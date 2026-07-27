@@ -1,7 +1,8 @@
 #!/bin/bash
 # Sets up an Ubuntu machine to control the AgileX Piper arm: system deps,
-# a Python venv with pyAgxArm (+ piper_sdk for cross-checking), and the
-# single-adapter CAN interface. Tested on Ubuntu 24.04.4 / Python 3.12.
+# a Python venv with pyAgxArm (+ piper_sdk for cross-checking), the
+# single-adapter CAN interface, and Intel RealSense camera dependencies.
+# Tested on Ubuntu 24.04.4 / Python 3.12.
 #
 # Usage: bash setup.sh
 set -euo pipefail
@@ -30,7 +31,10 @@ pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"
 # for cross-checking behavior against pyAgxArm.
 pip install piper_sdk
 
-echo "==> 4. Activating the CAN interface"
+echo "==> 4. Installing camera/vision dependencies (Intel RealSense)"
+pip install pyrealsense2 numpy opencv-python-headless
+
+echo "==> 5. Activating the CAN interface"
 echo "    Detected CAN adapters:"
 bash "$SCRIPT_DIR/scripts/find_all_can_port.sh"
 echo "    Bringing up a single CAN adapter as $CAN_IFACE @ ${CAN_BITRATE}bps"
@@ -38,7 +42,7 @@ echo "    (if you have more than one adapter plugged in, run"
 echo "     scripts/can_activate.sh manually with a USB address argument instead)"
 bash "$SCRIPT_DIR/scripts/can_activate.sh" "$CAN_IFACE" "$CAN_BITRATE"
 
-echo "==> 5. Verifying the interface"
+echo "==> 6. Verifying the interface"
 ip -details link show "$CAN_IFACE"
 
 echo

@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 venv/
 .venv/
+scripts/camera_snapshot.jpg
+scripts/pos.csv
+
+# Local secrets and runtime artifacts for the piper-asimov agent
+.env
+piper-asimov/piper-real-toolset/captures/
