@@ -19,12 +19,13 @@ since this arm's usable workspace at RY=85 deg is much smaller than its
 (arm_status flips to TARGET_POS_EXCEEDS_LIMIT, but motion_status does not
 report failure - both must be checked).
 
-Usage: python3 scripts/draw_square.py
+Usage: python3 scripts/draw_square.py [can_iface]   (default: can_piper)
 """
+import sys
 import time
 from piper_sdk import *
 
-CAN_IFACE = "can0"
+CAN_IFACE = sys.argv[1] if len(sys.argv) > 1 else "can_piper"
 MM_PER_INCH = 25.4
 
 SIDE_LENGTH_MM = 10 * MM_PER_INCH   # 254mm, per the ask
