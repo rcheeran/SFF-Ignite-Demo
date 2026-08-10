@@ -14,7 +14,20 @@ fi
 DEFAULT_BITRATE="${2:-1000000}"
 
 # USB hardware address (optional parameter)
-USB_ADDRESS="${3}"
+USB_ADDRESS="${3:-}"
+
+list_can_addresses() {
+    echo "Detected CAN interfaces and USB hardware addresses:"
+    for iface in $(ip -br link show type can | awk '{print $1}'); do
+        BUS_INFO=$(sudo ethtool -i "$iface" | awk '/bus-info/ {print $2}')
+        if [ -n "$BUS_INFO" ]; then
+            echo "  $iface: $BUS_INFO"
+        else
+            echo "  $iface: unavailable"
+        fi
+    done
+}
+
 echo "-------------------START-----------------------"
 # Check if ethtool is installed.
 if ! dpkg -l | grep -q "ethtool"; then
@@ -34,24 +47,14 @@ fi
 
 echo "Both ethtool and can-utils are installed."
 
+list_can_addresses
+
 # Retrieve the number of CAN modules in the current system.
 CURRENT_CAN_COUNT=$(ip link show type can | grep -c "link/can")
 
 # Verify if the number of CAN modules in the current system matches the expected value.
 if [ "$CURRENT_CAN_COUNT" -ne "1" ]; then
     if [ -z "$USB_ADDRESS" ]; then
-        # Iterate through all CAN interfaces.
-        for iface in $(ip -br link show type can | awk '{print $1}'); do
-            # Use ethtool to retrieve bus-info.
-            BUS_INFO=$(sudo ethtool -i "$iface" | grep "bus-info" | awk '{print $2}')
-            
-            if [ -z "$BUS_INFO" ];then
-                echo "Error: Unable to retrieve bus-info for interface $iface."
-                continue
-            fi
-            
-            echo "Interface $iface is inserted into USB port $BUS_INFO"
-        done
         echo -e " Error: The number of CAN modules detected by the system ($CURRENT_CAN_COUNT) does not match the expected number (1). "
         echo -e " Please add the USB hardware address parameter, such as: "
         echo -e " bash can_activate.sh can0 1000000 1-2:1.0"
