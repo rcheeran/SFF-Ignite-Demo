@@ -1,0 +1,16 @@
+# datasets, checkpoints, base model weights (large, regenerable)
+data/
+outputs/
+models/
+# old project artefacts (3.9 GB of images/logs); legacy code itself is tracked
+legacy/data/
+legacy/lerobot/
+legacy/logs/
+legacy/*.jpg
+# instance-specific / secrets
+training/cloud/lambda.env
+teleop/certs/
+# python
+__pycache__/
+*.pyc
+.pytest_cache/

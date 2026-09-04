@@ -1,0 +1,252 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Piper VR teleop</title>
+<style>
+  body { margin:0; padding:1.2em; background:#111; color:#eee; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; gap:1em; }
+  /* 2D landing: status card + ENTER + legend; log behind <details> */
+  #card { background:#1b1b1b; border:1px solid #333; border-radius:0.4em; padding:0.7em 1.1em; font-size:1.25em; line-height:1.6; min-width:17em; }
+  #enter { font-size:3em; padding:0.6em 1.5em; border-radius:0.3em; border:none; background:#2a7; color:#fff; }
+  #enter:disabled { background:#555; }
+  #legend { color:#8a8; max-width:92vw; text-align:center; }
+  details { color:#777; max-width:92vw; } #log { white-space:pre-line; color:#9a9; }
+  body.xr #card, body.xr #enter, body.xr #legend, body.xr details { display:none; }
+  /* in-headset dom-overlay panel, pinned top-left */
+  #overlay { display:none; } body.xr #overlay { display:block; position:fixed; top:0; left:0; z-index:9; }
+  #panel { font-size:1.7em; line-height:1.4; background:rgba(0,0,0,0.8); color:#fff; padding:0.35em 0.55em; border-radius:0 0 0.3em 0; white-space:nowrap; }
+  #banner { font-size:2.1em; font-weight:bold; text-align:center; padding:0.08em 0.4em; border-radius:0.12em; }
+  .s-grey { background:#454545; color:#ccc; } .s-amber { background:#e69500; color:#000; }
+  .s-green { background:#19b955; color:#000; } .s-red { background:#d22; color:#fff; }
+  .flash { animation:fl 0.5s step-start infinite; } @keyframes fl { 50% { opacity:0.3; } }
+  .row { margin:0.12em 0; }
+  #gripbar { height:0.55em; width:10em; background:#333; border:1px solid #555; border-radius:0.2em; }
+  #gripfill { height:100%; width:100%; background:#4af; border-radius:0.2em; }
+  #recrow { font-size:1.25em; font-weight:bold; }
+  #recdot.on { color:#f33; animation:fl 1s step-start infinite; } #recdot.off { color:#888; }
+  #armbar { height:0.4em; width:10em; background:#333; } #armfill { height:100%; width:0; background:#fc3; }
+  #exit { display:none; font-size:0.7em; padding:0.15em 0.7em; margin-top:0.25em; } body.xr #exit { display:inline-block; }
+  .ok { color:#6f6 } .bad { color:#f66 } .warn { color:#fc6 } .dim { color:#999 }
+</style>
+</head>
+<body>
+<div id="overlay"><div id="panel">
+  <div id="banner" class="s-grey">DISARMED</div>
+  <div class="row" id="griprow"><span id="griptxt" class="dim"></span><div id="gripbar"><div id="gripfill"></div></div></div>
+  <div class="row dim" id="lagrow"></div>
+  <div class="row warn" id="wristrow"></div>
+  <div class="row" id="recrow"><span id="recdot"></span><span id="rectxt"></span></div>
+  <div class="row dim" id="netrow"></div>
+  <div class="row" id="armrow"><span id="armtxt" class="dim"></span><div id="armbar"><div id="armfill"></div></div></div>
+  <div class="row bad" id="errrow"></div>
+  <button id="exit">EXIT XR</button>
+</div></div>
+<div id="card">
+  <div id="c-tr" class="bad">transport: connecting...</div>
+  <div id="c-st">server: -</div>
+  <div id="c-sc" class="dim">scale: -</div>
+</div>
+<button id="enter">ENTER VR</button>
+<div id="legend">checking WebXR...</div>
+<details><summary>details</summary><div id="log"></div></details>
+<script>
+const $ = (id) => document.getElementById(id);
+const overlayEl = $('overlay'), btn = $('enter'), legendEl = $('legend'), logEl = $('log'), bannerEl = $('banner');
+const C2 = { tr: $('c-tr'), st: $('c-st'), sc: $('c-sc') };
+const R = { grip: $('griprow'), lag: $('lagrow'), wrist: $('wristrow'), rec: $('recrow'), net: $('netrow'), arm: $('armrow'), err: $('errrow') };
+const G = { griptxt: $('griptxt'), gripfill: $('gripfill'), recdot: $('recdot'), rectxt: $('rectxt'), armtxt: $('armtxt'), armfill: $('armfill') };
+const log = (m) => { logEl.textContent = (m + '\n' + logEl.textContent).split('\n').slice(0, 12).join('\n'); };
+let lastErr = '';
+const err = (m) => { m = String(m); if (m !== lastErr) { lastErr = m; log('ERROR ' + m); } };   // each distinct error logged once
+const put = (el, txt, cls) => { if (el.textContent !== txt) el.textContent = txt; if (cls !== undefined && el.className !== cls) el.className = cls; };
+const show = (el, on) => { const d = on ? '' : 'none'; if (el.style.display !== d) el.style.display = d; };
+const nn = (v, dflt) => (v === undefined || v === null ? dflt : v);      // "or default" without ES2020 ??
+window.onerror = (m) => err(m);
+window.onunhandledrejection = (e) => err(e.reason);
+
+// ---- transport: WebSocket when it works, HTTP POST /pose otherwise (Quest browser + self-signed cert) ----
+let ws = null, wsOpen = false, wsBackoff = 1000, ack = {}, ackAt = 0, inflight = false, lastPost = 0;
+function connectWS() {
+  try { ws = new WebSocket('wss://' + location.host + '/ws'); } catch (e) { err('ws: ' + e); return; }
+  ws.onopen = () => { wsOpen = true; wsBackoff = 1000; log('ws connected'); };
+  ws.onclose = () => { wsOpen = false; log('ws closed, retry in ' + wsBackoff / 1000 + 's (using http)'); setTimeout(connectWS, wsBackoff); wsBackoff = Math.min(wsBackoff * 2, 10000); };
+  ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  ws.onmessage = (e) => { try { onAck(JSON.parse(e.data)); } catch (x) { err('ws ack: ' + x); } };
+}
+function wsSend(o) { try { ws.send(JSON.stringify(o)); return true; } catch (e) { err('ws send: ' + e); return false; } }
+function post(o) {
+  return fetch('/pose', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(o), keepalive: true })
+    .then((r) => r.json()).then((a) => onAck(a)).catch((e) => err('post: ' + e));
+}
+const sendEvent = (ev) => { if (!(wsOpen && wsSend(ev))) post(ev); };   // session events: never throttled or dropped
+function send(pkt) {                                                    // per-frame: every frame over ws; <=30 Hz, one in flight over http
+  if (wsOpen) { wsSend(pkt); return; }
+  const now = performance.now();
+  if (inflight || now - lastPost < 33) return;
+  inflight = true; lastPost = now;
+  post(pkt).finally(() => { inflight = false; });
+}
+function onAck(a) {
+  if (!a || typeof a !== 'object' || Array.isArray(a)) return;
+  if (a.error) { err('server: ' + a.error); return; }                   // 400 reply, not a state
+  const prev = ack;
+  ack = a; ackAt = performance.now();
+  if (a.armed && !prev.armed) beeps([[660, 60, 0.08], [990, 90, 0.08]]);
+  else if (!a.armed && prev.armed) beeps([[330, 120, 0.08]]);
+  if (a.engaged && !prev.engaged) beeps([[1500, 10, 0.03]]);            // barely audible click
+  if (a.stuck && !prev.stuck) beeps([[1200, 12, 0.04], [1200, 12, 0.04]]);   // soft double-click: re-squeeze the grip
+}
+
+// ---- sound cues (Web Audio; context created/resumed in the ENTER click) ----
+let actx = null;
+function beeps(seq) {                                                   // seq: [[hz, ms, gain?], ...] played back to back
+  if (!actx || actx.state !== 'running') return;
+  let t = actx.currentTime + 0.01;
+  for (const [hz, ms, g] of seq) {
+    const o = actx.createOscillator(), v = actx.createGain(), d = ms / 1000, gain = g || 0.06;
+    o.type = 'triangle'; o.frequency.value = hz;
+    v.gain.setValueAtTime(0, t); v.gain.linearRampToValueAtTime(gain, t + 0.01);
+    v.gain.setValueAtTime(gain, t + d - 0.01); v.gain.linearRampToValueAtTime(0, t + d);
+    o.connect(v).connect(actx.destination); o.start(t); o.stop(t + d);
+    t += d + 0.04;
+  }
+}
+
+// ---- status: 2D card + in-headset overlay (rows hidden unless meaningful; all new ack fields optional) ----
+function updatePanel() {
+  const a = ack, age = (performance.now() - ackAt) / 1000, ok = ackAt > 0 && age < 1;
+  const stuck = ok && !!a.stuck, nofb = ok && !!a.no_feedback;
+  const fw = typeof a.arm_status === 'string' && a.arm_status !== 'NORMAL' ? a.arm_status : '';   // firmware verdict
+  put(C2.tr, `transport ${wsOpen ? 'ws' : 'http'}: ${ok ? 'OK' : 'FAILED'} — ack ${ackAt ? age.toFixed(1) + 's ago' : 'never'}`, ok ? 'ok' : 'bad');
+  put(C2.st, `server: ${nn(a.status, '-')}`);
+  put(C2.sc, `scale: ${nn(a.scale, '-')}`, 'dim');
+  let btxt = 'DISARMED', bcls = 's-grey';                               // (a) big state banner, worst condition wins
+  if (!ok) { btxt = 'NO SERVER'; bcls = 's-red'; }
+  else if (nofb) { btxt = 'NO ARM FEEDBACK'; bcls = 's-red'; }
+  else if (stuck) { btxt = (fw || 'STUCK') + ' — RE-SQUEEZE'; bcls = 's-red flash'; }   // fw = collision / e-stop
+  else if (a.engaged) { btxt = 'ENGAGED'; bcls = 's-green'; }
+  else if (a.armed) { btxt = 'ARMED'; bcls = 's-amber'; }
+  put(bannerEl, btxt, bcls);
+  const g = typeof a.grip_cmd_mm === 'number' ? Math.max(0, Math.min(70, a.grip_cmd_mm)) : null;   // (b) gripper bar, 70 mm open -> 0 closed
+  show(R.grip, g !== null);
+  if (g !== null) { put(G.griptxt, `grip ${g.toFixed(0)} mm`); G.gripfill.style.width = (g / 0.7).toFixed(1) + '%'; }
+  const lag = typeof a.err_mm === 'number';                             // (c) target-vs-arm lag
+  show(R.lag, lag);
+  const lim = Array.isArray(a.limit) && a.limit.length ? a.limit.join('+') + ' at limit — rotate back' : '';   // joint range
+  if (lag) put(R.lag, `lag ${a.err_mm.toFixed(0)} mm ${typeof a.err_deg === 'number' ? a.err_deg.toFixed(0) : '?'}°${a.lead_limited ? ' — lead clamp' : ''}${lim ? ' · ' + lim : ''}${fw ? ' · fw ' + fw : ''}`,
+               'row ' + (stuck ? 'bad' : a.lead_limited || fw || lim ? 'warn' : 'dim'));
+  const m = typeof a.j6_margin_deg === 'number' ? a.j6_margin_deg : null;   // (d) wrist-roll firmware limit
+  show(R.wrist, m !== null && m <= 15);
+  if (m !== null && m <= 15) put(R.wrist, `WRIST ROLL LIMIT ${m.toFixed(0)}° — rotate gripper the other way ↺`, 'row ' + (m <= 6 ? 'bad' : 'warn'));
+  const rec = a.recording !== undefined && a.recording !== null;        // (e) recording indicator
+  show(R.rec, rec);
+  if (rec) {
+    put(G.recdot, a.recording ? '● ' : '○ ', a.recording ? 'on' : 'off');
+    put(G.rectxt, a.recording ? `REC ep ${nn(a.episode, '?')} · ${nn(a.frames, 0)} frames` : `not recording · ep ${nn(a.episode, '?')}`, a.recording ? '' : 'dim');
+  }
+  put(R.net, `${a.status === undefined ? '' : a.status + '  ·  '}${wsOpen ? 'ws' : 'http'} ${nn(a.rate_hz, '-')} Hz · ack ${ackAt ? age.toFixed(2) + ' s' : '-'} · scale ${nn(a.scale, '-')}`);
+  const bp = Math.max(0, Math.min(1, a.b_progress || 0)), ap = Math.max(0, Math.min(1, a.arm_progress || 0));
+  const prog = Math.max(ap, bp);                                         // (g) hold progress: A = arm/disarm, B = start episode
+  show(R.arm, prog > 0 && prog < 1);
+  put(G.armtxt, `${bp > ap ? 'starting episode' : 'arming'} ${Math.round(prog * 100)}%`);
+  G.armfill.style.width = prog * 100 + '%';
+  show(R.err, !!lastErr);                                               // (h) last error
+  if (lastErr) put(R.err, 'error: ' + lastErr);
+}
+
+// ---- WebGL fallback quads (when dom-overlay is unavailable): left = state, right = red on stuck / no feedback ----
+let gl, glProg, buf, uColor, uOff;
+function initGL(canvas) {
+  gl = canvas.getContext('webgl', { xrCompatible: true, alpha: true });
+  const vs = 'attribute vec2 p; uniform vec2 o; void main(){ gl_Position = vec4(p + o, 0.0, 1.0); }';
+  const fs = 'precision mediump float; uniform vec4 c; void main(){ gl_FragColor = c; }';
+  const mk = (t, s) => { const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh); return sh; };
+  glProg = gl.createProgram(); gl.attachShader(glProg, mk(gl.VERTEX_SHADER, vs)); gl.attachShader(glProg, mk(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(glProg);
+  buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-0.075, -0.55, 0.075, -0.55, -0.075, -0.45, 0.075, -0.45]), gl.STATIC_DRAW);
+  uColor = gl.getUniformLocation(glProg, 'c'); uOff = gl.getUniformLocation(glProg, 'o');
+}
+function drawQuad(color, ox) {
+  gl.useProgram(glProg); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  const loc = gl.getAttribLocation(glProg, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  gl.uniform2f(uOff, ox, 0.0); gl.uniform4fv(uColor, color); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+
+// ---- WebXR ----
+let session = null, refSpace = null, right = null;
+const pq = (pose) => pose ? { p: [pose.transform.position.x, pose.transform.position.y, pose.transform.position.z],
+                              q: [pose.transform.orientation.x, pose.transform.orientation.y, pose.transform.orientation.z, pose.transform.orientation.w] } : null;
+function readCtl(src, frame) {                                          // p/q null when not tracked; Quest touch button map
+  const gp = src.gamepad, b = gp ? gp.buttons : [], ax = gp ? gp.axes : [];
+  const v = (i) => (b[i] ? b[i].value : 0), pr = (i) => !!(b[i] && b[i].pressed);
+  return Object.assign(pq(frame.getPose(src.gripSpace, refSpace)) || { p: null, q: null },
+    { trigger: v(0), squeeze: v(1), thumb: pr(3), a: pr(4), b: pr(5), axes: [ax[2] || 0, ax[3] || 0] });
+}
+function onXRFrame(t, frame) {
+  if (!session) return;
+  session.requestAnimationFrame(onXRFrame);
+  try {
+    const layer = session.renderState.baseLayer;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, layer.framebuffer);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+    const head = frame.getViewerPose(refSpace), ctl = { right: null, left: null };
+    for (const src of session.inputSources) if (src.handedness in ctl && src.gripSpace) ctl[src.handedness] = readCtl(src, frame);
+    right = ctl.right;
+    send({ t: t / 1000, head: pq(head), right: ctl.right, left: ctl.left });
+    const tracked = !!(right && right.p), ackOk = performance.now() - ackAt < 1000;
+    const state = !ackOk ? [1, 0.1, 0.1, 1] : ack.engaged ? [0.1, 1, 0.1, 1] : ack.armed && tracked ? [1, 0.8, 0.1, 1] : [0.6, 0.6, 0.6, 1];
+    const alert = ackOk && !!(ack.stuck || ack.no_feedback);
+    if (head) for (const view of head.views) {
+      const vp = layer.getViewport(view); gl.viewport(vp.x, vp.y, vp.width, vp.height);
+      drawQuad(state, -0.095);
+      if (alert) drawQuad([1, 0.1, 0.1, 1], 0.095);
+    }
+    updatePanel();
+  } catch (e) { err('frame: ' + e); }
+}
+
+async function enter() {
+  btn.disabled = true;
+  try {                                                                 // autoplay rules: needs the click gesture
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    actx.resume().then(() => beeps([[880, 40, 0.04]]));
+  } catch (e) { err('audio: ' + e); }
+  try {
+    const ar = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+    const mode = ar ? 'immersive-ar' : 'immersive-vr';
+    session = await navigator.xr.requestSession(mode, { requiredFeatures: ['local-floor'], optionalFeatures: ['dom-overlay'], domOverlay: { root: overlayEl } });
+    initGL(document.createElement('canvas'));                           // offscreen; the XR layer renders straight to the headset
+    await gl.makeXRCompatible();
+    session.updateRenderState({ baseLayer: new XRWebGLLayer(session, gl) });
+    refSpace = await session.requestReferenceSpace('local-floor');
+    document.body.classList.add('xr');
+    session.addEventListener('end', () => {
+      session = null; right = null; document.body.classList.remove('xr'); btn.disabled = false;
+      sendEvent({ event: 'session_end' }); log('session ended');
+    });
+    sendEvent({ event: 'session_start', mode: mode });
+    log(`session started: ${mode}, dom-overlay: ${session.domOverlayState ? session.domOverlayState.type : 'NONE (quads only)'}`);
+    session.requestAnimationFrame(onXRFrame);
+  } catch (e) { err('XR: ' + e); btn.disabled = false; }
+}
+btn.onclick = enter;
+$('exit').onclick = () => { if (session) session.end(); };
+
+(async () => {
+  connectWS();
+  sendEvent({ event: 'hello' });                                        // proves the transport before ENTER (ws not open yet -> http)
+  setInterval(() => { if (!session) sendEvent({ event: 'hello' }); }, 500);   // keeps the 2D card's ack fresh
+  setInterval(updatePanel, 100);
+  if (!navigator.xr) { legendEl.textContent = 'navigator.xr missing - open this page in the Quest browser over https'; legendEl.className = 'bad'; btn.disabled = true; return; }
+  const ar = await navigator.xr.isSessionSupported('immersive-ar').catch(() => false);
+  const vr = await navigator.xr.isSessionSupported('immersive-vr').catch(() => false);
+  legendEl.textContent = ar || vr
+    ? 'hold A 3 s = arm/disarm · tap A = discard episode · hold B 3 s = start episode · tap B = stop + save · squeeze = clutch · trigger = gripper · stick click = READY'
+    : `WebXR: no immersive support (ar:${ar} vr:${vr})`;
+  legendEl.className = ar || vr ? '' : 'bad';
+  btn.disabled = !(ar || vr);
+})();
+</script>
+</body>
+</html>

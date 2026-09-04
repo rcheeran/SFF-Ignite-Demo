@@ -1,0 +1,136 @@
+{
+ "probe_z": 200.0,
+ "results": [
+  {
+   "target": [
+    120,
+    -250
+   ],
+   "reached": false,
+   "actual": [
+    55.747,
+    -0.422,
+    214.636
+   ]
+  },
+  {
+   "target": [
+    120,
+    0
+   ],
+   "reached": true,
+   "actual": [
+    120.146,
+    -0.033,
+    200.282
+   ],
+   "pixels": {
+    "realtek": null,
+    "hp": null
+   }
+  },
+  {
+   "target": [
+    120,
+    250
+   ],
+   "reached": false,
+   "actual": [
+    120.146,
+    -0.033,
+    200.282
+   ]
+  },
+  {
+   "target": [
+    250,
+    -250
+   ],
+   "reached": true,
+   "actual": [
+    250.033,
+    -249.697,
+    199.951
+   ],
+   "pixels": {
+    "realtek": null,
+    "hp": [
+     86.6983606557377,
+     566.5666059502125
+    ]
+   }
+  },
+  {
+   "target": [
+    250,
+    0
+   ],
+   "reached": true,
+   "actual": [
+    250.184,
+    -0.154,
+    200.03
+   ],
+   "pixels": {
+    "realtek": null,
+    "hp": null
+   }
+  },
+  {
+   "target": [
+    250,
+    250
+   ],
+   "reached": false,
+   "actual": [
+    250.184,
+    -0.154,
+    200.03
+   ]
+  },
+  {
+   "target": [
+    380,
+    -150
+   ],
+   "reached": true,
+   "actual": [
+    379.798,
+    -149.72,
+    199.802
+   ],
+   "pixels": {
+    "realtek": null,
+    "hp": null
+   }
+  },
+  {
+   "target": [
+    380,
+    0
+   ],
+   "reached": true,
+   "actual": [
+    380.135,
+    -0.445,
+    199.703
+   ],
+   "pixels": {
+    "realtek": null,
+    "hp": null
+   }
+  },
+  {
+   "target": [
+    380,
+    150
+   ],
+   "reached": false,
+   "actual": [
+    380.135,
+    -0.445,
+    199.703
+   ]
+  }
+ ]
+}

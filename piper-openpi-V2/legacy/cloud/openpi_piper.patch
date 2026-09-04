@@ -1,0 +1,201 @@
+diff --git a/src/openpi/policies/piper_policy.py b/src/openpi/policies/piper_policy.py
+new file mode 100644
+index 0000000..84c7878
+--- /dev/null
++++ b/src/openpi/policies/piper_policy.py
+@@ -0,0 +1,67 @@
++import dataclasses
++
++import einops
++import numpy as np
++
++from openpi import transforms
++from openpi.models import model as _model
++
++
++def make_piper_example() -> dict:
++    """Random input example for the single-arm Piper policy (10-D pose+gripper)."""
++    return {
++        "observation/state": np.random.rand(10).astype(np.float32),
++        "observation/wrist_image": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
++        "prompt": "pick up the soda can",
++    }
++
++
++def _parse_image(image) -> np.ndarray:
++    image = np.asarray(image)
++    if np.issubdtype(image.dtype, np.floating):
++        image = (255 * image).astype(np.uint8)
++    if image.shape[0] == 3:  # LeRobot stores float32 CHW; model wants HWC uint8
++        image = einops.rearrange(image, "c h w -> h w c")
++    return image
++
++
++@dataclasses.dataclass(frozen=True)
++class PiperInputs(transforms.DataTransformFn):
++    """Map our single-wrist-cam, 10-D pose+gripper data into the pi0.5 input format.
++
++    We have one eye-in-hand D405. pi0 takes up to 3 image slots (one base + two
++    wrist); we duplicate our wrist view into base_0_rgb + left_wrist_0_rgb (both
++    real) and zero/mask the right wrist. State/actions are 10-D
++    [x, y, z, R6d(6), gripper]; the framework pads them to the model dim.
++    """
++
++    model_type: _model.ModelType
++
++    def __call__(self, data: dict) -> dict:
++        wrist = _parse_image(data["observation/wrist_image"])
++        inputs = {
++            "state": data["observation/state"],
++            "image": {
++                "base_0_rgb": wrist,
++                "left_wrist_0_rgb": wrist,
++                "right_wrist_0_rgb": np.zeros_like(wrist),
++            },
++            "image_mask": {
++                "base_0_rgb": np.True_,
++                "left_wrist_0_rgb": np.True_,
++                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
++            },
++        }
++        if "actions" in data:
++            inputs["actions"] = data["actions"]
++        if "prompt" in data:
++            inputs["prompt"] = data["prompt"]
++        return inputs
++
++
++@dataclasses.dataclass(frozen=True)
++class PiperOutputs(transforms.DataTransformFn):
++    """Return the first 10 action dims (the model pads to action_dim; we unpad)."""
++
++    def __call__(self, data: dict) -> dict:
++        return {"actions": np.asarray(data["actions"][..., :10])}
+diff --git a/src/openpi/training/config.py b/src/openpi/training/config.py
+index 4ca47e1..9b6ef5b 100644
+--- a/src/openpi/training/config.py
++++ b/src/openpi/training/config.py
+@@ -5,6 +5,7 @@ from collections.abc import Sequence
+ import dataclasses
+ import difflib
+ import logging
++import os
+ import pathlib
+ from typing import Any, Literal, Protocol, TypeAlias
+ 
+@@ -20,6 +21,7 @@ import openpi.models.tokenizer as _tokenizer
+ import openpi.policies.aloha_policy as aloha_policy
+ import openpi.policies.droid_policy as droid_policy
+ import openpi.policies.libero_policy as libero_policy
++import openpi.policies.piper_policy as piper_policy
+ import openpi.shared.download as _download
+ import openpi.shared.normalize as _normalize
+ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
+@@ -355,6 +357,64 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
+         )
+ 
+ 
++@dataclasses.dataclass(frozen=True)
++class LeRobotPiperDataConfig(DataConfigFactory):
++    """Single-arm AgileX Piper, pose-6D control, one eye-in-hand D405 camera.
++
++    Dataset (built by ~/Documents/piper-openpi/build_pose_lerobot.py) stores:
++      wrist_image : (224,224,3)
++      state       : 10-D  [x_mm, y_mm, z_mm, R6d(6), gripper_m]
++      actions     : 10-D  absolute next-frame pose+gripper (already the target)
++    Actions are ABSOLUTE (no delta transform): the model predicts the next pose
++    directly, and gripper/rotation-6D don't play well with per-chunk deltas.
++    """
++
++    @override
++    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
++        # Rename dataset columns -> the observation/* keys our policy transform expects
++        # (mirrors what the live inference pipeline will feed the policy server).
++        repack_transform = _transforms.Group(
++            inputs=[
++                _transforms.RepackTransform(
++                    {
++                        "observation/wrist_image": "wrist_image",
++                        "observation/state": "state",
++                        "actions": "actions",
++                        "prompt": "prompt",
++                    }
++                )
++            ]
++        )
++
++        # Map into the pi0.5 model format (image slots, pad state/actions). Applied
++        # at train time AND inference. Defined in piper_policy.py.
++        data_transforms = _transforms.Group(
++            inputs=[piper_policy.PiperInputs(model_type=model_config.model_type)],
++            outputs=[piper_policy.PiperOutputs()],
++        )
++
++        # Train on DELTA actions (relative to the current pose); gripper stays
++        # absolute. With absolute next-pose actions the trivial "copy the state"
++        # solution already achieves ~0.01 normalized loss without using the
++        # camera - the v1 policy learned exactly that and random-walked on the
++        # robot. Deltas are normalized by motion scale, forcing vision use.
++        delta_mask = _transforms.make_bool_mask(9, -1)
++        data_transforms = data_transforms.push(
++            inputs=[_transforms.DeltaActions(delta_mask)],
++            outputs=[_transforms.AbsoluteActions(delta_mask)],
++        )
++
++        # Tokenize prompt, resize images, pad state/actions to the model dim.
++        model_transforms = ModelTransformFactory()(model_config)
++
++        return dataclasses.replace(
++            self.create_base_config(assets_dirs, model_config),
++            repack_transforms=repack_transform,
++            data_transforms=data_transforms,
++            model_transforms=model_transforms,
++        )
++
++
+ @dataclasses.dataclass(frozen=True)
+ class RLDSDroidDataConfig(DataConfigFactory):
+     """
+@@ -762,6 +822,42 @@ _CONFIGS = [
+         num_train_steps=30_000,
+     ),
+     #
++    # Fine-tuning pi0.5 on the real AgileX Piper (pick-and-place-back a soda can).
++    # Full fine-tune (the PyTorch path trains all params — no LoRA) from pi05_base,
++    # on ~57 drag-teach episodes. Runs on a single Jetson AGX Thor (122 GB unified).
++    #
++    TrainConfig(
++        name="pi05_piper",
++        model=pi0_config.Pi0Config(
++            pi05=True,
++            action_dim=32,  # match pi05_base checkpoint
++            action_horizon=10,  # 10 steps @15Hz ≈ 0.67s action chunk
++            discrete_state_input=False,
++            pytorch_compile_mode=None,  # Thor: torch.compile max-autotune hung the GPU
++        ),
++        data=LeRobotPiperDataConfig(
++            repo_id="piper/pick_soda_can",
++            base_config=DataConfig(prompt_from_task=True),
++        ),
++        # Small dataset + single device: modest batch, short schedule.
++        # 4k steps x batch 16 ~= 2.2 epochs over 29.7k frames - checkpoints every
++        # 500 steps let us deploy the earliest one that works.
++        batch_size=16,
++        num_train_steps=4_000,
++        lr_schedule=_optimizer.CosineDecaySchedule(
++            warmup_steps=300,
++            peak_lr=2.5e-5,
++            decay_steps=4_000,
++            decay_lr=2.5e-6,
++        ),
++        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
++        ema_decay=None,  # EMA is a no-op in the PyTorch trainer anyway
++        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
++        # PyTorch fine-tune loads base weights from here (converted from JAX).
++        pytorch_weight_path=os.path.expanduser("~/.cache/openpi/openpi-assets/checkpoints/pi05_base_pytorch"),
++        num_workers=4,
++    ),
++    #
+     # Fine-tuning Aloha configs.
+     #
+     # This is a test config that is used to illustate how train on a custom LeRobot dataset.
