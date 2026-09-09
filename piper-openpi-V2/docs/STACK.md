@@ -3,6 +3,103 @@
 Written 2026-09-04. Companion to `CONTRACT.md` (which states the rules) — this one explains *why* the pieces
 are what they are, for someone meeting the stack for the first time.
 
+- **Part 0** — the vocabulary: model, checkpoint, open weights, framework, norm stats
+- **Part 1** — what Hugging Face supplies, and how the LeRobot π0.5 port differs from Physical Intelligence's own
+- **Part 2** — the dataset we built, and the three details in it that caused real debugging
+
+## Part 0 — The vocabulary, in terms of this project
+
+Five words that get used interchangeably and are not the same thing. Each is anchored to a real artifact here.
+
+### Model
+
+The **architecture plus the learned parameters** — the thing that turns inputs into outputs. Ours is π0.5:
+two camera images + a 7-number arm state + a sentence go in, 50 future actions come out.
+
+Concretely, our fine-tuned model is **4.14 billion parameters** (3.61 B stored as bfloat16, 0.53 B as float32).
+"Fine-tuning" changed the *values* of those parameters; it did not change the architecture, which is why
+`lerobot/pi05_base` and our `lerobot-pi05-base-50` load with identical code.
+
+A model with no parameter values is just a shape — it produces noise. Which is why the file matters:
+
+### Checkpoint
+
+**A saved snapshot of a model's parameters at one moment in training** — the model frozen to disk so it can be
+moved, shared, or resumed. Ours:
+
+```
+outputs/lerobot-pi05-base-50/pretrained_model/
+  model.safetensors        9.35 GB   the 4.14 B parameter values
+  config.json                        the architecture, so the values can be rebuilt into a model
+  train_config.json                  what produced it (dataset, steps, batch size, LR)
+  policy_preprocessor.json  + .safetensors    normalisation to apply to inputs
+  policy_postprocessor.json + .safetensors    un-normalisation to apply to outputs
+  train.log                          the run that made it
+```
+
+Note that a checkpoint is **more than weights**. Without `config.json` you cannot reconstruct the architecture;
+without the pre/post-processors the numbers going in and out are on the wrong scale and the arm moves wrongly.
+Losing any of them makes the 9.35 GB useless — one reason `pull_checkpoint.sh` verifies size *and* sha256.
+
+"Checkpoint" also implies *a point in time*. Training wrote one every 500 steps; we deployed
+`checkpoints/last/`. If a run diverges you can go back to an earlier one.
+
+### Open weights (≠ open source)
+
+π0.5's **parameters are downloadable** — that is what makes any of this affordable, since we get the result of
+a very large training run for the cost of a download. But downloadable weights are not the same as open source:
+
+- `lerobot/pi05_base` carries the **Gemma licence** (it inherits Google's Gemma as its language backbone), not
+  MIT or Apache. It has terms — read them before anything commercial.
+- The **training data is not public**. We can use and fine-tune the model; we cannot reproduce it.
+
+So: *open weights* means you can download and adapt the parameters. *Open source* would mean the code, data and
+recipe are all public and re-runnable. The **code** around it (openpi, LeRobot) is open source; the model is
+open-weights. The distinction matters the moment someone asks whether this can ship in a product.
+
+### Framework
+
+**The software that defines, trains and runs models.** Several are in play, at different layers:
+
+| framework | role here |
+|---|---|
+| **PyTorch** (2.9.1+cu130) | the numerical engine — tensors, autograd, GPU kernels |
+| **JAX** | Google's alternative to PyTorch; π0.5's *reference* implementation is JAX-first, which is the root of the openpi/LeRobot split below |
+| **LeRobot** (0.6.1) | robotics layer on top of PyTorch — dataset format, `lerobot-train`, the policy classes |
+| **transformers** | supplies the vision/language backbones π0.5 is built from |
+
+The framework is not the model. The same π0.5 weights can be executed by PyTorch or JAX — which is exactly what
+the two distributions do.
+
+### Normalisation statistics ("norm stats")
+
+**The numbers that convert your robot's real-world units into the range the network expects, and back again.**
+
+The network works best on inputs roughly centred on zero with a spread near one. Our joints run 0–180° and the
+gripper 0–70 mm. Norm stats are the per-element scale and offset that map between the two — and they must be
+*the same numbers* at training and inference, or the policy is fluent in units the robot does not speak.
+
+They live in the dataset at `meta/stats.json`, computed from the data itself, and are baked into the checkpoint
+as the pre/post-processors listed above. Ours, for `action`:
+
+```
+              j1       j2       j3       j4       j5       j6     grip
+min        -63.2     -0.1   -136.5    -35.2    -52.6    -65.3      0.0
+q01        -26.6      0.0   -101.6    -12.4      3.6    -26.3     -0.0
+mean         2.3     66.5    -51.3      3.5     44.2     -3.9     20.3
+q99         33.1    127.3      0.0     19.7     70.1     17.7     69.4
+max         67.5    147.7      0.1     46.9     70.2     59.5     70.0
+```
+
+**π0.5 normalises on `q01`/`q99` — the 1st and 99th percentiles — not mean/std and not min/max.** Look at `j3`:
+`min` is −136.5 but `q01` is −101.6. Some single frame reached 35° beyond where the joint normally travels. Had
+min/max set the scale, that one outlier would have compressed every ordinary movement into a narrower band.
+Quantiles discard the extreme 1% at each end, so the scale reflects the motion that actually matters.
+
+The practical failure this causes: a dataset without `q01`/`q99` in `stats.json` trains **fine for a while and
+then fails**, because the error only appears when normalisation is applied. `inspect_dataset.py --strict`
+checks for them up front, which is cheaper than discovering it on a rented GPU.
+
 ## Part 1 — What Hugging Face provides
 
 Four distinct things, easily conflated because they share one brand and one auth token.
