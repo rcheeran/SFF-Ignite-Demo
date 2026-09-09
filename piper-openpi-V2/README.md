@@ -3,7 +3,7 @@
 Quest 3 teleop → LeRobot dataset → pi0.5 fine-tune (Lambda H100) → deploy on the Jetson — with a MuJoCo digital twin
 (`--sim`) to run any of it without the robot.
 Contract (hardware facts, dataset/teleop contracts, SDK gotchas): `docs/CONTRACT.md`.
-New here? `docs/STACK.md` — what Hugging Face provides, and what the LeRobot dataset actually is. Training notes: `training/NOTES.md`.
+New here? **`docs/STACK.md`** — what we built, each component, how it was trained and deployed, plus a glossary. Training notes: `training/NOTES.md`.
 Cloud: `training/cloud/README.md`. State of the system and what remains: `docs/HANDOFF.md`.
 
 ## Cheat sheet (everything, in order)

@@ -1,6 +1,6 @@
 # Handoff — state of the system and everything that remains (2026-09-04)
 
-New to the stack? `docs/STACK.md` explains what Hugging Face provides and what the dataset actually is.
+New to the stack? **`docs/STACK.md`** — what we built, the components, training, deployment, and a glossary.
 
 For any agent continuing this work: read `README.md` (runbook), `docs/CONTRACT.md` (hardware facts, dataset/teleop
 contracts, SDK gotchas, **and the deploy gotchas at the end — read those before debugging a "broken" policy**),

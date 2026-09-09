@@ -1,262 +1,110 @@
-# What Hugging Face provides, and what our dataset actually is
+# The stack: what we built, and the words for it
 
-Written 2026-09-04. Companion to `CONTRACT.md` (which states the rules) — this one explains *why* the pieces
-are what they are, for someone meeting the stack for the first time.
+Written 2026-09-04. For someone meeting this project for the first time. `CONTRACT.md` states the rules and
+`README.md` is the runbook — this explains what the system *is* and why each piece is there.
 
-- **Part 0** — the vocabulary: model, checkpoint, open weights, framework, norm stats
-- **Part 1** — what Hugging Face supplies, and how the LeRobot π0.5 port differs from Physical Intelligence's own
-- **Part 2** — the dataset we built, and the three details in it that caused real debugging
+1. [What we did](#1-what-we-did)
+2. [The components](#2-the-components)
+3. [Collecting the data](#3-collecting-the-data)
+4. [The dataset](#4-the-dataset)
+5. [Training](#5-training)
+6. [Inference — running it on the robot](#6-inference--running-it-on-the-robot)
+7. [Results, and what we have not measured](#7-results-and-what-we-have-not-measured)
+8. [Glossary](#8-glossary)
 
-## Part 0 — The vocabulary, in terms of this project
+---
 
-Five words that get used interchangeably and are not the same thing. Each is anchored to a real artifact here.
+## 1. What we did
 
-### Model
+We taught a robot arm to pick up a block and place it in a bowl, by demonstration, and it now does it on its own.
 
-The **architecture plus the learned parameters** — the thing that turns inputs into outputs. Ours is π0.5:
-two camera images + a 7-number arm state + a sentence go in, 50 future actions come out.
+The route: a person **hand-guides** the arm through the task a few dozen times → those demonstrations become a
+**dataset** → the dataset **fine-tunes a pretrained robotics foundation model** on a rented cloud GPU → the
+resulting **policy** runs on the computer bolted to the robot and drives the arm in real time.
 
-Concretely, our fine-tuned model is **4.14 billion parameters** (3.61 B stored as bfloat16, 0.53 B as float32).
-"Fine-tuning" changed the *values* of those parameters; it did not change the architecture, which is why
-`lerobot/pi05_base` and our `lerobot-pi05-base-50` load with identical code.
+Nothing here trains a model from scratch. The heavy lifting was done by π0.5, a model already trained on a large
+multi-robot corpus; our 50 demonstrations only teach it *this* arm, *this* workspace and *this* task. That is why
+the training bill was about **$4**.
 
-A model with no parameter values is just a shape — it produces noise. Which is why the file matters:
+---
 
-### Checkpoint
+## 2. The components
 
-**A saved snapshot of a model's parameters at one moment in training** — the model frozen to disk so it can be
-moved, shared, or resumed. Ours:
-
-```
-outputs/lerobot-pi05-base-50/pretrained_model/
-  model.safetensors        9.35 GB   the 4.14 B parameter values
-  config.json                        the architecture, so the values can be rebuilt into a model
-  train_config.json                  what produced it (dataset, steps, batch size, LR)
-  policy_preprocessor.json  + .safetensors    normalisation to apply to inputs
-  policy_postprocessor.json + .safetensors    un-normalisation to apply to outputs
-  train.log                          the run that made it
-```
-
-Note that a checkpoint is **more than weights**. Without `config.json` you cannot reconstruct the architecture;
-without the pre/post-processors the numbers going in and out are on the wrong scale and the arm moves wrongly.
-Losing any of them makes the 9.35 GB useless — one reason `pull_checkpoint.sh` verifies size *and* sha256.
-
-"Checkpoint" also implies *a point in time*. Training wrote one every 500 steps; we deployed
-`checkpoints/last/`. If a run diverges you can go back to an earlier one.
-
-### Open weights (≠ open source)
-
-π0.5's **parameters are downloadable** — that is what makes any of this affordable, since we get the result of
-a very large training run for the cost of a download. But downloadable weights are not the same as open source:
-
-- `lerobot/pi05_base` carries the **Gemma licence** (it inherits Google's Gemma as its language backbone), not
-  MIT or Apache. It has terms — read them before anything commercial.
-- The **training data is not public**. We can use and fine-tune the model; we cannot reproduce it.
-
-So: *open weights* means you can download and adapt the parameters. *Open source* would mean the code, data and
-recipe are all public and re-runnable. The **code** around it (openpi, LeRobot) is open source; the model is
-open-weights. The distinction matters the moment someone asks whether this can ship in a product.
-
-### Framework
-
-**The software that defines, trains and runs models.** Several are in play, at different layers:
-
-| framework | role here |
-|---|---|
-| **PyTorch** (2.9.1+cu130) | the numerical engine — tensors, autograd, GPU kernels |
-| **JAX** | Google's alternative to PyTorch; π0.5's *reference* implementation is JAX-first, which is the root of the openpi/LeRobot split below |
-| **LeRobot** (0.6.1) | robotics layer on top of PyTorch — dataset format, `lerobot-train`, the policy classes |
-| **transformers** | supplies the vision/language backbones π0.5 is built from |
-
-The framework is not the model. The same π0.5 weights can be executed by PyTorch or JAX — which is exactly what
-the two distributions do.
-
-### Normalisation statistics ("norm stats")
-
-**The numbers that convert your robot's real-world units into the range the network expects, and back again.**
-
-The network works best on inputs roughly centred on zero with a spread near one. Our joints run 0–180° and the
-gripper 0–70 mm. Norm stats are the per-element scale and offset that map between the two — and they must be
-*the same numbers* at training and inference, or the policy is fluent in units the robot does not speak.
-
-They live in the dataset at `meta/stats.json`, computed from the data itself, and are baked into the checkpoint
-as the pre/post-processors listed above. Ours, for `action`:
-
-```
-              j1       j2       j3       j4       j5       j6     grip
-min        -63.2     -0.1   -136.5    -35.2    -52.6    -65.3      0.0
-q01        -26.6      0.0   -101.6    -12.4      3.6    -26.3     -0.0
-mean         2.3     66.5    -51.3      3.5     44.2     -3.9     20.3
-q99         33.1    127.3      0.0     19.7     70.1     17.7     69.4
-max         67.5    147.7      0.1     46.9     70.2     59.5     70.0
-```
-
-**π0.5 normalises on `q01`/`q99` — the 1st and 99th percentiles — not mean/std and not min/max.** Look at `j3`:
-`min` is −136.5 but `q01` is −101.6. Some single frame reached 35° beyond where the joint normally travels. Had
-min/max set the scale, that one outlier would have compressed every ordinary movement into a narrower band.
-Quantiles discard the extreme 1% at each end, so the scale reflects the motion that actually matters.
-
-The practical failure this causes: a dataset without `q01`/`q99` in `stats.json` trains **fine for a while and
-then fails**, because the error only appears when normalisation is applied. `inspect_dataset.py --strict`
-checks for them up front, which is cheaper than discovering it on a rented GPU.
-
-## Part 1 — What Hugging Face provides
-
-Four distinct things, easily conflated because they share one brand and one auth token.
-
-### 1. The pretrained model we fine-tune: `lerobot/pi05_base`
-
-Hugging Face's PyTorch port of Physical Intelligence's **π0.5**, a vision-language-action (VLA) model. It takes
-camera images, a robot state vector and a language instruction, and predicts a chunk of future actions.
-
-**This is the expensive part we did not pay for.** It arrives already knowing what objects look like, what
-"graspable" means, and roughly how manipulation unfolds — learned from a large multi-robot corpus. Our 50
-episodes only teach it *this* arm, *this* workspace and *this* task.
-
-Two consequences worth internalising:
-
-- **~$4 of training was enough.** Fine-tuning 3000 steps took 68 minutes on one H100. Training a comparable
-  model from scratch is not a thing a project this size does.
-- **It generalises past its fine-tuning data.** Trained only on a red block — with a blue block visible in every
-  frame as a distractor it was taught to ignore — it picks up a blue block anyway. The priors carry "cube on
-  table"; colour was never the discriminating feature. Expect colour variation to need no new data and *shape*
-  variation to need it.
-
-`--policy.path=lerobot/pi05_base` in `training/cloud/train.sh` is the only place this is named.
-
-#### How the LeRobot port differs from Physical Intelligence's own π0.5
-
-Same model, two distributions. PI's reference implementation lives in
-[openpi](https://github.com/Physical-Intelligence/openpi) and is **JAX-first**; LeRobot ships a PyTorch port
-that announces itself on load as *"a direct port of the OpenPI implementation… follows the original OpenPI
-structure for compatibility"*, and its config file cites openpi line by line — `chunk_size` is openpi's
-`action_horizon`, `optimizer_lr: 2.5e-5` is openpi's `CosineDecaySchedule: peak_lr`, `tokenizer_max_length: 200`
-matches openpi's `__post_init__`. So the **architecture and hyperparameters are meant to match**; what differs
-is everything around them.
-
-**This project ran both.** V1 (`~/Documents/piper-openpi`, now legacy) used openpi directly; V2 uses LeRobot.
-The difference in what you have to do:
-
-| | openpi (PI's own) | LeRobot port (what we use) |
-|---|---|---|
-| framework | JAX first; PyTorch path is secondary | PyTorch native |
-| getting the weights | download a **JAX** checkpoint from GCS, then run `convert_jax_model_to_pytorch.py` | `model.safetensors` pulled straight from the Hub |
-| making it importable | **patch site-packages** — copy `transformers_replace/*` over the installed `transformers`, or it raises | plain `pip install lerobot` |
-| defining your robot | register a config in `config.py` + write a policy class mapping your cameras/state | none — a `--rename_map` CLI flag |
-| normalisation stats | run `scripts/compute_norm_stats.py`, writes to `assets/` | already in the dataset's `meta/stats.json` |
-| dataset | LeRobot format either way | LeRobot format, native |
-| training entry point | `scripts/train_pytorch.py <config>` | `lerobot-train --policy.path=...` |
-
-**Why we moved to LeRobot.** V1's route was a five-step bootstrap where each step could fail on this hardware —
-JAX installed purely so `openpi.models.gemma` can import it, a `transformers` patch that a routine `pip install`
-silently undoes, and a JAX→PyTorch conversion of a 12 GB checkpoint before a single training step. The LeRobot
-port removes all of it. `training/cloud/train.sh` is one `lerobot-train` invocation.
-
-**The practical consequence: advice written for openpi does not apply here.** No `config.py` to edit, no
-`compute_norm_stats.py`, no `transformers_replace`, no checkpoint conversion. Searching for π0.5 fine-tuning
-guidance mostly surfaces openpi instructions, and following them here wastes hours.
-
-**What we have not verified:** that the two produce numerically identical outputs from identical inputs. We
-never ran openpi and LeRobot side by side on the same checkpoint. The port is stated to be direct and the
-hyperparameters match, but treat "identical" as a claim from the library, not something this project measured.
-
-**Shared regardless of port** (these are π0.5 properties, not packaging):
-
-- **normalisation on QUANTILES** (`q01`/`q99`), not mean/std — `NormalizationMode.QUANTILES` for state and action
-- **state and action padded to 32 dimensions** (`max_state_dim`/`max_action_dim`); our 7-D vectors are padded
-- **50-action chunks** predicted per forward pass, via flow matching (10 inference steps)
-- **camera slots** named `base_0_rgb` / `left_wrist_0_rgb`, with missing slots padded and masked
-
-### 2. The LeRobot library (v0.6.1) — the framework, not just a model host
-
-- the **dataset format** (`LeRobotDataset`, see Part 2)
-- the **`lerobot-train` CLI** that runs the fine-tune
-- the **`PI05Policy`** class `inference/run_policy.py` loads to run on the robot
-- video encoding/decoding, normalisation, the pre/post-processors saved alongside a checkpoint
-
-### 3. Hub storage for our own artifacts
+### Hardware
 
 | | |
 |---|---|
-| dataset | `royc1981/piper_block_bowl` (private) |
-| trained model | `royc1981/lerobot-pi05-base-50` (private) |
+| **AgileX Piper** | 6-DOF robot arm with a parallel-jaw gripper. Joint limits `[±150, 0–180, −170–0, ±100, ±70, ±120]°`, gripper 0–70 mm. Commanded over **CAN** at 1 Mbps. |
+| **Jetson AGX Thor** | The computer on the robot. Runs the policy locally — no cloud call in the control loop. Blackwell-class GPU (`sm_110`), which drives several toolchain quirks. |
+| **USB-CAN adapter** | Links Thor to the arm. Thor's kernel has no in-tree `gs_usb` driver, so `setup.sh` builds it; without that the adapter never appears as a network interface. |
+| **Top camera** | USB webcam on a stand, wide view of the whole table — 640×480. Sees where the block and bowl are. |
+| **Wrist camera** | Intel RealSense D405 on the gripper — 640×480. Close-in view for the grasp itself. |
+| **Quest 3 headset** | VR teleoperation. Built and working, but **superseded** by drag-teach (§3) because it was too hard to drive consistently. |
 
-This is what makes cloud training possible at all: the rented H100 pulls the dataset from the Hub and pushes the
-checkpoint back — verified by size **and** sha256 before the instance is allowed to terminate. Neither artifact
-passes through a laptop. It is also the only real backup: a local dataset was destroyed once in this project,
-and was unrecoverable precisely because it had never been pushed.
+### Software
 
-### 4. Auth and transfer
+| | |
+|---|---|
+| **piper_sdk** | AgileX's CAN library. Everything in `piper/robot.py` wraps it. |
+| **PyTorch 2.9.1+cu130** | Numerical engine. Must be the aarch64 SBSA CUDA-13 build — the only one supporting Thor's `sm_110`. |
+| **LeRobot 0.6.1** | Hugging Face's robotics framework: the dataset format, the `lerobot-train` command, and the policy class we load at inference. |
+| **π0.5 (`lerobot/pi05_base`)** | The pretrained model we fine-tune. See §5. |
+| **Hugging Face Hub** | Stores our dataset and trained model. The rented GPU pulls from it and pushes back; nothing large goes via a laptop. |
+| **Lambda Cloud** | Where training runs — one H100 rented by the hour. |
 
-The `hf` CLI and `huggingface_hub`, driven by a write token. `tools/push_dataset.py` and
-`training/pull_checkpoint.sh` wrap them with confirmation and verification. Token handling is in `RESTORE.md`.
+---
 
-### What Hugging Face is NOT doing here
+## 3. Collecting the data
 
-No hosted inference, no hosted training, no data labelling. Training runs on a **Lambda Cloud** H100 we rent
-directly; inference runs on the **Jetson Thor** on the robot. HF is the model zoo, the library, and the artifact
-store.
+We tried two methods and kept the second.
 
-## Part 2 — The dataset we built
+**VR teleoperation** (`collect/record.py`) — drive the arm from a Quest 3 controller while cameras record. It
+works, and it is still in the repo, but driving smoothly enough to produce good demonstrations proved slow and
+frustrating.
 
-### The format: `LeRobotDataset` v3.0
+**Drag-teach** (`collect/teach.py`) — what we actually used. Two phases per episode:
 
-Not one file — a directory that separates cheap numeric columns from expensive pixels:
+1. **Teach.** Press the button on the arm; the joints go limp. Guide it by hand through the pick and place,
+   opening and closing the gripper with your fingers. Joint angles and gripper opening are sampled at 15 Hz.
+2. **Replay.** The arm re-torques and executes that trajectory **on its own** while both cameras record.
 
-```
-data/piper_block_bowl/
-  meta/info.json          schema, fps, episode and frame counts
-  meta/tasks.parquet      the language instruction(s)
-  meta/stats.json         normalisation statistics (see the quantile note below)
-  meta/episodes/          per-episode index: length, where its rows and video live
-  data/chunk-000/*.parquet    per-frame numeric columns
-  videos/observation.images.<cam>/chunk-000/*.mp4   one video per camera per episode
-```
+The second phase is the point. Recording the teaching directly would produce footage of a *human hand* moving the
+arm — the policy would learn to imitate a scene that never occurs at inference. The replay shows the robot doing
+the job alone, which is what it must reproduce.
 
-Frames are stored as **video**, not PNGs. 20228 frames × 2 cameras as stills would be tens of GB; as MP4 the
-whole dataset is 463 MB. Decoding is `pyav` (the `torchcodec` default is unavailable on this platform).
+A useful side effect: a saved trajectory can be re-recorded later (`--play`) under different lighting, or after
+a bug fix, without teaching it again.
 
-### What one frame contains
+---
+
+## 4. The dataset
+
+`royc1981/piper_block_bowl` — **50 episodes, 20228 frames, 15 fps**, in **LeRobotDataset v3.0** format: parquet
+files for the numbers, MP4 for the pixels (as stills it would be tens of GB; as video, 463 MB).
+
+Each frame holds:
 
 | field | type | meaning |
 |---|---|---|
-| `observation.images.top` | video 480×640×3 | overhead camera — where the block and bowl are |
-| `observation.images.wrist` | video 480×640×3 | gripper camera — close-in view for the grasp |
-| `observation.state` | float32[7] | `j1..j6` in **degrees** + gripper opening in **mm**, as MEASURED |
-| `action` | float32[7] | joints at the **next** frame + the gripper commanded **now** |
+| `observation.images.top` | video 480×640×3 | overhead camera |
+| `observation.images.wrist` | video 480×640×3 | gripper camera |
+| `observation.state` | float32[7] | `j1..j6` **degrees** + gripper **mm**, as MEASURED |
+| `action` | float32[7] | joints at the **next** frame + gripper commanded **now** |
 | `task` | string | `"put the block in the bowl"` |
-| `timestamp`, `frame_index`, `episode_index`, `index`, `task_index` | | bookkeeping |
 
-Ours: **50 episodes, 20228 frames, 15 fps, robot_type `piper`**.
+### Three details that cost real debugging time
 
-### Three details that caused real debugging
+**Action is offset by one frame from state.** `action[t]` holds the joints measured at `t+1`. That lag is what
+makes it a control target — "given what you see now, where should the arm be next" — rather than a copy of the
+state. `inspect_dataset.py` asserts `action[t][:6] == state[t+1][:6]` exactly.
 
-**1. `action` is offset by one frame from `observation.state`.** `action[t]` holds the joint angles measured at
-`t+1`. That one-frame lag is what makes it a *control target* — "given what you see now, where should the arm be
-next" — rather than a redundant copy of the state. `collect/record.py`'s `Episode` class implements it by
-holding each frame back until the following one arrives. `inspect_dataset.py` verifies
-`action[t][:6] == state[t+1][:6]` exactly; a non-zero result means the dataset teaches the wrong thing while
-looking perfectly valid.
+**π0.5 expects different camera names.** It wants `base_0_rgb` and `left_wrist_0_rgb`; we store `top` and
+`wrist`. Training bridges this with `--rename_map` rather than renaming our data. Get it wrong and training runs
+happily with the wrong camera wired to the wrong input.
 
-**2. π0.5 expects different camera names than we use.** It wants `base_0_rgb` and `left_wrist_0_rgb`; we store
-`top` and `wrist`. Training bridges this with a CLI flag rather than renaming our data:
-
-```
---rename_map='{"observation.images.top": "observation.images.base_0_rgb",
-               "observation.images.wrist": "observation.images.left_wrist_0_rgb"}'
-```
-
-Get this wrong and training runs happily, having wired the wrong camera to the wrong input.
-
-**3. π0.5 normalises on QUANTILES, not mean/std.** `meta/stats.json` must contain `q01` and `q99` per feature.
-LeRobot writes them automatically, but a hand-built or converted dataset may not have them — and the failure
-surfaces only once training has started. `inspect_dataset.py --strict` checks for them.
-
-### Why the state is joint angles rather than end-effector pose
-
-7-D joint space (`j1..j6` + gripper mm) is what the arm actually reports and accepts. Cartesian pose would need
-an IK round-trip at every step, and this arm's firmware IK **refuses unreachable targets silently** — a failure
-mode that already cost this project a frozen session. Joint space has no such ambiguity.
+**State is joint angles, not end-effector pose.** Joint space is what the arm reports and accepts. Cartesian
+pose would need an inverse-kinematics round trip every step, and this firmware **refuses unreachable targets
+silently** — a failure that already cost one frozen session.
 
 ### Validate before spending money on it
 
@@ -264,8 +112,172 @@ mode that already cost this project a frozen session. Joint space has no such am
 python tools/inspect_dataset.py data/piper_block_bowl --strict
 ```
 
-Schema, units (degrees not radians, joints inside limits, a gripper action the arm can actually reach), one
-decoded video frame per parquet row, quantiles present. Exits non-zero on failure.
+Checks schema, units, video/row alignment and normalisation stats; exits non-zero on failure. It **cannot** see
+whether the episodes show the task being done — a dataset where the arm repeatedly grasped the *bowl* passed
+every numeric check. Always look at the contact sheet it writes.
 
-**It cannot see whether the episodes show the task being done.** A dataset where the arm repeatedly grasped the
-*bowl* passed every numeric check. Always look at the contact sheet it writes.
+---
+
+## 5. Training
+
+### The model: π0.5
+
+A **vision-language-action** model: two camera images + the 7-number arm state + a sentence go in; 50 future
+actions come out. Ours is `lerobot/pi05_base`, **4.14 billion parameters**.
+
+We **fine-tune** rather than train: the pretrained weights already encode what objects look like and what
+"graspable" means, from a large multi-robot corpus. Our 50 episodes adjust them to this arm and task.
+
+### Which distribution, and why it matters
+
+π0.5 comes in two forms, and **advice written for one does not apply to the other**:
+
+| | openpi (Physical Intelligence's own) | LeRobot port (**what we use**) |
+|---|---|---|
+| framework | JAX first; PyTorch secondary | PyTorch native |
+| getting weights | download a JAX checkpoint, then convert it | `model.safetensors` from the Hub |
+| install | patch `transformers` in site-packages, or it raises | `pip install lerobot` |
+| defining your robot | register a config + write a policy class | a `--rename_map` CLI flag |
+| norm stats | run `compute_norm_stats.py` | already in the dataset |
+| entry point | `scripts/train_pytorch.py <config>` | `lerobot-train --policy.path=...` |
+
+This project ran **both** — V1 (`~/Documents/piper-openpi`, legacy) on openpi, V2 on LeRobot — so that table is
+from use, not from reading. LeRobot's config cites openpi line by line (`chunk_size` is openpi's
+`action_horizon`, `optimizer_lr: 2.5e-5` its `CosineDecaySchedule: peak_lr`), so the architecture and
+hyperparameters are meant to match. We never ran them side by side, so treat "identical outputs" as the
+library's claim, not our measurement.
+
+### The run
+
+```bash
+bash training/cloud/launch.sh royc1981/piper_block_bowl royc1981/lerobot-pi05-base-50
+```
+
+That rents a 1× H100, installs the stack, pulls the dataset from the Hub, and runs one `lerobot-train`:
+
+```
+--policy.path=lerobot/pi05_base   --policy.dtype=bfloat16
+--policy.gradient_checkpointing=true
+--rename_map='{"observation.images.top": "observation.images.base_0_rgb", ...}'
+--batch_size=16   --steps=3000   --save_freq=500
+```
+
+| | |
+|---|---|
+| steps | 3000 × batch 16 = **2.4 epochs** |
+| time / cost | **68 minutes, ~$4** |
+| loss | 0.319 → **0.037** |
+| result | `royc1981/lerobot-pi05-base-50`, 9.35 GB |
+
+The instance verifies the upload by size **and** sha256, then terminates itself — but deliberately **not** after
+a failure, so a broken run never destroys the checkpoint you paid for.
+
+---
+
+## 6. Inference — running it on the robot
+
+```bash
+python -m inference.run_policy --checkpoint outputs/lerobot-pi05-base-50/pretrained_model \
+                               --n-action-steps 30 --max-steps 450
+```
+
+Runs **entirely on the Jetson** — no network in the control loop. The loop ticks at **15 Hz**, matching the
+recording rate.
+
+**The model is slower than the loop.** One forward pass takes ~527 ms — about 8 ticks. It survives this because
+π0.5 predicts **50 actions at once**: the loop executes from the current chunk while a worker thread computes
+the next one from a fresh observation, handing over before the current chunk runs out. Measured: **0 late ticks**
+in 900.
+
+Three things were needed to make it work on this hardware, each documented in `CONTRACT.md`:
+
+- **`torch.compile` must be off.** Triton bundles a CUDA 12.8 `ptxas` with no `sm_110a`, so compilation can
+  never succeed on Thor. Eager mode costs little (~527 ms, 0 late ticks).
+- **`--n-action-steps 30`, not the default 10.** Every teach episode opens with ~2.8 s of stationary arm, so
+  chunk actions 0–25 are settling. At 10 the loop only ever executes that prefix, re-predicts from an unchanged
+  state, and **stalls forever looking like a broken policy**.
+- **Chunk-boundary blending.** A fresh chunk starts where the *model* thinks the arm is, not where the last
+  action put it — measured 10.6° mean jump at a boundary against 1.08° elsewhere, which is felt as jitter. The
+  discontinuity is now decayed over 6 ticks.
+
+Safety runs underneath all of it: per-tick step limits, a lead clamp, joint limits, a tool-tip floor, and a
+firmware-fault stop that rests the arm. `--shadow` runs the whole loop read-only, printing what it *would* send.
+
+---
+
+## 7. Results, and what we have not measured
+
+The policy picks up the block and places it in the bowl.
+
+**It generalises past its training data.** Trained only on a red block — with a blue block visible in every frame
+as a distractor it was taught to ignore — it picks up a **blue** block too. The pretrained priors carry "cube on
+table"; colour was never the discriminating feature. Expect colour variation to need no new data, and *shape*
+variation to need it.
+
+**We have not measured a success rate.** It has worked on individual attempts; nobody has run 20 trials and
+counted. That is the honest gauge of readiness and the obvious next step.
+
+Also open: only 7 of 50 grasps are near the centre of the workspace, so that band is thin; and the multi-task
+prompt idea (`"pick the red cube"` vs `"the blue cube"`) is harder than it looks, because the policy currently
+grabs the salient cube regardless of colour — the language only becomes load-bearing with both cubes present.
+
+---
+
+## 8. Glossary
+
+**Model** — an architecture plus its learned parameters; the thing that turns inputs into outputs. Ours is π0.5
+at 4.14 B parameters. Fine-tuning changes the parameter *values*, not the architecture, which is why the base
+model and our fine-tuned one load with identical code.
+
+**Parameters / weights** — the billions of numbers inside the model that training adjusts. Ours are stored as
+3.61 B in bfloat16 and 0.53 B in float32.
+
+**Checkpoint** — a saved snapshot of a model's parameters at one moment in training, so it can be moved or
+resumed. **More than weights**: ours is `model.safetensors` (the values) **plus** `config.json` (the
+architecture, without which the values cannot be rebuilt into a model) **plus** the pre/post-processors (without
+which inputs and outputs are on the wrong scale and the arm moves wrongly). Training wrote one every 500 steps;
+we deployed the last.
+
+**Open weights** — the parameters are downloadable, which is why this project was affordable. **Not the same as
+open source**: `pi05_base` carries the **Gemma licence** (it inherits Google's Gemma as its language backbone),
+and the training data is not public. You can download and adapt it; you cannot reproduce it. The surrounding
+*code* (openpi, LeRobot) is open source. The distinction matters the moment someone asks about shipping it.
+
+**Framework** — the software that defines, trains and runs models. **PyTorch** is the numerical engine;
+**JAX** is Google's alternative and π0.5's reference implementation, which is why two distributions exist;
+**LeRobot** is the robotics layer on top of PyTorch; **transformers** supplies the vision/language backbones.
+The framework is not the model — the same weights can run under either.
+
+**Fine-tuning** — continuing training on a pretrained model with your own, much smaller dataset, to adapt it to
+a specific robot and task rather than teach it from nothing.
+
+**VLA (vision-language-action)** — a model taking images *and* a language instruction and emitting robot
+actions. The language is why the same model can in principle do several tasks.
+
+**Policy** — the trained model in its role as a controller: observation in, action out.
+
+**Episode** — one demonstration, start to finish. Ours run 19–35 s, ~400 frames.
+
+**Action chunk** — π0.5 predicts **50 future actions per forward pass**, not one. This is what lets a 527 ms
+model drive a 15 Hz loop, and it is also the source of the boundary jitter in §6.
+
+**Normalisation statistics ("norm stats")** — the per-element numbers converting real-world units into the range
+the network expects, and back. Joints run 0–180° and the gripper 0–70 mm; the network wants values near zero
+with spread near one. They live in the dataset's `meta/stats.json` and are baked into the checkpoint, and they
+**must match between training and inference** or the policy speaks units the robot does not.
+
+π0.5 normalises on **quantiles** (`q01`/`q99` — the 1st and 99th percentiles), not mean/std and not min/max.
+Why, from our own data: joint 3's `min` is **−136.5°** but its `q01` is **−101.6°**. One frame reached 35°
+beyond where that joint normally travels. Had min/max set the scale, that single outlier would have compressed
+every ordinary movement into a narrower band. Quantiles discard the extreme 1% at each end.
+
+The failure this causes is nasty: a dataset without `q01`/`q99` trains *fine for a while* and then fails, because
+the error only surfaces when normalisation is applied. `inspect_dataset.py --strict` checks up front, which is
+cheaper than finding out on a rented GPU.
+
+**Teleoperation** — driving the robot remotely in real time (here, a Quest 3 controller). Distinct from
+drag-teach, where you move the arm with your hands.
+
+**Drag-teach** — putting the arm in a limp mode and physically guiding it. Also called kinesthetic teaching.
+
+**Epoch** — one pass through the whole dataset. Our 3000 steps × batch 16 over 20228 frames is 2.4 epochs.
