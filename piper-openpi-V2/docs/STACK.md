@@ -27,6 +27,49 @@ Two consequences worth internalising:
 
 `--policy.path=lerobot/pi05_base` in `training/cloud/train.sh` is the only place this is named.
 
+#### How the LeRobot port differs from Physical Intelligence's own π0.5
+
+Same model, two distributions. PI's reference implementation lives in
+[openpi](https://github.com/Physical-Intelligence/openpi) and is **JAX-first**; LeRobot ships a PyTorch port
+that announces itself on load as *"a direct port of the OpenPI implementation… follows the original OpenPI
+structure for compatibility"*, and its config file cites openpi line by line — `chunk_size` is openpi's
+`action_horizon`, `optimizer_lr: 2.5e-5` is openpi's `CosineDecaySchedule: peak_lr`, `tokenizer_max_length: 200`
+matches openpi's `__post_init__`. So the **architecture and hyperparameters are meant to match**; what differs
+is everything around them.
+
+**This project ran both.** V1 (`~/Documents/piper-openpi`, now legacy) used openpi directly; V2 uses LeRobot.
+The difference in what you have to do:
+
+| | openpi (PI's own) | LeRobot port (what we use) |
+|---|---|---|
+| framework | JAX first; PyTorch path is secondary | PyTorch native |
+| getting the weights | download a **JAX** checkpoint from GCS, then run `convert_jax_model_to_pytorch.py` | `model.safetensors` pulled straight from the Hub |
+| making it importable | **patch site-packages** — copy `transformers_replace/*` over the installed `transformers`, or it raises | plain `pip install lerobot` |
+| defining your robot | register a config in `config.py` + write a policy class mapping your cameras/state | none — a `--rename_map` CLI flag |
+| normalisation stats | run `scripts/compute_norm_stats.py`, writes to `assets/` | already in the dataset's `meta/stats.json` |
+| dataset | LeRobot format either way | LeRobot format, native |
+| training entry point | `scripts/train_pytorch.py <config>` | `lerobot-train --policy.path=...` |
+
+**Why we moved to LeRobot.** V1's route was a five-step bootstrap where each step could fail on this hardware —
+JAX installed purely so `openpi.models.gemma` can import it, a `transformers` patch that a routine `pip install`
+silently undoes, and a JAX→PyTorch conversion of a 12 GB checkpoint before a single training step. The LeRobot
+port removes all of it. `training/cloud/train.sh` is one `lerobot-train` invocation.
+
+**The practical consequence: advice written for openpi does not apply here.** No `config.py` to edit, no
+`compute_norm_stats.py`, no `transformers_replace`, no checkpoint conversion. Searching for π0.5 fine-tuning
+guidance mostly surfaces openpi instructions, and following them here wastes hours.
+
+**What we have not verified:** that the two produce numerically identical outputs from identical inputs. We
+never ran openpi and LeRobot side by side on the same checkpoint. The port is stated to be direct and the
+hyperparameters match, but treat "identical" as a claim from the library, not something this project measured.
+
+**Shared regardless of port** (these are π0.5 properties, not packaging):
+
+- **normalisation on QUANTILES** (`q01`/`q99`), not mean/std — `NormalizationMode.QUANTILES` for state and action
+- **state and action padded to 32 dimensions** (`max_state_dim`/`max_action_dim`); our 7-D vectors are padded
+- **50-action chunks** predicted per forward pass, via flow matching (10 inference steps)
+- **camera slots** named `base_0_rgb` / `left_wrist_0_rgb`, with missing slots padded and masked
+
 ### 2. The LeRobot library (v0.6.1) — the framework, not just a model host
 
 - the **dataset format** (`LeRobotDataset`, see Part 2)
