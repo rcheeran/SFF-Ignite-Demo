@@ -102,9 +102,13 @@ def teach(robot, task: str) -> dict:
         time.sleep(max(0.0, next_t - time.monotonic()))
 
     print(f"\n  taught {len(joints)} samples ({len(joints) / C.FPS:.1f} s)")
-    print("  KEEP HOLDING THE ARM - it stiffens where it stands, within about a second")
-    prompt("  press Enter to take control back...")
-    if not robot.teach_stop():          # forces teach mode off; no second button press needed
+    print("  KEEP HOLDING THE ARM and press the PHYSICAL TEACH BUTTON again")
+    print("  the arm should stiffen where it stands; do not release it yet")
+    if not robot.wait_teach_stopped(timeout=TEACH_BUTTON_S):
+        raise SystemExit("ABORT: teach recording did not stop. Keep holding the arm and power-cycle it.")
+    hold_joints = robot.joints_deg()
+    prompt("  arm stiffened; press Enter to take CAN control back...")
+    if not robot.teach_stop(hold_joints=hold_joints):
         raise SystemExit("ABORT: the arm would not leave teach mode. Keep hold of it and run "
                          "`python tools/rest.py --drop`, then power-cycle the arm.")
     print("  control taken back")

@@ -1,0 +1,20 @@
+{
+  "description": "Independent points that were not used to solve the homography.",
+  "points": [
+    {
+      "name": "validation-1",
+      "pixel": {"u": 320.0, "v": 240.0},
+      "robot_mm": {"x": 350.0, "y": 0.0}
+    },
+    {
+      "name": "validation-2",
+      "pixel": {"u": 220.0, "v": 180.0},
+      "robot_mm": {"x": 300.0, "y": 100.0}
+    },
+    {
+      "name": "validation-3",
+      "pixel": {"u": 420.0, "v": 300.0},
+      "robot_mm": {"x": 400.0, "y": -100.0}
+    }
+  ]
+}

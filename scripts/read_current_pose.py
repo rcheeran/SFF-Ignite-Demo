@@ -15,7 +15,7 @@ import sys
 import time
 from piper_sdk import *
 
-CAN_IFACE = sys.argv[1] if len(sys.argv) > 1 else "can0"
+CAN_IFACE = sys.argv[1] if len(sys.argv) > 1 else "can_piper"
 
 
 def main():

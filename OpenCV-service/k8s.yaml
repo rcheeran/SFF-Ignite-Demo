@@ -1,0 +1,125 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: productdaydemo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencv-vision
+  namespace: productdaydemo
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: opencv-vision
+  template:
+    metadata:
+      labels:
+        app: opencv-vision
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: vision
+          image: productdaydemo/opencv-vision:latest
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true
+          env:
+            - name: OWL_MODEL
+              value: candy-yolo11s
+            - name: FOUNDRY_URL
+              value: https://candy-yolo11s.foundry-local-operator.svc.cluster.local:5000
+            - name: FOUNDRY_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: candy-yolo11s-client
+                  key: api-key
+            - name: FOUNDRY_CA_CERT
+              value: /foundry-ca/ca.crt
+            - name: FOUNDRY_TIMEOUT_SECONDS
+              value: "30"
+            - name: NMS_IOU_THRESHOLD
+              value: "0.45"
+            - name: DETECTION_CONFIDENCE
+              value: "0.25"
+            - name: CAMERA_SERIAL
+              value: "126122270802"
+            - name: CAMERA_WIDTH
+              value: "640"
+            - name: CAMERA_HEIGHT
+              value: "480"
+            - name: CAMERA_FPS
+              value: "30"
+            - name: PORT
+              value: "8094"
+            - name: DEPTH_CORRECTION
+              value: /calibration/depth_correction.json
+            - name: DATASET_COLLECTION_DIR
+              value: /dataset/collected-starburst
+            - name: DATASET_CLASS_ID
+              value: "8"
+            - name: DATASET_COLLECTION_PROMPTS
+              value: starburst,starburst candy
+          ports:
+            - name: http
+              containerPort: 8094
+              hostPort: 8094
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            timeoutSeconds: 10
+          volumeMounts:
+            - name: usb
+              mountPath: /dev/bus/usb
+            - name: calibration
+              mountPath: /calibration
+              readOnly: true
+            - name: foundry-ca
+              mountPath: /foundry-ca
+              readOnly: true
+            - name: dataset
+              mountPath: /dataset
+      volumes:
+        - name: usb
+          hostPath:
+            path: /dev/bus/usb
+            type: Directory
+        - name: calibration
+          hostPath:
+            path: /home/clouduser/productdaydemo/prepare-piper/hand-eye/calibration
+            type: Directory
+        - name: foundry-ca
+          configMap:
+            name: foundry-local-ca
+        - name: dataset
+          hostPath:
+            path: /var/lib/rancher/k3s/storage/productdaydemo-yolo/datasets
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: opencv-vision
+  namespace: productdaydemo
+spec:
+  selector:
+    app: opencv-vision
+  ports:
+    - name: http
+      port: 8094
+      targetPort: http

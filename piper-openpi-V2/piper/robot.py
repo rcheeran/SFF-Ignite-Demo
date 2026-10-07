@@ -177,9 +177,17 @@ class Piper:
     # does de-torque the arm but its own demo warns the arm must be RESTARTED to leave that mode - useless
     # for a teach/replay loop. AgileX's own recordAndPlayPos does the same as this: poll ctrl_mode.
     TEACH_CTRL_MODE = 0x02
+    CAN_CTRL_MODE = 0x01
+    TEACH_STATUS_STOPPED = 0x02
+
+    def control_mode_code(self) -> int:
+        return int(self._p.GetArmStatus().arm_status.ctrl_mode)
+
+    def teach_status_code(self) -> int:
+        return int(self._p.GetArmStatus().arm_status.teach_status)
 
     def in_teach(self) -> bool:
-        return int(self._p.GetArmStatus().arm_status.ctrl_mode) == self.TEACH_CTRL_MODE
+        return self.control_mode_code() == self.TEACH_CTRL_MODE
 
     def wait_teach(self, on: bool, timeout=120.0, poll=0.2) -> bool:
         """Block until the teach button has been pressed into (on) or out of (off) teach mode."""
@@ -187,6 +195,16 @@ class Piper:
         while time.time() - t0 < timeout and self.in_teach() != on:
             time.sleep(poll)
         return self.in_teach() == on
+
+    def wait_teach_stopped(self, timeout=120.0, poll=0.2) -> bool:
+        """Wait for the physical teach button to stop recording and restore stiffness."""
+        t0 = time.time()
+        while (
+            time.time() - t0 < timeout
+            and self.teach_status_code() != self.TEACH_STATUS_STOPPED
+        ):
+            time.sleep(poll)
+        return self.teach_status_code() == self.TEACH_STATUS_STOPPED
 
     def gripper_enable(self, clear_errors=True):
         """Enable the gripper, clearing any latched error.
@@ -199,29 +217,55 @@ class Piper:
         self._p.GripperCtrl(int(self.grip_mm() * 1000), C.GRIP_EFFORT, 0x03 if clear_errors else 0x01, 0)
         time.sleep(0.1)
 
-    def teach_stop(self, timeout=8.0) -> bool:
+    def teach_stop(self, timeout=8.0, hold_joints=None) -> bool:
         """Force the arm out of teach mode and take CAN control back. Does NOT need the button pressed again.
 
-        Measured on this arm with tools/teach_probe.py, because four inferences about it were wrong:
-          * MotionCtrl_1(0,0,0x02) "end teach record"   -> ctrl_mode stays 2
-          * ModeCtrl(0x01,0x01) streamed  (AgileX playPos does this) -> ctrl_mode stays 2
-          * MotionCtrl_2(0x01,0x01) streamed           -> ctrl_mode 2 -> 1, and JointCtrl is obeyed
-        ModeCtrl and MotionCtrl_2 are both CAN ID 0x151; MotionCtrl_2 sends two more fields (residence_time,
-        installation_pos) and only the longer frame is accepted here. EmergencyStop was never reached, so it
-        is NOT needed. It also has to be STREAMED: `_enable_motors`' single MotionCtrl_2 is ignored while
-        teaching, which is what made this look unfixable. The arm is limp until this returns - the caller
-        must have the operator holding it."""
-        t0 = time.time()
-        while self.in_teach() and time.time() - t0 < timeout:
-            self._p.MotionCtrl_2(0x01, 0x01, C.SPEED_HOME, 0x00)
+        The operator must first press the physical teach button so teach_status
+        becomes STOP_RECORDING and the arm stiffens. Then reproduce the ordered
+        sequence measured by tools/teach_probe.py:
+          1. End teach recording with MotionCtrl_1.
+          2. Stream the short ModeCtrl frame for two seconds.
+          3. Stream the full MotionCtrl_2 frame until ctrl_mode becomes CAN_CTRL.
+        The first two commands do not leave teach mode alone. Field runs showed
+        that CAN exit is ineffective while teach_status is START_RECORDING.
+        The caller must keep supporting the arm until physical stop has restored
+        stiffness and this method has returned CAN control. The taught joint
+        pose is captured before changing modes and streamed as soon as CAN
+        control appears, preventing the controller from following a stale
+        target such as zero."""
+        if self.in_teach() and self.teach_status_code() != self.TEACH_STATUS_STOPPED:
+            return False
+        hold = np.asarray(
+            self.joints_deg() if hold_joints is None else hold_joints,
+            dtype=np.float64,
+        )
+        if hold.shape != (6,) or not np.all(np.isfinite(hold)):
+            raise ValueError("hold_joints must contain six finite joint angles")
+        self._p.MotionCtrl_1(0x00, 0x00, 0x02)
+        prime_deadline = time.time() + min(2.0, timeout)
+        while time.time() < prime_deadline:
+            self._p.ModeCtrl(0x01, 0x01, C.SPEED_HOME, 0x00)
             time.sleep(0.01)
-        if self.in_teach():
+
+        deadline = time.time() + timeout
+        stable_since = None
+        while time.time() < deadline:
+            self._p.MotionCtrl_2(0x01, 0x01, C.SPEED_HOME, 0x00)
+            if self.control_mode_code() == self.CAN_CTRL_MODE:
+                self.send_joints(hold, None, C.SPEED_REST)
+                stable_since = stable_since or time.time()
+                if time.time() - stable_since >= 0.5:
+                    break
+            else:
+                stable_since = None
+            time.sleep(0.01)
+        if self.control_mode_code() != self.CAN_CTRL_MODE:
             return False
         ok = self._enable_motors(timeout)
         if ok:
             self.gripper_enable()          # the hand just operated the jaws: clear any error it latched
-            self.send_joints(self.joints_deg(), None, C.SPEED_REST)   # hold where the hand left it, don't snap
-        return ok
+            self.send_joints(hold, None, C.SPEED_REST)
+        return ok and self.control_mode_code() == self.CAN_CTRL_MODE
 
     def joint_limits(self):
         """[[min, max] deg] * 6 as stored in the motors (queried; None if no reply), or None if the SDK lacks it."""
@@ -434,6 +478,27 @@ class Piper:
                 reached_at = None
         return np.abs(self.joints_deg() - target)[mask].max() < tol
 
+    def move_to_zero(self, secs=C.HOME_TIMEOUT_S, speed=C.SPEED_HOME,
+                     tol=C.HOME_TOL_DEG, settle=0.5) -> bool:
+        """Move to the calibrated all-zero pose using the SDK's ModeCtrl/JointCtrl sequence."""
+        target = np.zeros(6, dtype=np.float64)
+        mask = self.enabled_mask()
+        if not mask.any():
+            return False
+        t0, reached_at = time.time(), None
+        while time.time() - t0 < secs:
+            self._p.ModeCtrl(0x01, 0x01, int(speed), 0x00)
+            self._p.JointCtrl(0, 0, 0, 0, 0, 0)
+            time.sleep(1.0 / C.CONTROL_HZ)
+            close = np.abs(self.joints_deg() - target)[mask].max() < tol
+            if close and reached_at is None:
+                reached_at = time.time()
+            elif close and time.time() - reached_at >= settle:
+                return True
+            elif not close:
+                reached_at = None
+        return np.abs(self.joints_deg() - target)[mask].max() < tol
+
     def home(self, grip_mm=None) -> bool:
         print(f"home: {np.round(self.joints_deg(), 1).tolist()} -> {C.HOME_JOINTS_DEG} at {C.SPEED_HOME} %")
         ok = self.move_joints(C.HOME_JOINTS_DEG, C.HOME_TIMEOUT_S, grip_mm, speed=C.SPEED_HOME)
@@ -469,6 +534,50 @@ def connect_for_motion(countdown=5, iface=C.CAN_IFACE) -> Piper:
     except BaseException:   # Ctrl-C after EnablePiper went out: home slowly + de-torque (no-op if never connected);
         arm.rest(drop=arm._p is not None and not all(arm.enabled()))   # mid-enable = was limp a moment ago: in place
         lock.close()        # idempotent when rest() -> disconnect() already closed it
+        raise
+    return arm
+
+
+def connect_for_teach(iface=C.CAN_IFACE) -> Piper:
+    """Take exclusive CAN control and enable the arm without touching camera processes.
+
+    Camera-assisted teach workflows need the same enabled-arm lifecycle as
+    connect_for_motion(), but must keep their own camera/FFmpeg processes alive.
+    """
+    lock = acquire_lock()
+    n = can_receivers(iface)
+    if n:
+        lock.close()
+        raise SystemExit(
+            f"ABORT: {n} other CAN receiver(s) on {iface} - stop them first"
+        )
+    arm = Piper(iface)
+    try:
+        arm.connect(enable=True)
+        arm._lock = lock
+        if arm.in_teach():
+            if arm.teach_status_code() != arm.TEACH_STATUS_STOPPED:
+                raise RuntimeError(
+                    "arm started in active teach recording; support it and press "
+                    "the physical Teach button to stop recording before retrying"
+                )
+            startup_hold = arm.joints_deg()
+            if not arm.teach_stop(hold_joints=startup_hold):
+                raise RuntimeError(
+                    "could not normalize stopped teach state to CAN control"
+                )
+        print(
+            f"enabled {arm.enabled()}  mode {arm.ctrl_mode()}  "
+            f"J6 {arm.j6_temp()} C  faults {arm.faults() or 'none'}  "
+            f"joints {np.round(arm.joints_deg(), 1).tolist()}"
+        )
+    except RuntimeError as exc:
+        arm.disconnect()
+        lock.close()
+        raise SystemExit(f"ABORT: {exc}") from None
+    except BaseException:
+        arm.disconnect()
+        lock.close()
         raise
     return arm
 

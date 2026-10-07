@@ -36,7 +36,7 @@ the training bill was about **$4**.
 |---|---|
 | **AgileX Piper** | 6-DOF robot arm with a parallel-jaw gripper. Joint limits `[±150, 0–180, −170–0, ±100, ±70, ±120]°`, gripper 0–70 mm. Commanded over **CAN** at 1 Mbps. |
 | **Jetson AGX Thor** | The computer on the robot. Runs the policy locally — no cloud call in the control loop. Blackwell-class GPU (`sm_110`), which drives several toolchain quirks. |
-| **USB-CAN adapter** | Links Thor to the arm. Thor's kernel has no in-tree `gs_usb` driver, so `setup.sh` builds it; without that the adapter never appears as a network interface. |
+| **USB-CAN adapter** | Links Thor to the arm. Thor's kernel has no in-tree `gs_usb` driver, so `prepare-jetson/setup.sh` builds it; without that the adapter never appears as a network interface. |
 | **Top camera** | USB webcam on a stand, wide view of the whole table — 640×480. Sees where the block and bowl are. |
 | **Wrist camera** | Intel RealSense D405 on the gripper — 640×480. Close-in view for the grasp itself. |
 | **Quest 3 headset** | VR teleoperation. Built and working, but **superseded** by drag-teach (§3) because it was too hard to drive consistently. |
@@ -191,8 +191,9 @@ in 900.
 
 Three things were needed to make it work on this hardware, each documented in `CONTRACT.md`:
 
-- **`torch.compile` must be off.** Triton bundles a CUDA 12.8 `ptxas` with no `sm_110a`, so compilation can
-  never succeed on Thor. Eager mode costs little (~527 ms, 0 late ticks).
+- **`torch.compile` is off by default.** Triton bundles a CUDA 12.8 `ptxas` with no `sm_110a`, so its default
+  compilation path fails on Thor. Eager mode costs little (~527 ms, 0 late ticks). The system CUDA 13.2
+  `ptxas` does recognise `sm_110a` and can be selected for experimental compiled-mode testing; details are below.
 - **`--n-action-steps 30`, not the default 10.** Every teach episode opens with ~2.8 s of stationary arm, so
   chunk actions 0–25 are settling. At 10 the loop only ever executes that prefix, re-predicts from an unchanged
   state, and **stalls forever looking like a broken policy**.
@@ -202,6 +203,101 @@ Three things were needed to make it work on this hardware, each documented in `C
 
 Safety runs underneath all of it: per-tick step limits, a lead clamp, joint limits, a tool-tip floor, and a
 firmware-fault stop that rests the arm. `--shadow` runs the whole loop read-only, printing what it *would* send.
+
+### Why `torch.compile` is disabled on Thor
+
+PyTorch can execute a model in two ways:
+
+- **Eager mode** runs each PyTorch operation immediately using CUDA kernels shipped with PyTorch.
+- **Compiled mode** captures groups of operations with TorchDynamo, optimises and fuses them with
+  TorchInductor, then asks Triton to generate specialised GPU kernels. Triton's `ptxas` assembler turns those
+  generated kernels into code for the target NVIDIA GPU.
+
+The compiled path is roughly:
+
+```text
+PyTorch model -> TorchDynamo -> TorchInductor -> Triton -> ptxas -> GPU kernel
+```
+
+Thor's Blackwell GPU is an `sm_110`/`sm_110a` target. The installed `torch 2.9.1+cu130` aarch64 SBSA wheel
+supports `sm_110`, so its prebuilt CUDA kernels run correctly on Thor. The problem is narrower: the current
+Triton package bundles a CUDA 12.8 `ptxas` that predates `sm_110a`. When LeRobot's π0.5 sampler triggers
+compilation, that assembler rejects the target:
+
+```text
+ptxas fatal : Value 'sm_110a' is not defined for option 'gpu-name'
+```
+
+This does **not** mean CUDA or the Thor GPU is unavailable, and eager mode does **not** fall back to the CPU.
+Inference still runs on the GPU; it simply uses PyTorch's existing CUDA kernels instead of generating and
+fusing new Triton kernels. Updating only the NVIDIA driver would not fix the mismatch because Triton would
+still select its bundled userspace assembler.
+
+[`inference/run_policy.py`](../inference/run_policy.py) therefore disables TorchDynamo unless compilation is
+explicitly requested:
+
+```python
+if os.environ.get("PIPER_COMPILE") != "1":
+    torch._dynamo.config.disable = True
+```
+
+Leave `PIPER_COMPILE` unset for normal dry-run, shadow, simulation, and live operation. Setting it to `0` also
+keeps compilation disabled; only the exact value `1` opts into the compiled path. The policy performs a
+blank-observation warm-up while it is constructed, so a compiler failure normally occurs at startup rather
+than after the control loop starts.
+
+The eager model takes roughly 420–527 ms to predict a 50-action chunk. That is slower than one 15 Hz control
+tick, but the worker thread computes the next chunk while the loop consumes the current one. With
+`--n-action-steps 30`, this has produced zero late ticks in the measured runs, so compilation is not required
+to meet the current control-loop timing.
+
+#### Testing with the system CUDA 13.2 `ptxas`
+
+The Thor has a newer system assembler at `/usr/local/cuda/bin/ptxas`. Unlike Triton's bundled CUDA 12.8
+assembler, it recognises `sm_110a`:
+
+```bash
+/usr/local/cuda/bin/ptxas --version
+/usr/local/cuda/bin/ptxas --help | grep sm_110a
+```
+
+Triton 3.5.1 supports the `TRITON_PTXAS_PATH` environment variable, so use it to select the system assembler
+without replacing files inside the Python environment or independently upgrading the PyTorch-pinned Triton
+package:
+
+```bash
+TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas python -c \
+  "from triton import knobs; print(knobs.nvidia.ptxas.path, knobs.nvidia.ptxas.version)"
+# /usr/local/cuda/bin/ptxas 13.2
+```
+
+This fixes the known architecture-recognition failure. It does not prove that every kernel Triton 3.5.1 emits
+is valid or performant on Thor, so qualify the actual π0.5 workload without hardware first. Use a fresh
+TorchInductor cache on a filesystem with enough free space:
+
+```bash
+CKPT=/mnt/k3s-data/clouduser/models/lerobot-pi05-base-50/pretrained_model
+mkdir -p /mnt/k3s-data/clouduser/torchinductor-cache
+
+TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+TORCHINDUCTOR_CACHE_DIR=/mnt/k3s-data/clouduser/torchinductor-cache \
+PIPER_COMPILE=1 \
+python -m inference.run_policy \
+  --checkpoint "$CKPT" \
+  --dry-run --max-steps 3
+```
+
+If the checkpoint lives elsewhere, set `CKPT` to its absolute `pretrained_model` directory. A missing local
+path is interpreted as a Hugging Face repository ID and produces an unrelated `HFValidationError`.
+
+The test must load the model, complete warm-up, and repeatedly produce valid actions without a Triton,
+`ptxas`, PTX instruction, or runtime error. Then compare a longer compiled dry run with the eager baseline;
+compilation is useful only if steady-state latency or resource use improves. Progress through simulation and
+shadow mode before a supervised live test. Keep eager mode as the default until that qualification is complete.
+
+If the system-assembler override exposes a different Triton code-generation error, do not spoof an older GPU
+with `TRITON_OVERRIDE_ARCH`. Test a mutually compatible PyTorch, Triton, CUDA, and Jetson runtime combination
+in a separate virtual environment instead of upgrading Triton underneath the working PyTorch installation.
 
 ---
 

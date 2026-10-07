@@ -1,0 +1,9 @@
+# Jetson Thor OWL-ViT runtime for demo.py.
+# The CUDA 13 index supplies the aarch64 torch build with sm_110 support.
+--extra-index-url https://download.pytorch.org/whl/cu130
+
+torch==2.9.1+cu130
+torchvision==0.24.1
+transformers==5.5.4
+pillow==12.3.0
+safetensors==0.8.0

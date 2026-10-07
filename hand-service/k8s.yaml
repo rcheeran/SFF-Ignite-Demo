@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: productdaydemo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hand-landmarker
+  namespace: productdaydemo
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: hand-landmarker
+  template:
+    metadata:
+      labels:
+        app: hand-landmarker
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: hand-landmarker
+          image: productdaydemo/hand-landmarker:latest
+          imagePullPolicy: Never
+          env:
+            - name: PORT
+              value: "8095"
+            - name: SOURCE_MJPEG_URL
+              value: http://127.0.0.1:8094/stream.mjpg
+            - name: VISION_URL
+              value: http://127.0.0.1:8094
+            - name: HAND_MODEL
+              value: /models/hand_landmarker.task
+            - name: MAX_HANDS
+              value: "2"
+            - name: INFERENCE_FPS
+              value: "10"
+            - name: MIN_HAND_DETECTION_CONFIDENCE
+              value: "0.5"
+            - name: MIN_HAND_PRESENCE_CONFIDENCE
+              value: "0.5"
+            - name: MIN_TRACKING_CONFIDENCE
+              value: "0.5"
+            - name: STABILITY_SAMPLES
+              value: "5"
+            - name: MINIMUM_STABLE_SAMPLES
+              value: "3"
+            - name: MAXIMUM_PALM_SPREAD_MM
+              value: "50"
+          ports:
+            - name: http
+              containerPort: 8095
+              hostPort: 8095
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 24
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: hand-landmarker
+  namespace: productdaydemo
+spec:
+  selector:
+    app: hand-landmarker
+  ports:
+    - name: http
+      port: 8095
+      targetPort: http

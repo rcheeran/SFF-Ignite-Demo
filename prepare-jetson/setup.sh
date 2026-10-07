@@ -7,13 +7,101 @@
 # Tested on Ubuntu 24.04.4 / Python 3.12 (x86) and on the NVIDIA Jetson
 # AGX Thor Developer Kit (aarch64, L4T kernel 6.8.x-tegra).
 #
-# Usage: bash setup.sh
+# Usage from the repository root: bash prepare-jetson/setup.sh
 set -euo pipefail
 
 VENV_DIR="${VENV_DIR:-$HOME/venv}"
 PIPER_IFACE="${PIPER_IFACE:-can_piper}"   # stable name pinned via udev (step 6)
 CAN_BITRATE="${CAN_BITRATE:-1000000}"     # Piper runs at 1 Mbps
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SETUP_USER="${SUDO_USER:-$(id -un)}"
+REQUIREMENTS_FILE="$SCRIPT_DIR/requirements-setup.txt"
+REALSENSE_RULES_FILE="$SCRIPT_DIR/../config/99-realsense-d405.rules"
+
+if [ "$EUID" -eq 0 ]; then
+    echo "ERROR: run this script as your normal user, not with sudo." >&2
+    echo "       The script invokes sudo only for system-level changes." >&2
+    exit 1
+fi
+
+check_apt_packages_available() {
+    local package missing=()
+    for package in python3-pip python3-venv can-utils ethtool build-essential curl usbutils ffmpeg; do
+        if ! apt-cache show "$package" >/dev/null 2>&1; then
+            missing+=("$package")
+        fi
+    done
+    if [ "${#missing[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    echo "ERROR: required Ubuntu packages are unavailable: ${missing[*]}" >&2
+    echo "       Check that the standard Ubuntu repositories are enabled." >&2
+    if [ -f /etc/apt/sources.list.d/ubuntu.sources.disabled ]; then
+        echo "       Found disabled source: /etc/apt/sources.list.d/ubuntu.sources.disabled" >&2
+        echo "       Review it, then enable it as ubuntu.sources before rerunning setup." >&2
+    fi
+    return 1
+}
+
+install_realsense_permissions() {
+    if [ ! -f "$REALSENSE_RULES_FILE" ]; then
+        echo "ERROR: missing RealSense udev rules: $REALSENSE_RULES_FILE" >&2
+        return 1
+    fi
+
+    echo "    udev rule -> /etc/udev/rules.d/99-realsense-d405.rules"
+    sudo install -m 0644 "$REALSENSE_RULES_FILE" \
+        /etc/udev/rules.d/99-realsense-d405.rules
+    getent group video >/dev/null || sudo groupadd --system video
+    getent group plugdev >/dev/null || sudo groupadd --system plugdev
+    getent group render >/dev/null || sudo groupadd --system render
+    sudo usermod -aG video,plugdev,render "$SETUP_USER"
+    sudo udevadm control --reload-rules
+    sudo udevadm trigger --subsystem-match=usb --action=change
+    sudo udevadm trigger --subsystem-match=video4linux --action=change
+}
+
+verify_python_environment() {
+    sudo -u "$SETUP_USER" -g video "$VENV_DIR/bin/python" - <<'PY'
+import can
+import cv2
+import numpy
+import piper_sdk
+import pyAgxArm
+import pyrealsense2
+
+print("    Python imports: OK")
+PY
+}
+
+verify_realsense() {
+    if ! command -v lsusb >/dev/null 2>&1 ||
+            ! lsusb | grep -qiE '8086:0b5b|realsense'; then
+        echo "    RealSense: not connected - skipping device check."
+        return 0
+    fi
+
+    if sudo -u "$SETUP_USER" -g video "$VENV_DIR/bin/python" - <<'PY'
+import pyrealsense2 as rs
+
+devices = rs.context().query_devices()
+if len(devices) == 0:
+    raise SystemExit("RealSense USB device is present but the SDK cannot access it")
+for device in devices:
+    print(
+        "    RealSense:",
+        device.get_info(rs.camera_info.name),
+        device.get_info(rs.camera_info.serial_number),
+    )
+PY
+    then
+        return 0
+    fi
+
+    echo "    ERROR: RealSense verification failed. Replug the camera and retry." >&2
+    return 1
+}
 
 # ---------------------------------------------------------------------------
 # ensure_gs_usb: make sure the Geschwister Schneider / candleLight USB-CAN
@@ -145,10 +233,12 @@ EOF
     sudo systemctl restart piper-can.service || true
 }
 
-echo "==> 1. Installing system packages (python3-pip, python3-venv, can-utils, ethtool, build tools)"
+echo "==> 1. Installing system packages (Python, CAN, USB, video, and build tools)"
 sudo apt update
+check_apt_packages_available
 # build-essential + curl are needed to build gs_usb from source on Jetson (step 5).
-sudo apt install -y python3-pip python3.12-venv can-utils ethtool build-essential curl
+sudo apt install -y \
+    python3-pip python3-venv can-utils ethtool build-essential curl usbutils ffmpeg
 
 echo "==> 2. Creating Python virtual environment at $VENV_DIR"
 python3 -m venv "$VENV_DIR"
@@ -156,17 +246,11 @@ python3 -m venv "$VENV_DIR"
 source "$VENV_DIR/bin/activate"
 
 echo "==> 3. Installing SDKs into the venv"
-pip install --upgrade pip
-pip install python-can
-# pyAgxArm is not published on PyPI (pip install pyAgxArm will fail) -
-# install straight from GitHub source.
-pip install "git+https://github.com/agilexrobotics/pyAgxArm.git"
-# piper_sdk (older/more established SDK) is on PyPI - installed alongside
-# for cross-checking behavior against pyAgxArm.
-pip install piper_sdk
+python -m pip install --upgrade "pip==26.2.1"
+python -m pip install -r "$REQUIREMENTS_FILE"
 
-echo "==> 4. Installing camera/vision dependencies (Intel RealSense)"
-pip install pyrealsense2 numpy opencv-python-headless
+echo "==> 4. Installing Intel RealSense D405 permissions"
+install_realsense_permissions
 
 echo "==> 5. Ensuring the gs_usb USB-CAN driver is present (needed on Jetson Thor)"
 ensure_gs_usb
@@ -174,7 +258,7 @@ ensure_gs_usb
 echo "==> 6. Pinning a stable interface name + auto bring-up at boot (udev + systemd)"
 install_piper_can_service
 # For a one-off manual bring-up, or for non-Piper CAN adapters, the lower-level
-# helpers scripts/find_all_can_port.sh and scripts/can_activate.sh are still
+# helpers scripts/find_all_can_port.sh and prepare-piper/can_activate.sh are still
 # available (can_activate.sh expects a single USB-CAN adapter; on a Jetson with
 # native mttcan controllers pass a USB bus-address argument - see its usage).
 
@@ -186,13 +270,33 @@ for i in $(ip -br link show type can 2>/dev/null | awk '{print $1}'); do
     fi
 done
 if [ -n "$PIPER_IF" ]; then
-    ip -details link show "$PIPER_IF"
+    PIPER_DETAILS="$(ip -details link show "$PIPER_IF")"
+    echo "$PIPER_DETAILS"
+    if ! grep -q "can state ERROR-ACTIVE" <<<"$PIPER_DETAILS"; then
+        echo "    ERROR: $PIPER_IF is not ERROR-ACTIVE." >&2
+        exit 1
+    fi
+    if ! grep -q "bitrate $CAN_BITRATE" <<<"$PIPER_DETAILS"; then
+        echo "    ERROR: $PIPER_IF is not configured at $CAN_BITRATE bps." >&2
+        exit 1
+    fi
     echo "    Piper adapter is '$PIPER_IF' now; stable name '$PIPER_IFACE' applies from the next replug/reboot."
 else
     echo "    WARNING: no gs_usb CAN adapter found - is the Piper's USB-CAN adapter plugged in?"
 fi
 
+echo "==> 8. Verifying installed SDKs and camera access"
+verify_python_environment
+verify_realsense
+
 echo
 echo "Setup complete. To use the SDK later:"
 echo "  source $VENV_DIR/bin/activate"
-echo "  python3 scripts/check_connection.py $PIPER_IFACE"
+echo "  python3 prepare-piper/check_connection.py $PIPER_IFACE"
+if ! id -nG | tr ' ' '\n' | grep -qx video ||
+        ! id -nG | tr ' ' '\n' | grep -qx plugdev ||
+        ! id -nG | tr ' ' '\n' | grep -qx render; then
+    echo
+    echo "Log out and back in (or reboot) before using the camera or GPU so the"
+    echo "new video/plugdev/render group memberships take effect."
+fi

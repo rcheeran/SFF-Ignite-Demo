@@ -4,18 +4,18 @@
 No motion commands are sent. Connects, enables the arm, and reports CAN fps,
 arm status, joint angles, and enable state.
 
-Before running this, the arm must be in Slave mode - see SETUP.md. If it's
+Before running this, the arm must be in Slave mode - see prepare-jetson/SETUP.md. If it's
 still in Master mode (or was switched without a restart), ArmStatus.Hz will
 read 0.0 and Control Mode will show TEACHING_MODE instead of STANDBY/CAN_CTRL,
 even though the CAN link itself looks healthy.
 
-Usage: python3 scripts/check_connection.py [can_iface]
+Usage: python3 prepare-piper/check_connection.py [can_iface]
 """
 import sys
 import time
 from piper_sdk import *
 
-CAN_IFACE = sys.argv[1] if len(sys.argv) > 1 else "can0"
+CAN_IFACE = sys.argv[1] if len(sys.argv) > 1 else "can_piper"
 
 
 def main():
@@ -27,7 +27,7 @@ def main():
 
     status = piper.GetArmStatus()
     print("\nArmStatus.Hz:", getattr(status, "Hz", "n/a"),
-          "(0.0 means no real status frame received - check Slave mode / restart, see SETUP.md)")
+          "(0.0 means no real status frame received - check Slave mode / restart, see prepare-jetson/SETUP.md)")
     print(status)
 
     angles = piper.GetArmJointMsgs()

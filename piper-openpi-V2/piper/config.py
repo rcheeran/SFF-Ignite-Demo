@@ -50,10 +50,10 @@ GRIP_CLOSED_MM = 0.0
 GRIP_EFFORT = 1000       # 0.001 N/m
 
 # ---- Cartesian safety (flange frame, mm / deg) -------------------------------
-WORKSPACE_MIN_MM = [30.0, -300.0, 40.0]     # flange at HOME is x~46, y~-26, z~238 - must lie inside
-WORKSPACE_MAX_MM = [480.0, 300.0, 480.0]
+WORKSPACE_MIN_MM = [30.0, -400.0, 40.0]     # flange at HOME is x~46, y~-26, z~238 - must lie inside
+WORKSPACE_MAX_MM = [500.0, 400.0, 480.0]
 TOOL_LEN_MM = 120.0      # gripper tip lies this far past the flange along the tool z-axis
-TIP_Z_FLOOR_MM = 15.0    # tool tip never commanded below this height above the table
+TIP_Z_FLOOR_MM = 9.0     # tool tip never commanded below this height above the table
 STEP_MAX_MM = 15.0       # per 30 Hz tick
 STEP_MAX_DEG = 8.0
 

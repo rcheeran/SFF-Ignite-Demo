@@ -145,7 +145,7 @@ class RealPiperBackend:
         warn = None
         if not hz:
             warn = ("Arm status frames (0x2A1-0x2A8) not received (Hz=0). The arm "
-                    "is likely still in Master/teach mode — see SETUP.md: turn off "
+                    "is likely still in Master/teach mode — see prepare-jetson/SETUP.md: turn off "
                     "the Joint-5 button, set Slave mode, restart, reactivate CAN.")
         return {"ok": True, "can_fps": fps, "telemetry_hz": hz, "warning": warn}
 

@@ -1,0 +1,112 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: productdaydemo
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: owlvit-vision
+  namespace: productdaydemo
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: owlvit-vision
+  template:
+    metadata:
+      labels:
+        app: owlvit-vision
+    spec:
+      runtimeClassName: nvidia
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: vision
+          image: productdaydemo/owlvit-vision:latest
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: all
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,utility
+            - name: LD_LIBRARY_PATH
+              value: /opt/nvidia/l4t-gpu-libs/openrm
+            - name: OWL_MODEL
+              value: google/owlvit-base-patch32
+            - name: CAMERA_SERIAL
+              value: "126122270802"
+            - name: CAMERA_WIDTH
+              value: "640"
+            - name: CAMERA_HEIGHT
+              value: "480"
+            - name: CAMERA_FPS
+              value: "30"
+            - name: PORT
+              value: "8094"
+            - name: DEPTH_CORRECTION
+              value: /calibration/depth_correction.json
+          ports:
+            - name: http
+              containerPort: 8094
+              hostPort: 8094
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 36
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 180
+            periodSeconds: 15
+            timeoutSeconds: 3
+          volumeMounts:
+            - name: usb
+              mountPath: /dev/bus/usb
+            - name: calibration
+              mountPath: /calibration
+              readOnly: true
+            - name: model-cache
+              mountPath: /root/.cache/huggingface
+            - name: l4t-gpu-libs
+              mountPath: /opt/nvidia/l4t-gpu-libs
+              readOnly: true
+      volumes:
+        - name: usb
+          hostPath:
+            path: /dev/bus/usb
+            type: Directory
+        - name: calibration
+          hostPath:
+            path: /home/clouduser/productdaydemo/prepare-piper/hand-eye/calibration
+            type: Directory
+        - name: model-cache
+          hostPath:
+            path: /home/clouduser/.cache/huggingface
+            type: DirectoryOrCreate
+        - name: l4t-gpu-libs
+          hostPath:
+            path: /opt/nvidia/l4t-gpu-libs
+            type: Directory
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: owlvit-vision
+  namespace: productdaydemo
+spec:
+  selector:
+    app: owlvit-vision
+  ports:
+    - name: http
+      port: 8094
+      targetPort: http

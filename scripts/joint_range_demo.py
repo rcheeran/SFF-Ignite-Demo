@@ -17,7 +17,7 @@ motions - only with plenty of clearance below and around the arm).
 Mechanical limits (Piper URDF), degrees:
     J1 +/-150    J2 0..180    J3 -170..0    J4 +/-100    J5 +/-70    J6 +/-120
 
-Prereqs (see SETUP.md): arm in Slave mode, CAN up, arm reachable via piper_sdk.
+Prereqs (see prepare-jetson/SETUP.md): arm in Slave mode, CAN up, arm reachable via piper_sdk.
 The arm is on interface `can_piper` on this machine (see README/memory).
 
 Usage:

@@ -1,6 +1,6 @@
 # Restore this machine from scratch
 
-Written 2026-09-04, before a planned reimage of the Jetson Thor. Follow in order. `SETUP.md` covers getting
+Written 2026-09-04, before a planned reimage of the Jetson Thor. Follow in order. `prepare-jetson/SETUP.md` covers getting
 the *arm* talking over CAN; this covers getting the *software and state* back.
 
 Everything large is deliberately NOT in this repo — datasets and checkpoints live on the Hugging Face Hub and
@@ -17,22 +17,22 @@ are re-pullable. What IS here is everything that is small and irreplaceable.
 | Claude Code's memory | `docs/agent-memory/` (step 5) |
 | the dataset (463 MB) | Hub: `royc1981/piper_block_bowl` |
 | the trained policy (9.35 GB) | Hub: `royc1981/lerobot-pi05-base-50` |
-| the gs_usb CAN kernel module | `setup.sh` rebuilds it (Thor has no in-tree gs_usb) |
+| the gs_usb CAN kernel module | `prepare-jetson/setup.sh` rebuilds it (Thor has no in-tree gs_usb) |
 | **HF token, Lambda API key, Lambda SSH key** | **nothing — recreate by hand, step 4** |
 
 ## 1. System, CAN and the arm
 
 ```bash
 git clone https://github.com/rcheeran/SFF-AgileX-Piper.git ~/Documents/SFF-AgileX-Piper
-cd ~/Documents/SFF-AgileX-Piper && bash setup.sh
+cd ~/Documents/SFF-AgileX-Piper && bash prepare-jetson/setup.sh
 ```
 
-Then follow `SETUP.md` (arm out of Master mode, udev name `can_piper`, verify). Thor has no in-tree `gs_usb`,
-so `setup.sh` builds and installs it — without that the USB-CAN adapter never enumerates as a `canX` interface.
+Then follow `prepare-jetson/SETUP.md` (arm out of Master mode, udev name `can_piper`, verify). Thor has no in-tree `gs_usb`,
+so `prepare-jetson/setup.sh` builds and installs it — without that the USB-CAN adapter never enumerates as a `canX` interface.
 
 ## 2. The python environment the VLA stack runs on
 
-`setup.sh` creates `~/venv` for the arm SDK. The VLA work uses a **separate** venv, `~/lerobot-venv`:
+`prepare-jetson/setup.sh` creates `~/venv` for the arm SDK. The VLA work uses a **separate** venv, `~/lerobot-venv`:
 
 ```bash
 python3 -m venv ~/lerobot-venv && source ~/lerobot-venv/bin/activate

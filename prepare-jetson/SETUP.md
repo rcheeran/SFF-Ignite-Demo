@@ -1,8 +1,73 @@
 # Piper Arm Setup
 
 Steps to get a Piper arm from a fresh Ubuntu machine to a verified, controllable
-CAN connection. Run `bash setup.sh` first (system deps, venv, CAN activation -
+CAN connection. Run `bash prepare-jetson/setup.sh` first (system deps, venv, CAN activation -
 see README.md), then follow the steps below, in order.
+
+## Host packages and camera preview access
+
+`prepare-jetson/setup.sh` installs the required Python, CAN, USB, RealSense,
+build, and video packages. The video packages include `ffmpeg`, which the
+fixed-pose homography workflow uses to encode the wrist-camera alignment
+preview as MJPEG.
+
+The setup also adds the operator to `video`, `plugdev`, and `render`. Log out
+and back in, reboot, or reconnect the VS Code remote session before using the
+D405 or CUDA. Verify the effective groups with:
+
+```bash
+id
+```
+
+OWL-ViT additionally requires:
+
+```bash
+source ~/venv/bin/activate
+pip install -r prepare-jetson/requirements-demo.txt
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Expected on the Jetson Thor: `True NVIDIA Thor`.
+
+Verify FFmpeg after setup:
+
+```bash
+ffmpeg -version | head -n 1
+```
+
+The homography alignment page listens on TCP port `8094`. This Jetson's k3s
+firewall has a default-drop input policy, so allow that port only from the
+local `10.0.0.0/24` network:
+
+```bash
+sudo iptables -C INPUT -p tcp -s 10.0.0.0/24 --dport 8094 -j ACCEPT 2>/dev/null ||
+  sudo iptables -I INPUT 1 -p tcp -s 10.0.0.0/24 --dport 8094 -j ACCEPT
+```
+
+Verify the scoped rule:
+
+```bash
+sudo iptables -C INPUT -p tcp -s 10.0.0.0/24 --dport 8094 -j ACCEPT
+sudo iptables -L INPUT -n --line-numbers | head
+```
+
+This does not expose the preview outside the local subnet. The runtime rule
+may be removed by a reboot or a k3s firewall reload; rerun the idempotent
+command above if the preview URL times out. To remove the rule manually:
+
+```bash
+sudo iptables -D INPUT -p tcp -s 10.0.0.0/24 --dport 8094 -j ACCEPT
+```
+
+While `record_scan_pose.py` is running, open:
+
+```text
+http://<jetson-ip>:8094/
+```
+
+For this machine the current address is `http://10.0.0.19:8094/`. The server
+stops when the script exits, so the URL is expected to refuse connections at
+other times.
 
 ## 1. Put the arm in Slave mode
 
@@ -15,7 +80,7 @@ see README.md), then follow the steps below, in order.
 
    ```python
    from piper_sdk import *
-   piper = C_PiperInterface_V2("can0")
+   piper = C_PiperInterface_V2("can_piper")
    piper.ConnectPort()
    piper.MasterSlaveConfig(0xFC, 0, 0, 0)   # 0xFA = Master, 0xFC = Slave
    ```
@@ -36,20 +101,19 @@ The USB-CAN adapter drops its interface state across an arm power cycle
 Bring it back up:
 
 ```bash
-bash scripts/can_activate.sh can0 1000000
+sudo systemctl restart piper-can.service
 ```
 
 Verify:
 
 ```bash
-ip -details link show can0   # expect: state UP, can state ERROR-ACTIVE, bitrate 1000000
+ip -details link show can_piper   # expect: state UP, can state ERROR-ACTIVE, bitrate 1000000
 ```
 
 ## 4. Verify the connection
 
 ```bash
-source ~/venv/bin/activate
-python3 scripts/check_connection.py
+/home/clouduser/venv/bin/python prepare-piper/check_connection.py can_piper
 ```
 
 Expect:

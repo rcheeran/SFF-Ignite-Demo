@@ -8,3 +8,8 @@ scripts/pos.csv
 # Local secrets and runtime artifacts for the piper-asimov agent
 .env
 piper-asimov/piper-real-toolset/captures/
+
+# Host-specific runtime storage and local backups
+OpenCV-service/datasets
+YOLO-training/storage
+demo_old.py

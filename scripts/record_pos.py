@@ -26,7 +26,7 @@ import os
 import time
 from piper_sdk import *
 
-CAN_IFACE = "can0"
+CAN_IFACE = "can_piper"
 HAVE_GRIPPER = True
 TEACH_MODE_TIMEOUT_S = 10.0
 CSV_PATH = os.path.join(os.path.dirname(__file__), "pos.csv")

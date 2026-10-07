@@ -20,7 +20,7 @@ import time
 import csv
 from piper_sdk import *
 
-CAN_IFACE = "can0"
+CAN_IFACE = "can_piper"
 HAVE_GRIPPER = True
 PLAY_TIMES = 1          # 0 = infinite loop
 PLAY_INTERVAL_S = 0     # negative = manual (press Enter) advance between positions

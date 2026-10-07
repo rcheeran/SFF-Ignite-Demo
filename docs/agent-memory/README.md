@@ -5,7 +5,7 @@ These are the memory files Claude Code keeps for this machine. They live outside
     ~/.claude/projects/-home-jetson/memory/
 
 and are loaded automatically at the start of every session on that machine. They are copied here so a
-**reimage does not lose them** — see `../RESTORE.md` for how to put them back.
+**reimage does not lose them** — see `../../piper-openpi-V2/RESTORE.md` for how to put them back.
 
 They hold things that are true about the *work* rather than the code: what was tried and failed, why a
 constant has the value it does, and where the expensive-to-rediscover facts are. Several of them cover

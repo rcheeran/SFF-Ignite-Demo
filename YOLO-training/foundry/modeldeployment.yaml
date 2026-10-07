@@ -1,0 +1,38 @@
+apiVersion: foundrylocal.azure.com/v1
+kind: ModelDeployment
+metadata:
+  name: candy-yolo11s
+  namespace: foundry-local-operator
+spec:
+  displayName: Candy YOLO11s
+  workloadType: predictive
+  runtime: onnx-genai
+  compute: gpu
+  runtimeClassName: nvidia
+  model:
+    custom:
+      registry: ignitedemoregistry.azurecr.io
+      repository: models/candy-yolo11s
+      tag: v1
+      task: object-detection
+      credentials:
+        secretRef:
+          name: candy-yolo11s-acr
+          usernameKey: username
+          passwordKey: password
+  resources:
+    requests:
+      cpu: "2"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+      gpu: 1
+  env:
+    - name: BATCH_SIZE
+      value: "1"
+  replicas: 1
+  endpoint:
+    enabled: true
+    exposure: internal
+    host: candy-yolo11s.local

@@ -4,8 +4,8 @@ square with the gripper endpoint using linear (MOVE_L) Cartesian motion.
 
 *** THIS SENDS REAL MOTION COMMANDS TO THE ARM. ***
 
-Prerequisites (see SETUP.md): arm in Slave mode, CAN interface up, arm
-enabled and reachable via piper_sdk. Verify with scripts/check_connection.py
+Prerequisites (see prepare-jetson/SETUP.md): arm in Slave mode, CAN interface up, arm
+enabled and reachable via piper_sdk. Verify with prepare-piper/check_connection.py
 first.
 
 The square is traced in the X-Z plane (forward distance x height), at a

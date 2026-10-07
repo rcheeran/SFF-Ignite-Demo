@@ -12,7 +12,7 @@ Safety (mirrors the Asimov FR3 real toolset):
     PIPER_ALLOW_MOTION=1. Without it, enable/move/gripper tools refuse.
   * emergency_stop() is always available.
   * In real mode the arm must first be put in Slave mode and enabled (see the
-    toolset README / SFF-AgileX-Piper SETUP.md).
+    toolset README / SFF-AgileX-Piper prepare-jetson/SETUP.md).
 
 Tool-surface units: joints in DEGREES, Cartesian x/y/z in METERS, orientation
 rx/ry/rz in DEGREES, gripper opening as a 0..1 fraction.

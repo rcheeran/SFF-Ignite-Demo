@@ -72,7 +72,7 @@ cd ../piper-real-agent && ../.venv/bin/python agent.py             # :8213 → /
 
 This toolset uses the `../.venv` (has `asimov` + `piper_sdk`). The CAN interface
 and arm mode setup come from the sibling **`~/Documents/SFF-AgileX-Piper`**
-project — follow its `SETUP.md` first. Summary:
+project — follow its `prepare-jetson/SETUP.md` first. Summary:
 
 1. **Slave mode**: turn OFF the button on Joint 5, then
    ```python
@@ -82,12 +82,12 @@ project — follow its `SETUP.md` first. Summary:
 2. **Restart the arm** (power-cycle) so Slave mode takes effect.
 3. **Bring up CAN** (re-run after every power cycle):
    ```bash
-   bash ~/Documents/SFF-AgileX-Piper/scripts/can_activate.sh can0 1000000
+   bash ~/Documents/SFF-AgileX-Piper/prepare-piper/can_activate.sh can_piper 1000000
    ip -details link show can0        # expect: UP, ERROR-ACTIVE, bitrate 1000000
    ```
 4. **Verify telemetry** (must be non-zero, else the arm is still in Master/teach mode):
    ```bash
-   ~/venv/bin/python ~/Documents/SFF-AgileX-Piper/scripts/check_connection.py
+   ~/venv/bin/python ~/Documents/SFF-AgileX-Piper/prepare-piper/check_connection.py can_piper
    ```
 5. **Start the toolset in real mode.** Keep it observe-only until you've confirmed
    reads look right, then enable motion:
@@ -120,7 +120,7 @@ CAN reactivate. The toolset surfaces this as a `get_connection` warning.
 
 The **mock** path is fully verified (agent → MCP → tools end-to-end). The
 **real** backend is written to the `piper_sdk` API used by the SFF-AgileX-Piper
-scripts (`check_connection.py`, `read_current_pose.py`, `pick_can.py`,
+scripts (`prepare-piper/check_connection.py`, `scripts/read_current_pose.py`, `scripts/pick_can.py`,
 `play_pos.py`) — unit conversions, enable/mode sequence, EndPose/Joint/Gripper
 control, e-stop, and the gravity-fall guard — but has **not** been exercised
 against the physical arm from here. Bring it up observe-only first and verify

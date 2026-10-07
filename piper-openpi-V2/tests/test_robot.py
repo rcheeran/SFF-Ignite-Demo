@@ -22,6 +22,8 @@ DOWN = euler_to_rot([180, 0, 0])      # tool z pointing straight down
 
 # ---- clamp_pose ---------------------------------------------------------------
 def test_clamp_pose_box_and_step():
+    assert C.WORKSPACE_MIN_MM == [30.0, -400.0, 40.0]
+    assert C.WORKSPACE_MAX_MM == [500.0, 400.0, 480.0]
     prev = np.array([200.0, 0.0, 200.0])
     xyz, _, lim = clamp_pose(prev, FWD, [300, 0, 200], FWD)
     assert np.allclose(xyz, [215, 0, 200]) and not lim                  # <= STEP_MAX_MM per tick
@@ -219,6 +221,21 @@ def test_send_joints_clamps_limits_and_orders_frames():
     assert arm._p.calls[2][1] == (70000, C.GRIP_EFFORT, 0x01, 0)                 # gripper clipped, enabled
 
 
+def test_move_to_zero_uses_mode_ctrl_and_literal_zero_joint_ctrl(monkeypatch):
+    sdk = FakeSDK(joints=C.READY_JOINTS_DEG)
+    arm = _arm(sdk)
+    monkeypatch.setattr(robot.time, "sleep", lambda _: None)
+
+    assert arm.move_to_zero(secs=0.1, settle=0)
+
+    assert sdk.calls[0] == (
+        "ModeCtrl",
+        (0x01, 0x01, C.SPEED_HOME, 0x00),
+    )
+    assert sdk.calls[1] == ("JointCtrl", (0, 0, 0, 0, 0, 0))
+    assert np.allclose(arm.joints_deg(), np.zeros(6))
+
+
 def test_send_pose_orders_frames_and_skips_gripper_when_none():
     arm = _arm()
     arm.send_pose([200, 0, 200], [0, 85, 0], None)
@@ -227,6 +244,72 @@ def test_send_pose_orders_frames_and_skips_gripper_when_none():
     assert arm._p.calls[1][1] == (200000, 0, 200000, 0, 85000, 0)
     arm.send_pose([200, 0, 200], [0, 85, 0], 35.0)
     assert arm._p.calls[-1] == ("GripperCtrl", (35000, C.GRIP_EFFORT, 0x01, 0))
+
+
+def test_teach_stop_replays_probe_sequence_before_holding(monkeypatch):
+    class TeachSDK(FakeSDK):
+        def __init__(self):
+            super().__init__()
+            self.mode = Piper.TEACH_CTRL_MODE
+            self.ended_recording = False
+            self.primed_mode = False
+
+        def MotionCtrl_1(self, *args):
+            self.calls.append(("MotionCtrl_1", args))
+            self.ended_recording = args == (0x00, 0x00, 0x02)
+
+        def ModeCtrl(self, *args):
+            self.calls.append(("ModeCtrl", args))
+            self.primed_mode = self.ended_recording
+            self.mode = Piper.CAN_CTRL_MODE
+
+        def GetArmStatus(self):
+            mode = self.mode
+            if (
+                mode == Piper.CAN_CTRL_MODE
+                and not any(call[0] == "MotionCtrl_2" for call in self.calls)
+            ):
+                self.mode = Piper.TEACH_CTRL_MODE
+            return SimpleNamespace(
+                arm_status=SimpleNamespace(
+                    ctrl_mode=mode,
+                    teach_status=Piper.TEACH_STATUS_STOPPED,
+                )
+            )
+
+        def MotionCtrl_2(self, *args):
+            self.calls.append(("MotionCtrl_2", args))
+            if self.ended_recording and self.primed_mode:
+                self.mode = Piper.CAN_CTRL_MODE
+
+    sdk = TeachSDK()
+    arm = _arm(sdk)
+    expected_hold = arm.joints_deg().copy()
+    original_motion_ctrl = sdk.MotionCtrl_2
+
+    def motion_ctrl_with_stale_feedback(*args):
+        mode_before = sdk.mode
+        original_motion_ctrl(*args)
+        if mode_before == Piper.TEACH_CTRL_MODE and sdk.mode == Piper.CAN_CTRL_MODE:
+            sdk.j = np.zeros(6)
+
+    sdk.MotionCtrl_2 = motion_ctrl_with_stale_feedback
+    monkeypatch.setattr(robot.time, "sleep", lambda _: None)
+    self_advancing_time = iter(np.arange(0.0, 20.0, 0.25))
+    monkeypatch.setattr(robot.time, "time", lambda: next(self_advancing_time))
+
+    assert arm.teach_stop(timeout=8.0)
+    names = [call[0] for call in sdk.calls]
+    assert names.index("MotionCtrl_1") < names.index("ModeCtrl") < names.index(
+        "MotionCtrl_2"
+    )
+    assert names[-2:] == ["MotionCtrl_2", "JointCtrl"]
+    joint_commands = [call[1] for call in sdk.calls if call[0] == "JointCtrl"]
+    assert joint_commands
+    assert all(
+        command == tuple(int(value * 1000) for value in expected_hold)
+        for command in joint_commands
+    )
 
 
 def test_every_tick_starts_with_motion_ctrl_and_resends_gripper():

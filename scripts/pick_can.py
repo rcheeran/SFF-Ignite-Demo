@@ -24,7 +24,7 @@ Usage: python3 scripts/pick_can.py
 import time
 from piper_sdk import *
 
-CAN_IFACE = "can0"
+CAN_IFACE = "can_piper"
 SPEED_PERCENT = 30  # conservative speed
 
 # --- TODO: fill these in before running (see instructions above) ---

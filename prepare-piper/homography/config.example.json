@@ -1,0 +1,31 @@
+{
+  "camera": {
+    "serial": "126122270802",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "preview_port": 8094,
+    "preview_jpeg_quality": 5,
+    "warmup_frames": 30,
+    "sample_frames": 60
+  },
+  "aruco": {
+    "dictionary": "DICT_4X4_50",
+    "required_marker_ids": [0, 1, 2, 3],
+    "minimum_observations_per_marker": 20,
+    "maximum_center_stddev_px": 1.0
+  },
+  "collection": {
+    "pose_samples_per_marker": 20,
+    "sample_interval_seconds": 0.05,
+    "maximum_position_stddev_mm": 1.0
+  },
+  "acceptance": {
+    "ransac_threshold_mm": 5.0,
+    "maximum_table_z_range_mm": 5.0,
+    "maximum_fit_rmse_mm": 8.0,
+    "maximum_fit_error_mm": 15.0,
+    "maximum_validation_rmse_mm": 10.0,
+    "maximum_validation_error_mm": 15.0
+  }
+}

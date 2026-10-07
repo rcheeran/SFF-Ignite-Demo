@@ -1,0 +1,141 @@
+{
+  "camera": {
+    "serial": "126122270802",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "preview_port": 8094,
+    "preview_jpeg_quality": 5
+  },
+  "aruco": {
+    "dictionary": "DICT_4X4_50",
+    "target_marker_id": 1,
+    "marker_size_mm": 101.6,
+    "minimum_marker_side_px": 60.0
+  },
+  "collection": {
+    "minimum_samples": 15,
+    "frames_per_sample": 10,
+    "sample_interval_seconds": 0.05,
+    "maximum_marker_center_stddev_px": 1.0,
+    "maximum_robot_position_stddev_mm": 1.0,
+    "maximum_reprojection_error_px": 1.5
+  },
+  "acceptance": {
+    "minimum_translation_span_mm": 100.0,
+    "minimum_rotation_from_first_deg": 25.0,
+    "minimum_rotation_axis_rank": 2,
+    "maximum_target_translation_rmse_mm": 15.0,
+    "maximum_target_rotation_rmse_deg": 3.0
+  },
+  "depth_verification": {
+    "sample_count": 30,
+    "warmup_frames": 30,
+    "center_window_radius_px": 5,
+    "minimum_valid_depth_pixels": 25,
+    "minimum_depth_m": 0.05,
+    "maximum_depth_m": 1.0,
+    "maximum_robot_position_deviation_mm": 1.0,
+    "maximum_robot_rotation_deviation_deg": 0.5,
+    "maximum_coordinate_rmse_mm": 20.0,
+    "maximum_consensus_error_mm": 10.0,
+    "maximum_temporal_depth_mad_mm": 10.0,
+    "minimum_temporal_inlier_fraction": 0.8,
+    "temporal_mad_multiplier": 3.0,
+    "temporal_outlier_floor_mm": 10.0
+  },
+  "depth_calibration": {
+    "minimum_poses": 7,
+    "frames_per_pose": 15,
+    "sample_interval_seconds": 0.05,
+    "minimum_expected_depth_span_mm": 100.0,
+    "minimum_scale": 0.8,
+    "maximum_scale": 1.2,
+    "maximum_fit_rmse_mm": 8.0,
+    "maximum_cross_validation_rmse_mm": 8.0,
+    "maximum_cross_validation_error_mm": 15.0
+  },
+  "click_coordinate": {
+    "sample_count": 30,
+    "center_window_radius_px": 5,
+    "minimum_valid_depth_pixels": 25,
+    "minimum_depth_m": 0.05,
+    "maximum_depth_m": 1.0,
+    "maximum_robot_position_deviation_mm": 1.0,
+    "maximum_robot_rotation_deviation_deg": 0.5,
+    "maximum_temporal_depth_mad_mm": 10.0,
+    "minimum_temporal_inlier_fraction": 0.8,
+    "temporal_mad_multiplier": 3.0,
+    "temporal_outlier_floor_mm": 10.0
+  },
+  "demo": {
+    "motion_speed_percent": 20,
+    "pick_motion_speed_percent": 15,
+    "detection_confidence_threshold": 0.05,
+    "stable_detection_count": 3,
+    "maximum_detection_attempts": 12,
+    "box_inset_fraction": 0.2,
+    "minimum_box_depth_pixels": 100,
+    "minimum_depth_m": 0.05,
+    "maximum_depth_m": 1.0,
+    "depth_cluster_bin_mm": 10.0,
+    "depth_cluster_tolerance_mm": 15.0,
+    "minimum_depth_cluster_fraction": 0.35,
+    "maximum_target_spread_mm": 12.0,
+    "maximum_scan_position_deviation_mm": 2.0,
+    "maximum_scan_rotation_deviation_deg": 0.75,
+    "maximum_cross_view_target_difference_mm": 25.0,
+    "maximum_cross_view_orientation_difference_deg": 20.0,
+    "scan_settle_seconds": 1.0,
+    "target_workspace_min_mm": [
+      100.0,
+      -400.0,
+      -50.0
+    ],
+    "target_workspace_max_mm": [
+      500.0,
+      400.0,
+      100.0
+    ],
+    "hand_workspace_min_mm": [
+      100.0,
+      -400.0,
+      -30.0
+    ],
+    "hand_workspace_max_mm": [
+      500.0,
+      400.0,
+      30.0
+    ],
+    "hand_release_tip_z_mm": 73.0,
+    "hand_approach_height_mm": 20.0,
+    "enforce_hand_reacquisition_limit": false,
+    "maximum_hand_reacquisition_difference_mm": 15.0,
+    "hand_delivery_rpy_deg": [
+      180.0,
+      20.0,
+      180.0
+    ],
+    "grasp_rpy_deg": [
+      180.0,
+      20.0,
+      180.0
+    ],
+    "grasp_tip_z_mm": 9.5,
+    "approach_height_mm": 100.0,
+    "pregrasp_height_mm": 50.0,
+    "minimum_pregrasp_height_mm": 30.0,
+    "pregrasp_height_step_mm": 5.0,
+    "maximum_approach_inward_offset_mm": 120.0,
+    "approach_inward_step_mm": 20.0,
+    "maximum_grasp_yaw_offset_deg": 20.0,
+    "grasp_yaw_offset_step_deg": 5.0,
+    "drop_approach_height_mm": 80.0,
+    "grip_open_mm": 70.0,
+    "grip_close_mm": 0.0,
+    "maximum_grasp_retries": 1,
+    "move_timeout_seconds": 8.0,
+    "gripper_hold_seconds": 1.0,
+    "retry_delay_seconds": 1.0
+  }
+}
