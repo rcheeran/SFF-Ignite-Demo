@@ -281,10 +281,10 @@ python -m unittest -v \
   test_depth_coordinates.py \
   test_click_to_coordinate.py
 
-cd ~/productdaydemo/piper-openpi-V2
+cd ~/productdaydemo/Demo-VLA-On-Piper/piper-openpi-V2
 python -m pytest -q tests/test_robot.py -k 'teach_stop or not lerobot'
 
-cd ~/productdaydemo
+cd ~/productdaydemo/Demo-Product-Day
 python -m unittest -v test_demo.py
 ```
 
@@ -292,11 +292,11 @@ The two excluded tests require the optional LeRobot package.
 
 ## 9. Run the text-prompted pick/drop demo
 
-The k3s [`vision-service`](../../vision-service/README.md) owns the D405 and
-returns corrected camera-frame coordinates to the root [`demo.py`](../../demo.py).
-Teach three scan poses with [`teach_scan_poses.py`](../../teach_scan_poses.py),
+The k3s [OpenCV service](../../k3s-OpenCV-service/README.md) owns the D405 and
+returns corrected camera-frame coordinates to [`demo.py`](../../Demo-Product-Day/demo.py).
+Teach three scan poses with [`teach_scan_poses.py`](../../Demo-Product-Day/Teach-scripts/teach_scan_poses.py),
 then follow the scan-only and supervised one-pick sequence in the project
-[`README.md`](../../README.md). Do not begin with an unlimited motion loop.
+[setup instructions](../../prepare-jetson/README.md). Do not begin with an unlimited motion loop.
 
 ## Recalibrate when
 

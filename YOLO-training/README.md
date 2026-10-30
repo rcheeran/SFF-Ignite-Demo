@@ -2,7 +2,7 @@
 
 This directory fine-tunes `yolo11s.pt` on the 11-class candy dataset. Large
 artifacts live on the k3s data mount through the `storage` symlink.
-`OpenCV-service/datasets` points to the same mount. Preparation creates
+`k3s-OpenCV-service/datasets` points to the same mount. Preparation creates
 hard-linked train and validation splits to avoid duplicating image data.
 
 The source dataset spells class 8 as `starbust`. The generated `data.yaml`

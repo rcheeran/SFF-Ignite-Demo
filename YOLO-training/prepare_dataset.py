@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
         "--source",
         type=Path,
         default=project_dir.parent
-        / "OpenCV-service"
+        / "k3s-OpenCV-service"
         / "datasets"
         / "candy_data_14DEC24",
     )

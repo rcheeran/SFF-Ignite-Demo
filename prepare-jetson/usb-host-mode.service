@@ -1,0 +1,13 @@
+[Unit]
+Description=Set USB-C 5A port to host mode
+# Wait until the sysfs role switch device is present before running.
+After=sysinit.target
+ConditionPathExists=/sys/class/usb_role/usb2-0-role-switch/role
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/home/clouduser/productdaydemo/prepare-jetson/usb_host_mode.sh
+
+[Install]
+WantedBy=multi-user.target

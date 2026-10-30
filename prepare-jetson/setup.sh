@@ -258,7 +258,7 @@ ensure_gs_usb
 echo "==> 6. Pinning a stable interface name + auto bring-up at boot (udev + systemd)"
 install_piper_can_service
 # For a one-off manual bring-up, or for non-Piper CAN adapters, the lower-level
-# helpers scripts/find_all_can_port.sh and prepare-piper/can_activate.sh are still
+# helpers useful-piper-scripts/find_all_can_port.sh and prepare-piper/can_activate.sh are still
 # available (can_activate.sh expects a single USB-CAN adapter; on a Jetson with
 # native mttcan controllers pass a USB bus-address argument - see its usage).
 

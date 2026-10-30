@@ -2,14 +2,15 @@ __pycache__/
 *.pyc
 venv/
 .venv/
-scripts/camera_snapshot.jpg
-scripts/pos.csv
+prepare-jetson/camera_snapshot.jpg
+useful-piper-scripts/camera_snapshot.jpg
+useful-piper-scripts/pos.csv
 
 # Local secrets and runtime artifacts for the piper-asimov agent
 .env
-piper-asimov/piper-real-toolset/captures/
+Demo-VLA-On-Piper/piper-asimov/piper-real-toolset/captures/
 
 # Host-specific runtime storage and local backups
-OpenCV-service/datasets
+k3s-OpenCV-service/datasets
 YOLO-training/storage
 demo_old.py
