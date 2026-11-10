@@ -231,26 +231,6 @@ in the selected camera view, open and
 stationary, keep the emergency stop accessible, and remove the hand
 immediately if motion is unexpected.
 
-To physically teach a different absolute Piper-base release height:
-
-```bash
-python prepare-piper/Teach-scripts/teach_release_height.py
-```
-
-The arm first moves automatically to SDK zero. Support it and press the
-physical Teach button, then position the empty gripper tool tip at the desired
-absolute release height and press Enter while holding the arm still. This
-script does not use the camera, hand service, hand-eye calibration, or palm
-detection. It calculates and records tool-tip base Z from stable joint
-telemetry without applying a palm-clearance limit. After an accepted
-measurement, press the physical Teach button again to stiffen the arm and
-confirm saving. The rounded-up absolute Z is written atomically to
-`demo.hand_release_tip_z_mm`; the full measurement is saved in
-`prepare-piper/hand-eye/calibration/release_height.json`. The script does not
-automatically replay the hand-guided pose. During the actual demo, the detected
-palm Z is available and delivery is rejected if the taught release Z is not
-above that real palm measurement.
-
 Results are written to:
 
 - `prepare-piper/hand-eye/calibration/demo_runs.json`
