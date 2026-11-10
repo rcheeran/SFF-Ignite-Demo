@@ -97,8 +97,15 @@ frame. The cache holds the latest **30 captures**; callers must finish before
 their token is evicted. Localization bodies are limited to 2 MiB / 1000 boxes.
 
 The hand service's JPEG, RGB-D, deprojection, and MJPEG contracts are unchanged.
-Object scan panels update when the demo or threshold tester publishes localized
-results, not through background inference.
+
+The dashboard shows the live stream (about 70% of the page width, up to
+1113 x 835 px on a 1920 px screen) beside the latest candy scan stacked above
+the latest hand scan (up to 460 x 345 px each). The candy and hand scan
+metadata appear side by side below. When several scan poses publish
+snapshots, the most recently captured candy and hand scans are shown. Below
+900 px of window width everything stacks in one column. The candy panel
+updates when the demo or threshold tester publishes localized results, not
+through background inference.
 
 ## Dataset collection
 
