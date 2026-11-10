@@ -233,7 +233,7 @@ a missed grasp returns to scanning rather than using the older demo's retry work
 From the repository root in the existing isolated environment:
 
 ```bash
-source ~/venv-hand-eye435/bin/activate
+source ~/venv-ignite-demo/bin/activate
 python Demo-Ignite/demo.py --check-only
 ```
 
