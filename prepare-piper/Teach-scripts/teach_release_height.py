@@ -13,7 +13,7 @@ import numpy as np
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 HOMOGRAPHY_DIR = PROJECT_DIR / "prepare-piper" / "homography"
-HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye"
+HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye-realsense405"
 PIPER_DIR = PROJECT_DIR / "Demo-VLA-On-Piper" / "piper-openpi-V2"
 sys.path.insert(0, str(HOMOGRAPHY_DIR))
 sys.path.insert(0, str(HAND_EYE_DIR))

@@ -8,8 +8,6 @@ import json
 import math
 import sys
 import time
-import urllib.error
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -26,7 +24,7 @@ except ModuleNotFoundError as exc:
     ) from exc
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye"
+HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye-realsense405"
 HOMOGRAPHY_DIR = PROJECT_DIR / "prepare-piper" / "homography"
 PIPER_DIR = PROJECT_DIR / "Demo-VLA-On-Piper" / "piper-openpi-V2"
 sys.path.insert(0, str(HOMOGRAPHY_DIR))
@@ -48,6 +46,14 @@ from verify_depth_coordinates import (  # noqa: E402
     rigid_transform,
     transform_camera_point_to_base,
 )
+from vision_client import (  # noqa: E402
+    DEFAULT_DETECTION_URL,
+    DEFAULT_VISION_URL,
+    EXPECTED_VISION_MODEL,
+    DemoError,
+    HandClient,
+    VisionClient,
+)
 
 DEFAULT_CONFIG = HAND_EYE_DIR / "config.json"
 DEFAULT_HAND_EYE = HAND_EYE_DIR / "calibration" / "hand_eye.json"
@@ -56,14 +62,8 @@ DEFAULT_SCAN_POSES = (
     PROJECT_DIR / "prepare-piper" / "scan-poses" / "scan_poses.json"
 )
 DEFAULT_OUTPUT = HAND_EYE_DIR / "calibration" / "demo_runs.json"
-DEFAULT_VISION_URL = "http://127.0.0.1:8094"
 DEFAULT_HAND_URL = "http://127.0.0.1:8095"
 DEFAULT_OBJECT_PROMPT = "starburst candy"
-EXPECTED_VISION_MODEL = "candy-yolo11s"
-
-
-class DemoError(RuntimeError):
-    """An invalid configuration, rejected target, or unsafe motion request."""
 
 
 class GraspVerificationError(DemoError):
@@ -87,6 +87,7 @@ def parse_args() -> argparse.Namespace:
         help="YOLO candy class or alias (default: starburst candy)",
     )
     parser.add_argument("--vision-url", default=DEFAULT_VISION_URL)
+    parser.add_argument("--detection-url", default=DEFAULT_DETECTION_URL)
     parser.add_argument("--hand-url", default=DEFAULT_HAND_URL)
     parser.add_argument("--scan-poses", type=Path, default=DEFAULT_SCAN_POSES)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
@@ -256,11 +257,15 @@ def validate_demo_config(config: dict) -> dict:
 
 
 def load_scan_poses(path: Path) -> list[dict[str, Any]]:
-    """Load exactly three distinct, joint-limit-safe taught scan poses."""
+    """Load one to three distinct, joint-limit-safe taught scan poses."""
     document = load_json(path)
     poses = document.get("poses")
-    if document.get("pose_count") != 3 or not isinstance(poses, list) or len(poses) != 3:
-        raise DemoError(f"{path} must contain exactly three taught scan poses")
+    count = document.get("pose_count")
+    if (
+        type(count) is not int or count not in (1, 2, 3)
+        or not isinstance(poses, list) or len(poses) != count
+    ):
+        raise DemoError(f"{path} must contain 1..3 taught scan poses matching pose_count")
     parsed = []
     limits = np.asarray(PIPER_C.JOINT_LIMITS_DEG, dtype=np.float64)
     safe_minimum = limits[:, 0] + PIPER_C.IK_LIMIT_MARGIN_DEG
@@ -285,7 +290,7 @@ def load_scan_poses(path: Path) -> list[dict[str, Any]]:
             raise DemoError(
                 f"scan pose {expected_index} is not safely replayable: "
                 + "; ".join(violations)
-                + ". Rerun Demo-Product-Day/Teach-scripts/teach_scan_poses.py"
+                + ". Rerun prepare-piper/Teach-scripts/teach_scan_poses.py"
             )
         parsed.append(
             {
@@ -298,8 +303,8 @@ def load_scan_poses(path: Path) -> list[dict[str, Any]]:
                 ),
             }
         )
-    for left in range(3):
-        for right in range(left + 1, 3):
+    for left in range(len(parsed)):
+        for right in range(left + 1, len(parsed)):
             if (
                 np.linalg.norm(
                     parsed[left]["joints_deg"] - parsed[right]["joints_deg"]
@@ -310,103 +315,6 @@ def load_scan_poses(path: Path) -> list[dict[str, Any]]:
                     f"scan poses {left + 1} and {right + 1} are not distinct"
                 )
     return parsed
-
-
-class VisionClient:
-    """HTTP client for the D405 OpenCV and Foundry YOLO vision service."""
-
-    def __init__(self, base_url: str, timeout: float = 90.0) -> None:
-        """Configure the service base URL and request timeout."""
-        self.base_url = base_url.rstrip("/")
-        if not self.base_url.startswith(("http://", "https://")):
-            raise DemoError("--vision-url must start with http:// or https://")
-        self.timeout = timeout
-
-    def _json_request(
-        self, path: str, payload: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Send a JSON request and convert transport or response errors."""
-        data = None if payload is None else json.dumps(payload).encode("utf-8")
-        request = urllib.request.Request(
-            f"{self.base_url}{path}",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="GET" if payload is None else "POST",
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                document = json.loads(response.read())
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise DemoError(
-                f"vision service {path} returned HTTP {exc.code}: {body}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise DemoError(
-                f"cannot reach vision service at {self.base_url}: {exc.reason}"
-            ) from exc
-        except (TimeoutError, json.JSONDecodeError) as exc:
-            raise DemoError(f"invalid response from vision service: {exc}") from exc
-        if not isinstance(document, dict):
-            raise DemoError("vision service response must be a JSON object")
-        return document
-
-    def health(self) -> dict[str, Any]:
-        """Return service health after requiring an explicit healthy status."""
-        health = self._json_request("/healthz")
-        if health.get("status") != "ok":
-            raise DemoError(f"vision service is unhealthy: {health}")
-        return health
-
-    def capture(
-        self, slot: int, prompt: str, confidence: float
-    ) -> dict[str, Any]:
-        """Capture one object scan and validate its detection status."""
-        result = self._json_request(
-            "/api/capture",
-            {"slot": slot, "prompt": prompt, "confidence": confidence},
-        )
-        status = result.get("status")
-        if status not in ("detected", "not_found", "rejected"):
-            raise DemoError(f"vision capture {slot} was rejected: {result}")
-        return result
-
-    def set_workspace_overlay(
-        self,
-        base_to_camera: np.ndarray,
-        minimum_mm: np.ndarray,
-        maximum_mm: np.ndarray,
-    ) -> None:
-        """Send the current camera transform and base-frame workspace overlay."""
-        self._json_request(
-            "/api/workspace-overlay",
-            {
-                "base_to_camera": np.asarray(
-                    base_to_camera,
-                    dtype=np.float64,
-                ).tolist(),
-                "minimum_mm": np.asarray(
-                    minimum_mm,
-                    dtype=np.float64,
-                ).tolist(),
-                "maximum_mm": np.asarray(
-                    maximum_mm,
-                    dtype=np.float64,
-                ).tolist(),
-            },
-        )
-
-
-class HandClient(VisionClient):
-    """HTTP client for stable, synchronized open-palm captures."""
-
-    def capture_hand(self, slot: int) -> dict[str, Any]:
-        """Capture an open-palm slot and validate its detection status."""
-        result = self._json_request("/api/capture", {"slot": slot})
-        status = result.get("status")
-        if status not in ("detected", "not_found", "rejected"):
-            raise DemoError(f"hand capture {slot} returned invalid status: {result}")
-        return result
 
 
 def validate_target_workspace(
@@ -1759,7 +1667,7 @@ def main() -> int:
     if not args.allow_motion:
         print(
             "ERROR: --allow-motion is required because the demo moves through "
-            "three taught scan poses",
+            "the taught scan poses",
             file=sys.stderr,
         )
         return 2
@@ -1799,7 +1707,7 @@ def main() -> int:
         )
         if not math.isfinite(grasp_tip_z_mm):
             raise DemoError("grasp tip Z must be finite")
-        client = VisionClient(args.vision_url)
+        client = VisionClient(args.vision_url, detection_url=args.detection_url)
         health = client.health()
         if health.get("model") != EXPECTED_VISION_MODEL:
             raise DemoError(
@@ -1821,7 +1729,8 @@ def main() -> int:
         return 2
     print(
         f"Vision service ready: model={health.get('model')}, "
-        f"camera={health.get('camera_serial')}, UI={args.vision_url}/"
+        f"camera={health.get('camera_serial')}, UI={args.vision_url}/, "
+        f"detection={args.detection_url}"
     )
     if hand_health is not None:
         print(
@@ -1853,7 +1762,7 @@ def main() -> int:
             }
             cycles.append(cycle)
             save_run(args.output, DEFAULT_OBJECT_PROMPT, cycles)
-            print(f"\nCYCLE {cycle['index']}: scanning three taught poses")
+            print(f"\nCYCLE {cycle['index']}: scanning {len(scan_poses)} taught pose(s)")
             scan_started_at = time.perf_counter()
             for scan_index, scan in enumerate(scan_poses, start=1):
                 if hand_client is None:

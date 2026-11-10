@@ -14,15 +14,13 @@ import numpy as np
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 HOMOGRAPHY_DIR = PROJECT_DIR / "prepare-piper" / "homography"
-HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye"
+HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye-realsense405"
 PIPER_DIR = PROJECT_DIR / "Demo-VLA-On-Piper" / "piper-openpi-V2"
 sys.path.insert(0, str(HOMOGRAPHY_DIR))
 sys.path.insert(0, str(HAND_EYE_DIR))
 sys.path.insert(0, str(PIPER_DIR))
-sys.path.insert(0, str(PROJECT_DIR / "Demo-Product-Day"))
 
 from common import CalibrationError, load_json, write_json_atomic  # noqa: E402
-from demo import DEFAULT_CONFIG, DemoError, validate_demo_config  # noqa: E402
 from piper import config as PIPER_C  # noqa: E402
 from piper.robot import Piper, connect_for_teach  # noqa: E402
 from piper.transforms import tip_position  # noqa: E402
@@ -33,7 +31,13 @@ from teach_scan_poses import (  # noqa: E402
 )
 from verify_depth_coordinates import hold_until_power_off  # noqa: E402
 
-DEFAULT_OUTPUT = HAND_EYE_DIR / "calibration" / "candy_grip.json"
+CAMERA_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye-realsense435"
+DEFAULT_CONFIG = CAMERA_DIR / "config.json"
+DEFAULT_OUTPUT = CAMERA_DIR / "calibration" / "candy_grip.json"
+
+
+class DemoError(RuntimeError):
+    """Invalid candy-grip teaching settings or measurements."""
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,30 +71,30 @@ def validate_gripper_widths(open_mm: float, close_mm: float) -> None:
         raise DemoError("open width must be at least 5mm greater than close width")
 
 
+def initial_grip_settings(record: dict) -> dict:
+    """Use the last teaching record for jaw prompts, not calibration configuration."""
+    open_mm = float(record.get("grip_open_command_mm", PIPER_C.GRIP_OPEN_MM))
+    close_mm = float(record.get("grip_close_command_mm", PIPER_C.GRIP_CLOSED_MM))
+    validate_gripper_widths(open_mm, close_mm)
+    return {"grip_open_mm": open_mm, "grip_close_mm": close_mm}
+
+
 def save_taught_grip(
     config_path: Path,
     output_path: Path,
-    config: dict,
     record: dict,
 ) -> None:
-    """Atomically save grasp height and confirmed open/close commands."""
+    """Save confirmed grip measurements without modifying calibration configuration."""
+    if config_path.resolve() == output_path.resolve():
+        raise DemoError("configuration and teaching record paths must differ")
     grasp_z = float(record["grasp_tip_z_mm"])
     open_mm = float(record["grip_open_command_mm"])
     close_mm = float(record["grip_close_command_mm"])
     if not math.isfinite(grasp_z):
         raise DemoError("grasp tool-tip Z must be finite")
+    if grasp_z < PIPER_C.TIP_Z_FLOOR_MM:
+        raise DemoError("grasp tool-tip Z must not be below the safety floor")
     validate_gripper_widths(open_mm, close_mm)
-    updated = dict(config)
-    updated["demo"] = dict(config["demo"])
-    updated["demo"].update(
-        {
-            "grasp_tip_z_mm": grasp_z,
-            "grip_open_mm": open_mm,
-            "grip_close_mm": close_mm,
-        }
-    )
-    validate_demo_config(updated)
-    write_json_atomic(config_path, updated)
     write_json_atomic(output_path, record)
 
 
@@ -179,8 +183,8 @@ def main() -> int:
         )
         return 2
     try:
-        config = load_json(args.config)
-        demo = validate_demo_config(config)
+        load_json(args.config)
+        grip_settings = initial_grip_settings(load_json(args.output) if args.output.exists() else {})
     except (CalibrationError, DemoError, KeyError, TypeError, ValueError) as exc:
         print(f"ERROR: cannot start candy-grip teaching: {exc}", file=sys.stderr)
         return 2
@@ -260,14 +264,14 @@ def main() -> int:
             piper,
             hold_joints,
             "open",
-            float(demo["grip_open_mm"]),
+            float(grip_settings["grip_open_mm"]),
             args.gripper_settle_seconds,
         )
         close_command, close_measured = prompt_width(
             piper,
             hold_joints,
             "close",
-            float(demo["grip_close_mm"]),
+            float(grip_settings["grip_close_mm"]),
             args.gripper_settle_seconds,
         )
         validate_gripper_widths(open_command, close_command)
@@ -310,8 +314,8 @@ def main() -> int:
             f"Gripper reopened to {reopened_mm:.1f}mm. Remove the candy while "
             "the arm remains held."
         )
-        save_taught_grip(args.config, args.output, config, record)
-        print(f"Updated candy grip settings in {args.config}")
+        save_taught_grip(args.config, args.output, record)
+        print("Calibration configuration unchanged. Review the saved values and update DEMO_SETTINGS in Demo-Ignite/demo.py.")
         print(f"Teaching record written to {args.output}")
     except KeyboardInterrupt:
         print("\nInterrupted; no unconfirmed values were saved.", file=sys.stderr)

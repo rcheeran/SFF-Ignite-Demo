@@ -20,7 +20,6 @@ import cv2
 import numpy as np
 
 from vision import (
-    OwlVitDetector,
     VisionError,
     annotate_capture,
     camera_point_from_pixel,
@@ -43,6 +42,13 @@ def env_int(name: str, default: int) -> int:
     return value
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, str(default)).lower()
+    if value not in ("true", "false"):
+        raise VisionError(f"{name} must be true or false")
+    return value == "true"
+
+
 def load_depth_correction(path: Path) -> tuple[float, float]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -63,6 +69,7 @@ def load_depth_correction(path: Path) -> tuple[float, float]:
 class D405FfmpegStream:
     def __init__(self) -> None:
         self.serial = os.environ.get("CAMERA_SERIAL", "")
+        self.name: str | None = None
         self.width = env_int("CAMERA_WIDTH", 640)
         self.height = env_int("CAMERA_HEIGHT", 480)
         self.fps = env_int("CAMERA_FPS", 30)
@@ -80,6 +87,7 @@ class D405FfmpegStream:
         self.intrinsics = None
         self.threads: list[threading.Thread] = []
         self.frame_annotator = None
+        self.show_status_banner = True
 
     def start(self) -> None:
         import pyrealsense2 as rs
@@ -103,6 +111,7 @@ class D405FfmpegStream:
                 f"expected D405 {self.serial}, detected {detected_serial}"
             )
         self.serial = detected_serial
+        self.name = device.get_info(rs.camera_info.name)
         self.depth_scale = float(device.first_depth_sensor().get_depth_scale())
         self.intrinsics = (
             profile.get_stream(rs.stream.color)
@@ -199,17 +208,18 @@ class D405FfmpegStream:
                     self.frame_ready.notify_all()
                 if self.frame_annotator is not None:
                     frame = self.frame_annotator(frame)
-                cv2.rectangle(frame, (0, 0), (self.width, 34), (0, 0, 0), -1)
-                cv2.putText(
-                    frame,
-                    "D405 LIVE - OWL-ViT service ready",
-                    (8, 23),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 190, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
+                if self.show_status_banner:
+                    cv2.rectangle(frame, (0, 0), (self.width, 34), (0, 0, 0), -1)
+                    cv2.putText(
+                        frame,
+                        "D405 LIVE - OWL-ViT service ready",
+                        (8, 23),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        (0, 190, 0),
+                        1,
+                        cv2.LINE_AA,
+                    )
                 if self.process.poll() is not None:
                     stderr = self.process.stderr.read().decode(errors="replace")
                     raise VisionError(f"FFmpeg exited: {stderr.strip()}")
@@ -272,6 +282,13 @@ class D405FfmpegStream:
 
 
 class VisionApplication:
+    detection_enabled = True
+    preview_only = False
+    service_name = "owlvit-vision"
+
+    def dashboard_html(self) -> bytes:
+        return page_html()
+
     def __init__(self) -> None:
         self.model_name = os.environ.get(
             "OWL_MODEL", "google/owlvit-base-patch32"
@@ -279,14 +296,22 @@ class VisionApplication:
         self.default_confidence = env_float("DETECTION_CONFIDENCE", 0.2)
         if not 0 < self.default_confidence < 1:
             raise VisionError("DETECTION_CONFIDENCE must be between zero and one")
-        self.depth_scale_correction, self.depth_offset_mm = load_depth_correction(
-            Path(
-                os.environ.get(
-                    "DEPTH_CORRECTION",
-                    "/calibration/depth_correction.json",
+        self.preview_only = env_bool("CAMERA_PREVIEW_ONLY", False)
+        if self.preview_only and self.detection_enabled:
+            raise VisionError("preview-only mode requires the independent camera service")
+        self.depth_scale_correction: float | None = None
+        self.depth_offset_mm: float | None = None
+        if self.preview_only:
+            print("PREVIEW ONLY: depth/XYZ localization and workspace overlays disabled", flush=True)
+        else:
+            self.depth_scale_correction, self.depth_offset_mm = load_depth_correction(
+                Path(
+                    os.environ.get(
+                        "DEPTH_CORRECTION",
+                        "/calibration/depth_correction.json",
+                    )
                 )
             )
-        )
         self.depth_settings = {
             "inset_fraction": env_float("BOX_INSET_FRACTION", 0.2),
             "minimum_pixels": env_int("MINIMUM_BOX_DEPTH_PIXELS", 100),
@@ -300,14 +325,18 @@ class VisionApplication:
                 "MINIMUM_DEPTH_CLUSTER_FRACTION", 0.35
             ),
         }
-        print(f"Loading {self.model_name} on CUDA", flush=True)
-        self.detector = OwlVitDetector(self.model_name, "cuda")
+        if self.detection_enabled:
+            from vision import OwlVitDetector
+
+            print(f"Loading {self.model_name} on CUDA", flush=True)
+            self.detector = OwlVitDetector(self.model_name, "cuda")
         self.camera = D405FfmpegStream()
         self.camera.frame_annotator = self.annotate_workspace
         self.capture_lock = threading.Lock()
         self.snapshots: dict[int, dict[str, Any]] = {}
         self.snapshot_jpegs: dict[int, bytes] = {}
         self.rgbd_frames: dict[str, dict[str, Any]] = {}
+        self.rgbd_lock = threading.Lock()
         self.workspace_overlay: dict[str, Any] | None = None
         self.workspace_overlay_lock = threading.Lock()
         dataset_dir = os.environ.get("DATASET_COLLECTION_DIR", "").strip()
@@ -328,10 +357,19 @@ class VisionApplication:
     def start(self) -> None:
         self.camera.start()
         print(
-            f"Vision service ready: D405 {self.camera.serial}, "
+            f"Vision service ready: RealSense {self.camera.serial}, "
             f"{self.camera.width}x{self.camera.height}@{self.camera.fps}",
             flush=True,
         )
+
+    def metric_depth_correction(self) -> tuple[float, float]:
+        scale, offset = self.depth_scale_correction, self.depth_offset_mm
+        if self.preview_only or scale is None or offset is None:
+            raise VisionError(
+                "metric depth/XYZ localization and workspace overlays are disabled "
+                "in preview-only mode; complete and accept this camera's calibration first"
+            )
+        return scale, offset
 
     def localize_detection(
         self,
@@ -345,8 +383,14 @@ class VisionApplication:
             "box_xyxy": [float(value) for value in detection["box_xyxy"]],
         }
         try:
+            scale, offset = self.metric_depth_correction()
             if detection.get("orientation_error"):
                 raise VisionError(str(detection["orientation_error"]))
+            pickup_point = detection.get("pickup_point", "depth_cluster")
+            if pickup_point not in ("depth_cluster", "long_axis_midpoint"):
+                raise VisionError("unsupported pickup_point")
+            if pickup_point == "long_axis_midpoint" and "long_axis_pixels" not in detection:
+                raise VisionError("long-axis midpoint pickup requires detected long-axis endpoints")
             pixel, raw_depth_mm, diagnostics = robust_box_depth(
                 depth,
                 detection["box_xyxy"],
@@ -354,21 +398,16 @@ class VisionApplication:
                 **self.depth_settings,
             )
             corrected_depth_mm = (
-                self.depth_scale_correction * raw_depth_mm
-                + self.depth_offset_mm
+                scale * raw_depth_mm + offset
             )
-            camera_point = camera_point_from_pixel(
-                self.camera.intrinsics,
-                pixel,
-                corrected_depth_mm,
-            )
+            depth_sample_pixel = pixel
             orientation: dict[str, Any] = {}
             if "long_axis_pixels" in detection:
                 axis_pixels = np.asarray(
                     detection["long_axis_pixels"],
                     dtype=np.float64,
                 )
-                if axis_pixels.shape != (2, 2):
+                if axis_pixels.shape != (2, 2) or not np.all(np.isfinite(axis_pixels)):
                     raise VisionError(
                         "long-axis pixels must contain two image points"
                     )
@@ -384,7 +423,7 @@ class VisionApplication:
                 )
                 axis_vector = axis_camera_points[1] - axis_camera_points[0]
                 axis_norm = float(np.linalg.norm(axis_vector))
-                if axis_norm <= 1e-6:
+                if not np.isfinite(axis_norm) or axis_norm <= 1e-6:
                     raise VisionError(
                         "Starburst camera-frame orientation is degenerate"
                     )
@@ -400,10 +439,19 @@ class VisionApplication:
                         detection["orientation_mask_fraction"]
                     ),
                 }
+                if pickup_point == "long_axis_midpoint":
+                    pixel = tuple(np.mean(axis_pixels, axis=0).tolist())
+            camera_point = camera_point_from_pixel(
+                self.camera.intrinsics,
+                pixel,
+                corrected_depth_mm,
+            )
             candidate.update(
                 {
                     "status": "detected",
                     "pixel_uv": list(pixel),
+                    "pickup_point": pickup_point,
+                    "depth_sample_pixel_uv": list(depth_sample_pixel),
                     "raw_depth_mm": raw_depth_mm,
                     "corrected_depth_mm": corrected_depth_mm,
                     "camera_point_mm": camera_point.tolist(),
@@ -484,6 +532,8 @@ class VisionApplication:
         }
 
     def capture(self, slot: int, prompt: str, confidence: float) -> dict[str, Any]:
+        if not self.detection_enabled:
+            raise VisionError("camera does not run detection; use RGB-D capture and localization")
         if slot not in (1, 2, 3):
             raise VisionError("slot must be 1, 2, or 3")
         if not prompt.strip():
@@ -497,41 +547,104 @@ class VisionApplication:
                 after_sequence=self.camera.sequence
             )
             detections = self.detector.detect(frame, prompt.strip(), confidence)
-            result: dict[str, Any] = {
-                "status": "not_found",
-                "slot": slot,
-                "prompt": prompt.strip(),
-                "captured_at": datetime.now(timezone.utc).isoformat(),
-                "frame_sequence": sequence,
-                "model": self.model_name,
-            }
-            result.update(
-                self.save_dataset_capture(frame, prompt.strip(), detections)
+            return self.complete_capture(
+                frame, depth, sequence, slot, prompt.strip(), detections,
+                self.model_name, datetime.now(timezone.utc).isoformat(),
             )
-            candidates = [
-                self.localize_detection(detection, depth)
-                for detection in detections
-            ]
-            valid_candidates = [
-                candidate
-                for candidate in candidates
-                if candidate["status"] == "detected"
-            ]
-            result["detection_count"] = len(detections)
-            result["candidate_count"] = len(valid_candidates)
-            result["candidates"] = candidates
-            if valid_candidates:
-                result.update(valid_candidates[0])
-            elif candidates:
-                result.update(candidates[0])
-            annotated = annotate_capture(frame, slot, prompt.strip(), result)
-            annotated = self.annotate_workspace(annotated)
-            ok, encoded = cv2.imencode(".jpg", annotated)
-            if not ok:
-                raise VisionError("could not encode capture JPEG")
-            result["snapshot_url"] = f"/snapshots/{slot}.jpg"
-            self.snapshots[slot] = result
-            self.snapshot_jpegs[slot] = encoded.tobytes()
+        finally:
+            self.capture_lock.release()
+
+    def complete_capture(
+        self,
+        frame: np.ndarray,
+        depth: np.ndarray,
+        sequence: int,
+        slot: int,
+        prompt: str,
+        detections: list[dict[str, Any]],
+        model: str,
+        captured_at: str,
+        token: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "status": "not_found", "slot": slot, "prompt": prompt,
+            "captured_at": captured_at, "frame_sequence": sequence, "model": model,
+        }
+        if token is not None:
+            result["token"] = token
+        result.update(self.save_dataset_capture(frame, prompt, detections))
+        candidates = [
+            self.localize_detection(detection, depth)
+            for detection in sorted(detections, key=lambda item: float(item["score"]), reverse=True)
+        ]
+        valid = [candidate for candidate in candidates if candidate["status"] == "detected"]
+        result.update(
+            detection_count=len(detections), candidate_count=len(valid), candidates=candidates
+        )
+        if valid:
+            result.update(valid[0])
+        elif candidates:
+            result.update(candidates[0])
+        annotated = self.annotate_workspace(annotate_capture(frame, slot, prompt, result))
+        ok, encoded = cv2.imencode(".jpg", annotated)
+        if not ok:
+            raise VisionError("could not encode capture JPEG")
+        result["snapshot_url"] = f"/snapshots/{slot}.jpg"
+        self.snapshots[slot] = result
+        self.snapshot_jpegs[slot] = encoded.tobytes()
+        return result
+
+    def localize(
+        self, token: str, slot: int, prompt: str, model: str, detections: Any
+    ) -> dict[str, Any]:
+        self.metric_depth_correction()
+        if slot not in (1, 2, 3) or not prompt.strip() or not model.strip():
+            raise VisionError("localization requires slot 1..3, prompt, and model metadata")
+        if not isinstance(detections, list) or len(detections) > 1000:
+            raise VisionError("detections must be a list of at most 1000 objects")
+        stored = self.rgbd_frames.get(token)
+        if stored is None:
+            raise VisionError("unknown or expired RGB-D frame token")
+        height, width = stored["frame"].shape[:2]
+        for detection in detections:
+            if not isinstance(detection, dict):
+                raise VisionError("each detection must be an object")
+            try:
+                box = np.asarray(detection["box_xyxy"], dtype=np.float64)
+                score = float(detection["score"])
+            except (KeyError, ValueError, TypeError) as exc:
+                raise VisionError(f"invalid detection geometry: {exc}") from exc
+            if (
+                box.shape != (4,) or not np.all(np.isfinite(box))
+                or not np.isfinite(score) or not 0 <= score <= 1
+                or not 0 <= box[0] < box[2] <= width
+                or not 0 <= box[1] < box[3] <= height
+            ):
+                raise VisionError("detection box/score is invalid or outside the captured image")
+            if "long_axis_pixels" in detection:
+                try:
+                    axis = np.asarray(detection["long_axis_pixels"], dtype=np.float64)
+                    quality = np.asarray([
+                        detection["orientation_aspect_ratio"],
+                        detection["orientation_mask_fraction"],
+                    ], dtype=np.float64)
+                except (KeyError, ValueError, TypeError) as exc:
+                    raise VisionError(f"invalid detection orientation: {exc}") from exc
+                if (
+                    axis.shape != (2, 2) or not np.all(np.isfinite(axis))
+                    or quality.shape != (2,) or not np.all(np.isfinite(quality))
+                    or np.any(axis < 0) or np.any(axis[:, 0] >= width)
+                    or np.any(axis[:, 1] >= height)
+                ):
+                    raise VisionError("orientation must contain finite image points and quality")
+        if not self.capture_lock.acquire(blocking=False):
+            raise VisionError("another localization is already running")
+        try:
+            result = self.complete_capture(
+                stored["frame"], stored["depth"], stored["frame_sequence"],
+                slot, prompt.strip(), detections, model.strip(), stored["captured_at"],
+                token=token,
+            )
             return result
         finally:
             self.capture_lock.release()
@@ -542,6 +655,7 @@ class VisionApplication:
         minimum: list[float],
         maximum: list[float],
     ) -> dict[str, Any]:
+        self.metric_depth_correction()
         transform = np.asarray(base_to_camera, dtype=np.float64)
         lower = np.asarray(minimum, dtype=np.float64)
         upper = np.asarray(maximum, dtype=np.float64)
@@ -640,15 +754,18 @@ class VisionApplication:
         ok, encoded = cv2.imencode(".jpg", frame)
         if not ok:
             raise VisionError("could not encode synchronized RGB frame")
+        ok, png = cv2.imencode(".png", frame)
+        if not ok:
+            raise VisionError("could not encode lossless synchronized RGB frame")
         captured_at = datetime.now(timezone.utc).isoformat()
-        self.rgbd_frames[token] = {
-            "depth": depth,
-            "jpeg": encoded.tobytes(),
-            "frame_sequence": sequence,
-            "captured_at": captured_at,
-        }
-        while len(self.rgbd_frames) > 30:
-            self.rgbd_frames.pop(next(iter(self.rgbd_frames)))
+        with self.rgbd_lock:
+            self.rgbd_frames[token] = {
+                "frame": frame.copy(), "depth": depth.copy(),
+                "jpeg": encoded.tobytes(), "png": png.tobytes(),
+                "frame_sequence": sequence, "captured_at": captured_at,
+            }
+            while len(self.rgbd_frames) > 30:
+                self.rgbd_frames.pop(next(iter(self.rgbd_frames)))
         return {
             "status": "ok",
             "token": token,
@@ -657,9 +774,12 @@ class VisionApplication:
             "width": int(frame.shape[1]),
             "height": int(frame.shape[0]),
             "image_url": f"/rgbd/{token}.jpg",
+            "image_png_url": f"/rgbd/{token}.png",
+            "preview_only": self.preview_only,
         }
 
     def deproject(self, token: str, pixel: list[int]) -> dict[str, Any]:
+        scale, offset = self.metric_depth_correction()
         stored = self.rgbd_frames.get(token)
         if stored is None:
             raise VisionError("unknown or expired RGB-D frame token")
@@ -673,7 +793,7 @@ class VisionApplication:
             maximum_depth_m=float(self.depth_settings["maximum_depth_m"]),
         )
         corrected_depth_mm = (
-            self.depth_scale_correction * raw_depth_mm + self.depth_offset_mm
+            scale * raw_depth_mm + offset
         )
         camera_point = camera_point_from_pixel(
             self.camera.intrinsics,
@@ -758,7 +878,7 @@ setInterval(refresh,1000); refresh();
 
 
 def create_server(app: VisionApplication, port: int) -> ThreadingHTTPServer:
-    page = page_html()
+    page = app.dashboard_html() if isinstance(app, VisionApplication) else page_html()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -787,14 +907,23 @@ def create_server(app: VisionApplication, port: int) -> ThreadingHTTPServer:
             if path == "/healthz":
                 try:
                     app.camera.check()
+                    health = {
+                        "status": "ok", "camera_serial": app.camera.serial,
+                        "camera_name": app.camera.name,
+                        "camera_owner_service": app.service_name,
+                        "service": "camera",
+                        "preview_only": app.preview_only,
+                        "depth_calibrated": not app.preview_only,
+                        "capabilities": (
+                            ["rgbd-capture"] if app.preview_only
+                            else ["rgbd-capture", "localize", "deproject"]
+                        ),
+                    }
+                    if app.detection_enabled:
+                        health.update(model=app.model_name, cuda=True, service="vision")
                     self.send_json(
                         200,
-                        {
-                            "status": "ok",
-                            "model": app.model_name,
-                            "camera_serial": app.camera.serial,
-                            "cuda": True,
-                        },
+                        health,
                     )
                 except VisionError as exc:
                     self.send_json(503, {"status": "error", "error": str(exc)})
@@ -845,13 +974,16 @@ def create_server(app: VisionApplication, port: int) -> ThreadingHTTPServer:
                     return
                 self.send_bytes(200, "image/jpeg", jpeg)
                 return
-            if path.startswith("/rgbd/") and path.endswith(".jpg"):
-                token = path.removeprefix("/rgbd/").removesuffix(".jpg")
+            if path.startswith("/rgbd/") and path.endswith((".jpg", ".png")):
+                token, extension = path.removeprefix("/rgbd/").rsplit(".", 1)
                 stored = app.rgbd_frames.get(token)
                 if stored is None:
                     self.send_error(404)
                 else:
-                    self.send_bytes(200, "image/jpeg", stored["jpeg"])
+                    self.send_bytes(
+                        200, "image/png" if extension == "png" else "image/jpeg",
+                        stored["png" if extension == "png" else "jpeg"],
+                    )
                 return
             if path != "/stream.mjpg":
                 self.send_error(404)
@@ -880,6 +1012,13 @@ def create_server(app: VisionApplication, port: int) -> ThreadingHTTPServer:
 
         def do_POST(self) -> None:
             path = urllib.parse.urlsplit(self.path).path
+            if path == "/api/capture" and not app.detection_enabled:
+                self.send_json(410, {
+                    "status": "error",
+                    "error": "camera no longer runs detection; orchestrate /api/rgbd-capture, "
+                    "detection /api/detect, then camera /api/localize",
+                })
+                return
             if path == "/api/rgbd-capture":
                 try:
                     self.send_json(200, app.capture_rgbd())
@@ -890,17 +1029,25 @@ def create_server(app: VisionApplication, port: int) -> ThreadingHTTPServer:
                 "/api/capture",
                 "/api/deproject",
                 "/api/workspace-overlay",
+                "/api/localize",
             ):
                 self.send_error(404)
                 return
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length <= 0 or length > 4096:
-                    raise VisionError("request body must be 1..4096 bytes")
+                maximum = 2 * 1024 * 1024 if path == "/api/localize" else 4096
+                if length <= 0 or length > maximum:
+                    raise VisionError(f"request body must be 1..{maximum} bytes")
                 body = json.loads(self.rfile.read(length))
                 if not isinstance(body, dict):
                     raise VisionError("request must be a JSON object")
-                if path == "/api/workspace-overlay":
+                if path == "/api/localize":
+                    result = app.localize(
+                        str(body.get("token", "")), int(body.get("slot")),
+                        str(body.get("prompt", "")), str(body.get("model", "")),
+                        body.get("detections"),
+                    )
+                elif path == "/api/workspace-overlay":
                     result = app.set_workspace_overlay(
                         body.get("base_to_camera"),
                         body.get("minimum_mm"),

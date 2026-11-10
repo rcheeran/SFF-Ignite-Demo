@@ -136,7 +136,7 @@ def robust_box_depth(
 
 
 def camera_point_from_pixel(
-    intrinsics: Any, pixel: tuple[int, int], corrected_depth_mm: float
+    intrinsics: Any, pixel: tuple[float, float], corrected_depth_mm: float
 ) -> np.ndarray:
     import pyrealsense2 as rs
 
@@ -213,7 +213,7 @@ def annotate_capture(
         cv2.rectangle(annotated, (x0, y0), (x1, y1), color, 2)
         cv2.drawMarker(
             annotated,
-            tuple(candidate["pixel_uv"]),
+            tuple(np.rint(candidate["pixel_uv"]).astype(int)),
             (0, 255, 255),
             cv2.MARKER_CROSS,
             24,

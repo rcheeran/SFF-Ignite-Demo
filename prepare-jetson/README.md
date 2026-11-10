@@ -79,11 +79,11 @@ Open `http://10.0.0.19:8094/` and confirm the live stream. The demo requires
 the health response model to be `candy-yolo11s`; the OpenCV service calls
 Foundry Local for GPU inference and performs NMS and D405 depth processing.
 
-Teach exactly three distinct, collision-free scan poses:
+Teach one to three collision-free scan poses (default: three). For one view:
 
 ```bash
 source ~/venv/bin/activate
-python Demo-Product-Day/Teach-scripts/teach_scan_poses.py
+python prepare-piper/Teach-scripts/teach_scan_poses.py --pose-count 1
 ```
 
 The Piper SDK zero/home joint pose is `[0, 0, 0, 0, 0, 0]` degrees. The
@@ -92,9 +92,15 @@ verifies joint telemetry before allowing physical teach mode. The zero move uses
 SDK sequence `ModeCtrl(0x01, 0x01, speed, 0x00)` followed by
 `JointCtrl(0, 0, 0, 0, 0, 0)`. After saving stable
 joint/end telemetry to `prepare-piper/scan-poses/scan_poses.json`, it moves to
-and verifies the same SDK zero pose again before replaying scans 1, 2, and 3.
+and verifies the same SDK zero pose again before replaying the requested poses.
 It returns to zero after replay and keeps zero streamed until controller power
 is off. Restart the controller and CAN interface afterward.
+
+`--pose-count` accepts 1, 2, or 3. The demo reads the count from the saved file;
+one pose means one view per scan cycle, without multi-view coverage. Re-teaching
+overwrites the scan-pose output; use `--output` to keep a separate file and pass
+that path to the demo with `--scan-poses`. The script saves after each accepted
+pose, so finish the session before using its output.
 
 Each taught pose must remain at least 2 degrees inside every factory joint
 limit. Physical teach can move beyond limits accepted by CAN replay; such a
@@ -105,7 +111,7 @@ gripper alignment have been physically checked:
 
 ```bash
 source ~/venv/bin/activate
-python Demo-Product-Day/Teach-scripts/teach_candy_grip.py
+python prepare-piper/Teach-scripts/teach_candy_grip.py
 ```
 
 The script first moves to SDK zero and asks for physical teach mode. Place the
@@ -144,7 +150,7 @@ python Demo-Product-Day/demo.py \
   --max-cycles 1
 ```
 
-The robot continuously visits all three taught poses. At each pose it captures
+The robot continuously visits the saved one to three taught poses. At each pose it captures
 Starburst in object slot 1-3 and an open palm in hand slot 4-6. The object and
 hand service requests run concurrently after the pose settles, reducing scan
 time without changing the one-second settling delay or pose-stability checks.
@@ -228,7 +234,7 @@ immediately if motion is unexpected.
 To physically teach a different absolute Piper-base release height:
 
 ```bash
-python Demo-Product-Day/Teach-scripts/teach_release_height.py
+python prepare-piper/Teach-scripts/teach_release_height.py
 ```
 
 The arm first moves automatically to SDK zero. Support it and press the

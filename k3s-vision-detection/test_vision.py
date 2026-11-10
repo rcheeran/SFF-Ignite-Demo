@@ -7,6 +7,7 @@ import numpy as np
 
 from vision import (
     CLASS_NAMES,
+    VisionError,
     decode_yolo_output,
     estimate_long_axis,
     letterbox_tensor,
@@ -15,6 +16,14 @@ from vision import (
 
 
 class FoundryYoloTests(unittest.TestCase):
+    def test_decode_rejects_non_finite_model_output(self) -> None:
+        output = np.zeros((1, 4 + len(CLASS_NAMES), 8400), dtype=np.float32)
+        output[0, 0, 0] = np.nan
+        with self.assertRaisesRegex(VisionError, "non-finite"):
+            decode_yolo_output(
+                output, 8, 0.25, 0.45, 1.0, 0.0, 80.0, (480, 640, 3)
+            )
+
     def test_prompt_alias(self) -> None:
         self.assertEqual(normalize_prompt(" Starburst-Candy "), "starburst candy")
 

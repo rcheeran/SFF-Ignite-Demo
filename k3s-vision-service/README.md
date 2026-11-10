@@ -9,6 +9,11 @@ This service is the exclusive owner of the wrist-mounted D405. It provides:
 - Three annotated object-scan panels and three proxied hand-scan panels.
 - An HTTP API consumed by `demo.py`.
 
+This is the alternative **combined OWL-ViT service**, not the independent
+[camera service](../k3s-OpenCV-service/README.md) used by the current demo.
+Its legacy `/api/capture` endpoint remains available. The current demo instead
+orchestrates independent camera and YOLO detection services.
+
 The service does not connect to the Piper CAN interface and does not transform
 points into the Piper base frame. `demo.py` combines returned camera XYZ with
 the robot pose measured around each HTTP capture.
@@ -61,7 +66,7 @@ No-robot prompt and threshold sweep:
 
 ```bash
 cd ~/productdaydemo
-python Demo-Product-Day/test_owlvit.py "red cube"
+python Demo-Product-Day/test_owlvit.py "red cube" --legacy-capture
 ```
 
 This tests thresholds `0.20`, `0.10`, and `0.05` by default and prints the

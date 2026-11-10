@@ -1,0 +1,71 @@
+{
+  "camera": {
+    "serial": "263022078260",
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "preview_port": 8094,
+    "preview_jpeg_quality": 5
+  },
+  "aruco": {
+    "dictionary": "DICT_4X4_50",
+    "target_marker_id": 1,
+    "marker_size_mm": 101.6,
+    "minimum_marker_side_px": 60.0
+  },
+  "collection": {
+    "minimum_samples": 15,
+    "frames_per_sample": 10,
+    "sample_interval_seconds": 0.05,
+    "maximum_marker_center_stddev_px": 1.0,
+    "maximum_robot_position_stddev_mm": 1.0,
+    "maximum_reprojection_error_px": 1.5
+  },
+  "acceptance": {
+    "minimum_translation_span_mm": 100.0,
+    "minimum_rotation_from_first_deg": 25.0,
+    "minimum_rotation_axis_rank": 2,
+    "maximum_target_translation_rmse_mm": 15.0,
+    "maximum_target_rotation_rmse_deg": 3.0
+  },
+  "depth_verification": {
+    "sample_count": 30,
+    "warmup_frames": 30,
+    "center_window_radius_px": 5,
+    "minimum_valid_depth_pixels": 25,
+    "minimum_depth_m": 0.3,
+    "maximum_depth_m": 1.0,
+    "maximum_robot_position_deviation_mm": 1.0,
+    "maximum_robot_rotation_deviation_deg": 0.5,
+    "maximum_coordinate_rmse_mm": 20.0,
+    "maximum_consensus_error_mm": 10.0,
+    "maximum_temporal_depth_mad_mm": 10.0,
+    "minimum_temporal_inlier_fraction": 0.8,
+    "temporal_mad_multiplier": 3.0,
+    "temporal_outlier_floor_mm": 10.0
+  },
+  "depth_calibration": {
+    "minimum_poses": 7,
+    "frames_per_pose": 15,
+    "sample_interval_seconds": 0.05,
+    "minimum_expected_depth_span_mm": 100.0,
+    "minimum_scale": 0.8,
+    "maximum_scale": 1.2,
+    "maximum_fit_rmse_mm": 8.0,
+    "maximum_cross_validation_rmse_mm": 8.0,
+    "maximum_cross_validation_error_mm": 15.0
+  },
+  "click_coordinate": {
+    "sample_count": 30,
+    "center_window_radius_px": 5,
+    "minimum_valid_depth_pixels": 25,
+    "minimum_depth_m": 0.3,
+    "maximum_depth_m": 1.0,
+    "maximum_robot_position_deviation_mm": 1.0,
+    "maximum_robot_rotation_deviation_deg": 0.5,
+    "maximum_temporal_depth_mad_mm": 10.0,
+    "minimum_temporal_inlier_fraction": 0.8,
+    "temporal_mad_multiplier": 3.0,
+    "temporal_outlier_floor_mm": 10.0
+  }
+}

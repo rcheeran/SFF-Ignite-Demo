@@ -29,7 +29,7 @@ class DemoDepthTests(unittest.TestCase):
         )
         self.assertTrue(demo.PIPER_DIR.is_dir())
         self.assertEqual(
-            demo.DEFAULT_CONFIG, root / "prepare-piper" / "hand-eye" / "config.json"
+            demo.DEFAULT_CONFIG, root / "prepare-piper" / "hand-eye-realsense405" / "config.json"
         )
         self.assertTrue(demo.DEFAULT_CONFIG.is_file())
         self.assertEqual(
@@ -40,7 +40,7 @@ class DemoDepthTests(unittest.TestCase):
     def test_entrypoints_show_help_outside_repository(self) -> None:
         demo_dir = Path(__file__).resolve().parent
         scripts = [demo_dir / "demo.py"] + [
-            demo_dir / "Teach-scripts" / name
+            demo.PROJECT_DIR / "prepare-piper" / "Teach-scripts" / name
             for name in (
                 "teach_scan_poses.py",
                 "teach_candy_grip.py",
@@ -277,6 +277,52 @@ class DemoDepthTests(unittest.TestCase):
                 demo.DemoError, "scan pose 1 is not safely replayable"
             ):
                 demo.load_scan_poses(path)
+
+    def test_scan_file_accepts_one_to_three_poses(self) -> None:
+        for count in (1, 2, 3):
+            with self.subTest(count=count), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "poses.json"
+                path.write_text(json.dumps({
+                    "pose_count": count,
+                    "poses": [{
+                        "index": index,
+                        "joints_deg": [index * 10, 45, -25, 0, 40, 0],
+                        "end_pose_mm_deg": [200, 0, 200, 180, 20, 180],
+                    } for index in range(1, count + 1)],
+                }))
+                parsed = demo.load_scan_poses(path)
+                self.assertEqual(len(parsed), count)
+                self.assertEqual([pose["index"] for pose in parsed], list(range(1, count + 1)))
+
+    def test_scan_file_rejects_invalid_counts_and_mismatches(self) -> None:
+        pose = {
+            "index": 1, "joints_deg": [10, 45, -25, 0, 40, 0],
+            "end_pose_mm_deg": [200, 0, 200, 180, 20, 180],
+        }
+        for count, poses in (
+            (0, []), (4, [pose] * 4), (True, [pose]), (1.0, [pose]),
+            (2, [pose]), (1, [pose, pose]), (1, None),
+        ):
+            with self.subTest(count=count, poses=poses), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "poses.json"
+                path.write_text(json.dumps({"pose_count": count, "poses": poses}))
+                with self.assertRaisesRegex(demo.DemoError, "1..3 taught scan poses"):
+                    demo.load_scan_poses(path)
+
+    def test_two_scan_poses_still_require_separation_and_order(self) -> None:
+        first = {
+            "index": 1, "joints_deg": [10, 45, -25, 0, 40, 0],
+            "end_pose_mm_deg": [200, 0, 200, 180, 20, 180],
+        }
+        for second, error in (
+            ({**first, "index": 2}, "not distinct"),
+            ({**first, "index": 3}, "out of order"),
+        ):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "poses.json"
+                path.write_text(json.dumps({"pose_count": 2, "poses": [first, second]}))
+                with self.assertRaisesRegex(demo.DemoError, error):
+                    demo.load_scan_poses(path)
 
 
 class DemoPlanningTests(unittest.TestCase):

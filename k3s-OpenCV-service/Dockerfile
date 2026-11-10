@@ -13,10 +13,8 @@ RUN python -m pip install --no-cache-dir -r requirements.txt
 
 COPY k3s-vision-service/app.py /app/base_app.py
 COPY k3s-vision-service/vision.py /app/base_vision.py
-RUN sed -i 's/OWL-ViT/OpenCV + Foundry YOLO/g' /app/base_app.py
 COPY k3s-OpenCV-service/app.py k3s-OpenCV-service/vision.py ./
-COPY k3s-OpenCV-service/test_vision.py /app/tests/test_vision.py
-COPY k3s-vision-service/test_app.py /app/tests/test_app.py
+COPY k3s-OpenCV-service/test_app.py /app/tests/test_app.py
 
 EXPOSE 8094
 CMD ["python", "app.py"]

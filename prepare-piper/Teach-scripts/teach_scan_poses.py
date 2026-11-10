@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Teach and persist exactly three Piper wrist-camera scan poses."""
+"""Teach and persist one to three Piper wrist-camera scan poses."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import numpy as np
 
 PROJECT_DIR = Path(__file__).resolve().parents[2]
 HOMOGRAPHY_DIR = PROJECT_DIR / "prepare-piper" / "homography"
-HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye"
+HAND_EYE_DIR = PROJECT_DIR / "prepare-piper" / "hand-eye-realsense405"
 PIPER_DIR = PROJECT_DIR / "Demo-VLA-On-Piper" / "piper-openpi-V2"
 sys.path.insert(0, str(HOMOGRAPHY_DIR))
 sys.path.insert(0, str(HAND_EYE_DIR))
@@ -25,13 +25,17 @@ from piper.robot import Piper, connect_for_teach  # noqa: E402
 from verify_depth_coordinates import hold_until_power_off  # noqa: E402
 
 DEFAULT_OUTPUT = PROJECT_DIR / "prepare-piper" / "scan-poses" / "scan_poses.json"
-POSE_COUNT = 3
+DEFAULT_POSE_COUNT = 3
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--can-interface", default="can_piper")
+    parser.add_argument(
+        "--pose-count", type=int, choices=(1, 2, 3), default=DEFAULT_POSE_COUNT,
+        help="number of scan poses to teach (default: 3)",
+    )
     parser.add_argument("--samples", type=int, default=20)
     parser.add_argument("--sample-interval", type=float, default=0.05)
     parser.add_argument("--maximum-joint-stddev-deg", type=float, default=0.25)
@@ -252,10 +256,10 @@ def main() -> int:
         hold_joints = None
         print("TEACH MODE detected.")
         print(
-            "Teach three distinct camera views. Keep each pose still while it "
+            f"Teach {args.pose_count} camera view(s). Keep each pose still while it "
             "is sampled; the vision-service URL may remain open for alignment."
         )
-        while len(poses) < POSE_COUNT:
+        while len(poses) < args.pose_count:
             index = len(poses) + 1
             input(
                 f"\nMove to scan position {index}, hold it still, then press Enter: "
@@ -296,14 +300,14 @@ def main() -> int:
         if not piper.teach_stop(hold_joints=hold_joints):
             raise RuntimeError("Piper did not return to stable CAN control")
         save_poses(args.output, poses)
-        print(f"\nSaved all three scan positions to {args.output}")
+        print(f"\nSaved all {args.pose_count} scan position(s) to {args.output}")
         print(
-            "\nClear the complete path between all three scan poses and the "
+            "\nClear the complete path between all saved scan poses and the "
             "zero position. Keep the emergency stop accessible."
         )
         input(
-            "Press Enter to move to zero, replay scans 1, 2, 3, and return "
-            "to zero: "
+            "Press Enter to move to zero, replay scan(s) "
+            f"{', '.join(str(pose['index']) for pose in poses)}, and return to zero: "
         )
         for seconds in range(3, 0, -1):
             print(f"Replay begins in {seconds}...", flush=True)

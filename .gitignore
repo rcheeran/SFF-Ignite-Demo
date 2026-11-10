@@ -12,5 +12,7 @@ Demo-VLA-On-Piper/piper-asimov/piper-real-toolset/captures/
 
 # Host-specific runtime storage and local backups
 k3s-OpenCV-service/datasets
+Demo-Ignite/captures/
 YOLO-training/storage
 demo_old.py
+Demo-Ignite/logs/
