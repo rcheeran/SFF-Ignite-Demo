@@ -94,7 +94,7 @@ sudo kubectl get pods -A | grep -vE "Running|Completed"
 What good looks like:
 
 - `productdaydemo`: `hand-landmarker`, `opencv-vision`, and `vision-detection`
-  are `1/1` and `Running`. `owlvit-vision` is intentionally scaled to `0/0`.
+  are `1/1` and `Running`.
 - `candy-yolo11s` model deployment: `STATE Running`, `READY true`, and at least
   one `candy-yolo11s-...` pod `2/2 Running`. Older pods from previous boots may
   show `Unknown` or `Error`; they are harmless while one pod is `2/2 Running`.
