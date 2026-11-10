@@ -1,7 +1,0 @@
-# AgileX Piper REAL-hardware toolset — host-run requirements
-asimov
-piper_sdk            # AgileX Piper CAN SDK (real mode only; mock needs neither)
-uvicorn[standard]>=0.24,<1.0
-pydantic>=2.0,<3
-python-dotenv
-httpx>=0.27.1,<1.0

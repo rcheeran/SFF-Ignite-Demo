@@ -1,6 +1,0 @@
-- [No Gmail draft tool](feedback_no_gmail_draft.md) — user rejected create_draft twice; give email text directly instead
-- [Asimov robotics setup](project_asimov_robotics.md) — local FR3 VLA (Docker) + Piper MuJoCo sims, Ollama LLM, X11 viewer gotchas
-- [Piper GR00T training](project_piper_groot_training.md) — fine-tuning Isaac GR00T N1.7 for the real Piper arm; env setup, dataset format, VRAM strategy
-- [Piper CAN on Jetson Thor](project_piper_jetson_can.md) — Thor kernel lacks gs_usb; built it out-of-tree, arm enumerates as can4
-- [Thor PyTorch + openpi VLA](project_thor_pytorch_vla.md) — pi0.5 on Jetson Thor; torch cu130 SBSA wheel has sm_110, venv ~/pi05-venv
-- [Piper V2 pi0.5 pipeline](project_piper_v2_autodata.md) — ACTIVE: drag-teach → 50 eps → H100 fine-tune → policy DRIVING THE ARM (works 2026-09-04); read docs/HANDOFF.md
