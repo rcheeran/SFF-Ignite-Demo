@@ -11,7 +11,7 @@ Setup, calibration, vision services, and demo workflows for the AgileX Piper.
 - [k3s-OpenCV-service](k3s-OpenCV-service/README.md): camera, depth, and public vision API.
 - [k3s-vision-detection](k3s-vision-detection/README.md): RGB processing and Foundry YOLO detection.
 - [k3s-hand-service](k3s-hand-service/README.md): MediaPipe hand service.
-- [k3s-vision-service](k3s-vision-service/README.md): alternative OWL-ViT vision service.
+- [k3s-vision-service](k3s-vision-service/README.md): alternative OWL-ViT vision service (not deployed).
 - [YOLO-training](YOLO-training/README.md): candy-model training.
 - [useful-piper-scripts](useful-piper-scripts/): standalone diagnostics and utilities.
 

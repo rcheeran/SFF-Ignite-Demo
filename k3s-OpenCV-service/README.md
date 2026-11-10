@@ -124,8 +124,9 @@ bash k3s-OpenCV-service/build-and-deploy.sh
 bash k3s-vision-detection/build-and-deploy.sh
 ```
 
-Keep the alternative OWL-ViT deployment scaled to zero: only one process can
-own the USB camera. The camera script no longer provisions Foundry credentials.
+The alternative OWL-ViT deployment has been removed from the cluster; do not
+redeploy it alongside this service, because only one process can own the USB
+camera. The camera script no longer provisions Foundry credentials.
 The detection manifest maps port 8096 to Jetson loopback for local demo callers,
 while also providing an internal ClusterIP service.
 
