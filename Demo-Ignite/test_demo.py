@@ -1432,13 +1432,11 @@ print("Standalone preflight passed without older demo folders")
                     demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
                 ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                 mock.patch.object(demo, "run_cycle", return_value=True) as cycle, \
-                mock.patch.object(demo, "hold_until_power_off") as hold, \
                 mock.patch.object(demo.time, "sleep"):
             self.assertEqual(demo.main(), 0)
         self.assertEqual(cycle.call_count, 2)
         self.startup.assert_called_once_with(self.arm, self.scan, self.settings)
         self.assertEqual(cycle.call_args.args[-1], demo.MAXIMUM_HAND_AGE_SECONDS)
-        hold.assert_not_called()
         self.assertEqual(shutdown.mock_calls, [
             mock.call.zero(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2),
             mock.call.disconnect(),
@@ -1468,11 +1466,9 @@ print("Standalone preflight passed without older demo folders")
                     demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
                 ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                 mock.patch.object(demo, "run_cycle") as cycle, \
-                mock.patch.object(demo, "hold_until_power_off") as hold, \
                 mock.patch.object(demo.time, "sleep"):
             self.assertEqual(demo.main(), 2)
         cycle.assert_not_called()
-        hold.assert_not_called()
         self.zero.assert_called_once_with(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2)
         self.arm.disconnect.assert_called_once()
 
@@ -1486,13 +1482,11 @@ print("Standalone preflight passed without older demo folders")
                 demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
             ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                     mock.patch.object(demo, "run_cycle", side_effect=failure) as cycle, \
-                    mock.patch.object(demo, "hold_until_power_off") as hold, \
                     mock.patch.object(demo, "hold_gripper") as release, \
                     mock.patch.object(demo, "return_to_zero") as zero, \
                     mock.patch.object(demo.time, "sleep"):
                 self.assertEqual(demo.main(), code)
             self.assertEqual(cycle.call_count, 1)
-            hold.assert_not_called()
             release.assert_not_called()
             zero.assert_called_once_with(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2)
 
@@ -1512,11 +1506,9 @@ print("Standalone preflight passed without older demo folders")
             ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                     mock.patch.object(demo, "run_cycle", side_effect=cycle_failure), \
                     mock.patch.object(demo, "return_to_zero", side_effect=failure) as zero, \
-                    mock.patch.object(demo, "hold_until_power_off") as hold, \
                     mock.patch.object(demo.time, "sleep"), \
                     mock.patch("builtins.print") as output:
                 self.assertEqual(demo.main(), code)
-            hold.assert_not_called()
             zero.assert_called_once_with(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2)
             self.assertTrue(any("disconnecting without further motion" in str(call) for call in output.call_args_list))
         self.assertEqual(self.arm.disconnect.call_count, 4)
@@ -1525,12 +1517,10 @@ print("Standalone preflight passed without older demo folders")
         with mock.patch.object(demo, "parse_args", return_value=self.args()), \
                 mock.patch.object(demo, "load_hand_eye", side_effect=KeyboardInterrupt()), \
                 mock.patch.object(demo, "connect_robot") as connect, \
-                mock.patch.object(demo, "return_to_zero") as zero, \
-                mock.patch.object(demo, "hold_until_power_off") as hold:
+                mock.patch.object(demo, "return_to_zero") as zero:
             self.assertEqual(demo.main(), 130)
         connect.assert_not_called()
         zero.assert_not_called()
-        hold.assert_not_called()
 
     def test_runtime_settings_exclude_obsolete_candy_bounds_and_config_argument(self):
         self.assertNotIn("target_workspace_min_mm", demo.DEMO_SETTINGS)

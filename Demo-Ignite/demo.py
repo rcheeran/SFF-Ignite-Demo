@@ -222,28 +222,6 @@ def transform_camera_point_to_base(
     return base_point
 
 
-def hold_until_power_off(piper: Piper, hold_joints: np.ndarray) -> None:
-    """Hold the supplied joints without changing grip until the operator confirms power-off.
-
-    Confirmation is manual; this does not electronically detect controller power
-    or automatically disable motors while the arm may be unsupported.
-    """
-    confirmed = threading.Event()
-
-    def wait_for_confirmation() -> None:
-        """Wait for the operator's power-off confirmation and signal the hold loop."""
-        input(
-            "Turn the Piper controller OFF while supporting the arm. "
-            "Once it is OFF, press Enter: "
-        )
-        confirmed.set()
-
-    threading.Thread(target=wait_for_confirmation, daemon=True).start()
-    while not confirmed.is_set():
-        piper.send_joints(hold_joints, None, PIPER_C.SPEED_REST)
-        confirmed.wait(timeout=0.05)
-
-
 class GraspVerificationError(DemoError):
     """The measured post-lift jaw width shows no object was retained."""
 
