@@ -98,6 +98,11 @@ What good looks like:
 - `candy-yolo11s` model deployment: `STATE Running`, `READY true`, and at least
   one `candy-yolo11s-...` pod `2/2 Running`. Older pods from previous boots may
   show `Unknown` or `Error`; they are harmless while one pod is `2/2 Running`.
+  To clear them, delete only the stale pods by name (never the `2/2 Running` one):
+
+  ```bash
+  sudo kubectl -n foundry-local-operator delete pod <stale-pod-name> [<stale-pod-name> ...]
+  ```
 - A high `RESTARTS` count is historical if the restart time in brackets is days
   ago. A count that keeps rising means the pod is crash-looping.
 
