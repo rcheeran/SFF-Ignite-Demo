@@ -278,7 +278,8 @@ decimal places; calculations retain full precision. Verbose mode does not
 change motion permissions or planning. `--check-only --verbose` still performs
 only preflight; it does not capture detections or print point transformations.
 Joint-limit summaries, enable-time joint/twitch diagnostics, connection status,
-zero-motion announcements, and the initial scan-pose motion announcement are
+zero-motion announcements, the initial scan-pose motion announcement, and the
+per-cycle `motion: scan 1` announcement are
 also verbose-only in the main demo. Errors,
 safety warnings, joint-limit restoration warnings, and zero-arrival confirmation
 remain visible without `--verbose`. Standalone teaching/replay tools retain their
@@ -407,7 +408,7 @@ degrees tilt, ~418 mm high), modelled errors are overestimates only: length
 0-9 mm (largest near image corners), width under 2 mm, so error can reject a
 near-limit candy but cannot pass an oversized object. Captured wrappers
 measured 78-89 x 32-37 mm. Oversized candidates are rejected with their size
-in the error; accepted sizes appear in the `SCAN` line. Startup requires
+in the error; accepted sizes appear in the `CANDY SCAN` line. Startup requires
 camera intrinsics in `hand_eye.json` when `--detector opencv` is selected. The
 YOLO path is unchanged and does not apply the size check.
 Touching or partly occluded wrappers usually fail the

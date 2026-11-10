@@ -325,6 +325,23 @@ class MotionTests(unittest.TestCase):
             if verbose:
                 self.assertEqual(output.call_args.args[0], "motion: initial scan pose after zero")
 
+    def test_scan_pose_motion_announcement_follows_verbose_setting(self):
+        scan = {"index": 1, "joints_deg": np.ones(6)}
+        for verbose in (False, True):
+            settings = {
+                "verbose": verbose, "grip_open_mm": 60.0, "move_timeout_seconds": 8.0,
+                "motion_speed_percent": 10, "scan_settle_seconds": 0.0,
+            }
+            with self.subTest(verbose=verbose), \
+                    mock.patch.object(demo, "move_robot", side_effect=RuntimeError("stop after move")) as move, \
+                    self.assertRaisesRegex(RuntimeError, "stop after move"):
+                demo.capture_scan_pair(
+                    mock.Mock(), mock.Mock(), mock.Mock(), scan, 4, "starburst candy", 0.5, np.eye(4), settings,
+                )
+            move.assert_called_once()
+            self.assertEqual(move.call_args.args[1], "scan 1")
+            self.assertEqual(move.call_args.kwargs["verbose"], verbose)
+
     def test_enable_diagnostics_follow_verbose_setting(self):
         import piper.robot as robot
 

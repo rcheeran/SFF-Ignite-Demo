@@ -980,7 +980,7 @@ print("Standalone preflight passed without older demo folders")
                 np.eye(4), np.eye(4), np.eye(4), settings,
             )
         summary = output.call_args.args[0]
-        self.assertIn("SCAN 1: detected 1 candy(ies)", summary)
+        self.assertIn("CANDY SCAN: detected 1 candy(ies)", summary)
         self.assertNotIn("candidate(s)", summary)
         plan = [("pick approach", np.ones(6)), ("grasp", np.ones(6)), ("lift", np.ones(6)), ("scan 1", np.zeros(6))]
         with mock.patch.object(demo, "validate_joint_path_safety"), \

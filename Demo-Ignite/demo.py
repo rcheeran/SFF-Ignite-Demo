@@ -1249,7 +1249,7 @@ def process_object_capture(
             if "length_mm" in result else ""
         )
         print(
-            f"SCAN {index}: detected {len(valid_candidates)} candy(ies), "
+            f"CANDY SCAN: detected {len(valid_candidates)} candy(ies), "
             f"best score={float(result['score']):.3f}, "
             f"camera={np.round(result['camera_point_mm'], 1).tolist()}mm{size}, "
             f"snapshot={client.base_url}{result['snapshot_url']}"
@@ -1275,7 +1275,7 @@ def process_object_capture(
             else ""
         )
         print(
-            f"SCAN {index}: {result['status']} at "
+            f"CANDY SCAN: {result['status']} at "
             f"confidence={confidence:.3f}{reason}, "
             f"snapshot={client.base_url}{result['snapshot_url']}"
         )
@@ -1304,6 +1304,7 @@ def capture_scan_pair(
         float(demo["grip_open_mm"]),
         float(demo["move_timeout_seconds"]),
         int(demo["motion_speed_percent"]),
+        verbose=bool(demo.get("verbose", False)),
     )
     move_seconds = time.perf_counter() - move_started_at
     settle_started_at = time.perf_counter()
