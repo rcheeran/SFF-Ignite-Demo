@@ -85,7 +85,7 @@ spec:
             type: Directory
         - name: calibration
           hostPath:
-            path: /home/clouduser/productdaydemo/prepare-piper/hand-eye-realsense435/calibration
+            path: /home/clouduser/SFF-Ignite-Demo/prepare-piper/hand-eye-realsense435/calibration
             type: Directory
         - name: dataset
           hostPath:

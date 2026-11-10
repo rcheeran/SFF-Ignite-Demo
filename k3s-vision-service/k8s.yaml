@@ -87,7 +87,7 @@ spec:
             type: Directory
         - name: calibration
           hostPath:
-            path: /home/clouduser/productdaydemo/prepare-piper/hand-eye/calibration
+            path: /home/clouduser/SFF-Ignite-Demo/prepare-piper/hand-eye-realsense405/calibration
             type: Directory
         - name: model-cache
           hostPath:

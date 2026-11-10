@@ -129,11 +129,17 @@ Remain ready to support the arm and use emergency stop if the return fails.
 
 ### Jetson storage
 
-The repository is stored at `/mnt/k3s-data/productdaydemo` on the encrypted
-data filesystem and persistently bind-mounted at `/home/clouduser/productdaydemo`.
-Existing commands and Kubernetes calibration host paths therefore stay unchanged.
-The `home-clouduser-productdaydemo.mount` unit is required by k3s at startup,
+The repository is stored at `/mnt/k3s-data/SFF-Ignite-Demo` on the encrypted
+data filesystem and persistently bind-mounted at `/home/clouduser/SFF-Ignite-Demo`
+by `home-clouduser-SFF\x2dIgnite\x2dDemo.mount` (create the unit name with
+`systemd-escape -p --suffix=mount /home/clouduser/SFF-Ignite-Demo`). The
+`opencv-vision` calibration host path points into this mount, so k3s requires the
+unit at startup (drop-in `/etc/systemd/system/k3s.service.d/demo-repository.conf`),
 preventing fallback to an empty root-filesystem directory if the mount fails.
+Git-ignored local data (calibration records, scan poses, `Demo-Ignite/logs/` and
+`captures/`) and the `YOLO-training/storage` and `k3s-OpenCV-service/datasets`
+links to `/var/lib/rancher/k3s/storage/productdaydemo-yolo` are not in the
+repository; copy or recreate them after a fresh clone.
 
 The separate Docker containerd store is at `/mnt/k3s-data/docker-containerd`,
 bind-mounted at `/var/lib/containerd` by `var-lib-containerd.mount`, which

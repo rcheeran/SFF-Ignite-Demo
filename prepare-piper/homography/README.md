@@ -67,7 +67,7 @@ one physical camera, board placement, scan pose, and robot.
 2. Verify the Piper connection:
 
    ```bash
-   cd /home/clouduser/productdaydemo
+   cd /home/clouduser/SFF-Ignite-Demo
    source ~/venv/bin/activate
    python3 prepare-piper/check_connection.py can_piper
    ```
@@ -221,7 +221,7 @@ smaller.
 ## 5. Verify the software without hardware
 
 ```bash
-cd /home/clouduser/productdaydemo/prepare-piper/homography
+cd /home/clouduser/SFF-Ignite-Demo/prepare-piper/homography
 ~/venv/bin/python -m unittest -v test_common.py
 ```
 

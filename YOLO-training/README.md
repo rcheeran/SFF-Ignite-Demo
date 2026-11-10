@@ -11,7 +11,7 @@ corrects its display name to `starburst` without changing its numeric class ID.
 ## Prepare
 
 ```bash
-cd ~/productdaydemo/YOLO-training
+cd ~/SFF-Ignite-Demo/YOLO-training
 python prepare_dataset.py
 ```
 
@@ -21,13 +21,13 @@ The local `clouduser` account cannot read `/dev/nvmap`, so CUDA training must
 run through the privileged Python process:
 
 ```bash
-cd ~/productdaydemo/YOLO-training/storage
+cd ~/SFF-Ignite-Demo/YOLO-training/storage
 sudo env \
   YOLO_CONFIG_DIR="$PWD/config" \
   TORCH_HOME="$PWD/cache/torch" \
   XDG_CACHE_HOME="$PWD/cache" \
   /home/clouduser/venv/bin/python \
-  /home/clouduser/productdaydemo/YOLO-training/train.py
+  /home/clouduser/SFF-Ignite-Demo/YOLO-training/train.py
 ```
 
 Defaults follow the referenced Ultralytics workflow:
@@ -68,7 +68,7 @@ Foundry Local requires this archive in an externally addressable
 OCI-compatible registry. After authenticating with ORAS, push it with:
 
 ```bash
-cd ~/productdaydemo/YOLO-training/storage/artifacts
+cd ~/SFF-Ignite-Demo/YOLO-training/storage/artifacts
 ../tools/oras push REGISTRY/REPOSITORY:candy-yolo11s-v1 \
   candy-yolo11s-v1.tar.gz:application/gzip
 ```

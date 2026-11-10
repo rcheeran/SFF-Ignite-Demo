@@ -11,7 +11,7 @@ adapter connected.
 Run commands from the repository root unless stated otherwise:
 
 ```bash
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 bash prepare-jetson/setup.sh
 ```
 
@@ -68,7 +68,7 @@ performs image/depth processing, and sends YOLO tensors to the Foundry Local
 `candy-yolo11s` GPU deployment. Deploy it and the MediaPipe hand service first:
 
 ```bash
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 ./k3s-OpenCV-service/build-and-deploy.sh
 ./k3s-hand-service/build-and-deploy.sh
 curl http://127.0.0.1:8094/healthz

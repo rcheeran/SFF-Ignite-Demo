@@ -39,7 +39,7 @@ import numpy as np
 
 HAND_EYE_DIR = Path(__file__).resolve().parent
 HOMOGRAPHY_DIR = HAND_EYE_DIR.parent / "homography"
-PIPER_APP_DIR = HAND_EYE_DIR.parents[1] / "Demo-VLA-On-Piper" / "piper-openpi-V2"
+PIPER_APP_DIR = HAND_EYE_DIR.parents[1] / "Demo-Ignite"
 sys.path.insert(0, str(HOMOGRAPHY_DIR))
 sys.path.insert(0, str(HAND_EYE_DIR))
 sys.path.insert(0, str(PIPER_APP_DIR))

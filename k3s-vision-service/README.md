@@ -21,7 +21,7 @@ the robot pose measured around each HTTP capture.
 ## Deploy
 
 ```bash
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 ./k3s-vision-service/build-and-deploy.sh
 ```
 
@@ -65,7 +65,7 @@ curl -X POST http://127.0.0.1:8094/api/capture \
 No-robot prompt and threshold sweep:
 
 ```bash
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 python Demo-Product-Day/test_owlvit.py "red cube" --legacy-capture
 ```
 

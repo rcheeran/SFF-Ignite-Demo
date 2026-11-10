@@ -7,7 +7,7 @@ exclusive D405 ownership in `opencv-vision`.
 ## Deploy
 
 ```bash
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 chmod +x k3s-hand-service/build-and-deploy.sh
 ./k3s-hand-service/build-and-deploy.sh
 ```

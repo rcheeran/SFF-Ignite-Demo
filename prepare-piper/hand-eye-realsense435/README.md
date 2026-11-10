@@ -14,7 +14,7 @@ The existing environment has overlapping OpenCV installations and lacks
 `calibrateHandEye`. Use an isolated environment with one pinned OpenCV build:
 
 ```bash
-cd ~/productdaydemo/prepare-piper/hand-eye-realsense435
+cd ~/SFF-Ignite-Demo/prepare-piper/hand-eye-realsense435
 python3 -m venv ~/venv-hand-eye435
 ~/venv-hand-eye435/bin/python -m pip install -r requirements.txt
 source ~/venv-hand-eye435/bin/activate
