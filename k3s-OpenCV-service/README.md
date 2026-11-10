@@ -29,7 +29,7 @@ identity as `camera_name`, `camera_serial`, and `camera_owner_service`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/healthz` | Camera health and capabilities, without model/CUDA claims |
-| GET | `/` | Live stream, object scan panels, proxied hand panels |
+| GET | `/` | Dashboard: live stream beside the latest candy and hand scans, scan details below |
 | GET | `/stream.mjpg` | Live MJPEG stream |
 | POST | `/api/rgbd-capture` | Capture one aligned RGB/depth pair and return its token |
 | GET | `/rgbd/{token}.png` | Lossless RGB image for detection |

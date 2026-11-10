@@ -173,6 +173,20 @@ class CameraHttpTests(unittest.TestCase):
         self.assertEqual(health["camera_name"], "Intel RealSense D435")
         self.assertEqual(health["camera_owner_service"], "opencv-vision")
 
+    def test_dashboard_puts_live_view_beside_stacked_scans_with_details_below(self) -> None:
+        page = self.request("/").decode("utf-8")
+        top = page.index('<div class="top">')
+        details = page.index('<div class="details">')
+        self.assertLess(top, page.index('src="/stream.mjpg"'))
+        self.assertLess(page.index('src="/stream.mjpg"'), page.index('id="candyshot"'))
+        self.assertLess(page.index('id="candyshot"'), page.index('id="handshot"'))
+        self.assertLess(page.index('id="handshot"'), details)
+        self.assertLess(details, page.index('id="candymeta"'))
+        self.assertLess(page.index('id="candymeta"'), page.index('id="handmeta"'))
+        self.assertIn("grid-template-columns:minmax(0,7fr) minmax(220px,3fr)", page)
+        for legacy in ("Hand scan 4", "Scan 1", "X=100..450 mm"):
+            self.assertNotIn(legacy, page)
+
     def test_dashboard_escapes_camera_identity(self) -> None:
         self.app.camera.name = "<camera>"
         self.app.camera.serial = 'serial<script>'
