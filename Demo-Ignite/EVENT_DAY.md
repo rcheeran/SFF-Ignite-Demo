@@ -1,0 +1,192 @@
+# Ignite demo: event-day checklist
+
+Work through the sections in order. Steps 1-7 never move the arm. Run every
+command from the repository root with the demo environment active:
+
+```bash
+source ~/venv-ignite-demo/bin/activate
+cd ~/SFF-Ignite-Demo
+```
+
+`kubectl` needs `sudo` on this Jetson (the k3s kubeconfig is root-only).
+
+## 1. Power on and connect
+
+1. Plug the D435 into a USB 3 port and the Piper USB-CAN adapter into USB.
+2. Power on the Jetson. The encrypted data disks unlock automatically through
+   the TPM; no passphrase is needed.
+3. Power on the Piper controller. Keep the emergency stop within reach from
+   now on.
+4. Wait about two minutes for k3s and the services to start.
+
+## 2. Host checks
+
+```bash
+# Repository mount on the encrypted disk (SOURCE must be k3s-data-secure)
+findmnt -T ~/SFF-Ignite-Demo -o TARGET,SOURCE
+
+# k3s and the CAN bring-up service (both should print "active")
+systemctl is-active k3s piper-can
+
+# Both USB devices are visible
+lsusb | grep -E "RealSense D435|CAN adapter"
+```
+
+Expected `lsusb` lines:
+
+```text
+... ID 8086:0b07 Intel Corp. RealSense D435
+... ID 1d50:606f OpenMoko, Inc. Geschwister Schneider CAN adapter
+```
+
+## 3. CAN link and arm
+
+```bash
+ip -details link show can_piper | grep "can state"
+```
+
+`can state ERROR-ACTIVE` is healthy. `ERROR-PASSIVE` or `BUS-OFF` means the
+arm is not answering (powered off, emergency stop pressed, or the adapter was
+re-plugged). Reset the bus with:
+
+```bash
+bash prepare-jetson/can_up.sh
+```
+
+Then run the read-only arm check (no motion is sent):
+
+```bash
+python prepare-piper/check_connection.py can_piper
+```
+
+Healthy output includes:
+
+| Line | Expected |
+|---|---|
+| `ArmStatus.Hz` / `JointMsgs.Hz` | about `200.0` (`0.0` means the arm is in Master mode or needs a power cycle; see [SETUP.md](../prepare-jetson/SETUP.md)) |
+| `Control Mode` | `CAN_CTRL` |
+| `Arm Status` | `NORMAL` |
+| `Teach Status` | `STOP_RECORDING` |
+| `Error Code` | `0` |
+| `Joint N Angle Limit Status` / `Communication Status` | all `False` (no fault) |
+| `EnableStatus` | six `True` values (may be `False` after a fresh power-on; the demo enables the arm) |
+
+Only one program can use the CAN bus safely at a time: do not run this check
+while `demo.py` is running.
+
+## 4. Kubernetes pods and services
+
+```bash
+# Node ready
+sudo kubectl get nodes
+
+# Demo services: hand-landmarker, opencv-vision, vision-detection must be 1/1 Running
+sudo kubectl -n productdaydemo get deploy,pods,svc
+
+# Foundry Local YOLO model used by vision-detection
+sudo kubectl -n foundry-local-operator get modeldeployments
+sudo kubectl -n foundry-local-operator get pods -l app.kubernetes.io/name=candy-yolo11s
+
+# Anything not Running or Completed across the cluster
+sudo kubectl get pods -A | grep -vE "Running|Completed"
+```
+
+What good looks like:
+
+- `productdaydemo`: `hand-landmarker`, `opencv-vision`, and `vision-detection`
+  are `1/1` and `Running`. `owlvit-vision` is intentionally scaled to `0/0`.
+- `candy-yolo11s` model deployment: `STATE Running`, `READY true`, and at least
+  one `candy-yolo11s-...` pod `2/2 Running`. Older pods from previous boots may
+  show `Unknown` or `Error`; they are harmless while one pod is `2/2 Running`.
+- A high `RESTARTS` count is historical if the restart time in brackets is days
+  ago. A count that keeps rising means the pod is crash-looping.
+
+Inspect or restart a service:
+
+```bash
+sudo kubectl -n productdaydemo logs deploy/opencv-vision --tail=50
+sudo kubectl -n productdaydemo rollout restart deploy/opencv-vision
+sudo kubectl -n productdaydemo rollout status deploy/opencv-vision --timeout=5m
+```
+
+Use the same commands with `hand-landmarker` or `vision-detection`. Restart
+`hand-landmarker` after `opencv-vision`, because it reads the camera stream from
+it. Restarting `opencv-vision` while the demo runs interrupts the demo.
+
+## 5. Service health
+
+```bash
+for port in 8094 8095 8096; do
+  echo "$port: $(curl -s -m 10 http://127.0.0.1:$port/healthz)"
+done
+```
+
+| Port | Service | Expected |
+|---|---|---|
+| 8094 | Camera (opencv-vision) | `"status": "ok"`, `"camera_name": "RealSense D435"`, `"camera_serial": "263022078260"`, `"depth_calibrated": true`, `"preview_only": false` |
+| 8095 | Hand (MediaPipe) | `"status": "ok"`, `"source_url": "http://127.0.0.1:8094/stream.mjpg"` |
+| 8096 | YOLO detection | `"status": "ok"`, `"model": "candy-yolo11s"`, `"cuda": true` |
+
+Live views for the audience screen (find the address with `hostname -I`):
+
+- Camera, detections, and workspace outline: `http://<jetson-ip>:8094/`
+- Hand detection: `http://<jetson-ip>:8095/`
+
+## 6. Demo preflight (no CAN, no motion)
+
+```bash
+python Demo-Ignite/demo.py --check-only --detector opencv
+python Demo-Ignite/demo.py --check-only --detector yolo
+```
+
+Each must end with `Preflight passed; no CAN connection or arm motion`. Any
+`[FAILED]` line names the service to fix in sections 4-5.
+
+## 7. Physical setup
+
+- Board and table in the taught position; nothing has moved since calibration.
+- Clear space around the arm, the scan pose, and the path to the palm area.
+- Candies flat on the table, inside the workspace outline shown on the 8094
+  view and within about 42 cm (X 420 mm) of the robot base. Further out, candies
+  lying along X are grasped at a forward tilt, which missed often.
+- The open palm goes on "Place hand here", away from the candies.
+- Gripper empty. Emergency stop reachable by the operator.
+
+## 8. Run the demo
+
+```bash
+python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
+  --setup-reviewed --detector opencv --verbose --max-cycles 0 2>&1 \
+  | tee -i Demo-Ignite/logs/run-$(date +%Y%m%d-%H%M%S).log
+```
+
+- `--max-cycles 0` loops until Ctrl+C; use a number for a bounded run.
+- Drop `--detector opencv` to use YOLO instead. OpenCV is recommended: YOLO can
+  miss some wrappers and has mistaken palms for candy.
+- On start the arm moves to SDK zero, opens the gripper, then goes to the scan
+  pose. Each cycle scans, picks one candy, waits for an open palm, and releases
+  76.2 mm above it.
+
+## 9. Stop and shut down
+
+1. Press Ctrl+C once. The arm returns to SDK zero, opens the gripper, and
+   disconnects. Wait for the prompt before touching the arm.
+2. If anything looks wrong, press the emergency stop instead.
+3. Power off the Piper controller, then shut down the Jetson
+   (`sudo shutdown -h now`).
+
+## Troubleshooting
+
+| Symptom | Likely cause and fix |
+|---|---|
+| `can state ERROR-PASSIVE` / `BUS-OFF` | Arm off, emergency stop pressed, or adapter re-plugged. Release the stop, power the arm, run `bash prepare-jetson/can_up.sh`. |
+| `ArmStatus.Hz: 0.0` | Arm in Master mode or needs a power cycle; see [SETUP.md](../prepare-jetson/SETUP.md). |
+| Preflight `[FAILED] OpenCV camera` | Re-seat the D435 on USB 3, then restart `opencv-vision`, then `hand-landmarker` (section 4). |
+| Preflight `[FAILED] YOLO / Foundry detection` | Check the `candy-yolo11s` model deployment (section 4), restart `vision-detection`, or run with `--detector opencv`. |
+| Preflight `[FAILED] MediaPipe hand service` | Restart `hand-landmarker` after `opencv-vision` is healthy. |
+| `No accepted candy/palm pair` every cycle | A pickup needs a candy and an open palm in the same scan. Check both on the 8094/8095 views; move the candy toward the board centre. |
+| `Pickup missed` | The arm rescans and retries automatically. Repeated misses on one candy: reposition it, or check the verbose `PICK PLAN` lines in the log. |
+| `No reachable candy` | The candy is too far or at an unreachable angle; move it closer to the robot. |
+| Arm faults or joints disabled | Press the emergency stop, power-cycle the arm, run `can_up.sh`, then repeat section 3. |
+
+Keep the run logs in `Demo-Ignite/logs/` for later review.

@@ -5,6 +5,9 @@ orchestration, grasp planning, calibration loading, and motor-health checks.
 It does not import code from either older demo folder. It defaults to D435
 calibration, not D405.
 
+For the step-by-step power-on, health-check, run, and shutdown procedure, see
+the [event-day checklist](EVENT_DAY.md).
+
 ## Flow
 
 1. Print independent checks for the OpenCV camera, YOLO/Foundry CUDA model,
