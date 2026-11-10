@@ -1926,17 +1926,17 @@ def plan_delivery(palm: dict, arm: Any, scan: dict, settings: dict, maximum_age:
 
 def reacquire_palm(
     arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    transform: np.ndarray, settings: dict,
+    camera_to_gripper: np.ndarray, settings: dict,
 ) -> dict:
     """Capture a new palm at the current arm pose for delivery-plan validation."""
     return capture_hand_at_current_pose(
-        arm, hands, objects, scan, int(scan["index"]) + 3, transform, settings,
+        arm, hands, objects, scan, int(scan["index"]) + 3, camera_to_gripper, settings,
     )
 
 
 def wait_for_deliverable_palm(
     arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    transform: np.ndarray, settings: dict, maximum_age: float,
+    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
 ) -> tuple[dict, np.ndarray, dict]:
     """Hold the scan pose with the candy, capturing until a palm has an accepted delivery plan.
 
@@ -1950,7 +1950,7 @@ def wait_for_deliverable_palm(
         require_healthy(arm, "waiting at scan pose with candy")
         attempt += 1
         try:
-            palm = reacquire_palm(arm, objects, hands, scan, transform, settings)
+            palm = reacquire_palm(arm, objects, hands, scan, camera_to_gripper, settings)
             center = finite_vector(palm.get("base_point_mm"), 3, "reacquired palm center")
             plan = dict(plan_delivery(palm, arm, scan, settings, maximum_age))
             verify_palm(palm, maximum_age)
@@ -1966,7 +1966,7 @@ def wait_for_deliverable_palm(
 
 def deliver_to_palm(
     arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    transform: np.ndarray, settings: dict, maximum_age: float,
+    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
     carry: CandyCarry | None = None,
 ) -> None:
     """Wait at the scan pose for a deliverable palm, then approach and release above it.
@@ -1984,7 +1984,7 @@ def deliver_to_palm(
     carry.reached("scan pose", scan["joints_deg"])
     time.sleep(float(settings["scan_settle_seconds"]))
     palm, current, plan = wait_for_deliverable_palm(
-        arm, objects, hands, scan, transform, settings, maximum_age,
+        arm, objects, hands, scan, camera_to_gripper, settings, maximum_age,
     )
     print(f"Palm detected after pickup: {np.round(current, 3).tolist()}mm")
     checked_move(arm, "hand approach", plan["hand approach"], closed, settings)
@@ -2172,7 +2172,7 @@ def pick_diagnostic(capture: dict, target: dict, plan: list[tuple[str, np.ndarra
 
 def run_cycle(
     arm: Any, objects: VisionClient, hands: HandClient, scans: list[dict],
-    transform: np.ndarray, settings: dict, maximum_age: float,
+    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
 ) -> bool:
     """Scan taught poses, pick one accepted candy, then deliver to a freshly checked palm.
 
@@ -2191,7 +2191,7 @@ def run_cycle(
         )
         candy, palm = capture_scan_pair(
             arm, objects, hands, scan, int(scan["index"]) + 3,
-            PROMPT, float(settings["detection_confidence_threshold"]), transform, settings,
+            PROMPT, float(settings["detection_confidence_threshold"]), camera_to_gripper, settings,
         )
         if candy.get("status") != "detected" or palm.get("status") != "detected":
             print("No accepted candy/palm pair; continuing scan without pickup", flush=True)
@@ -2217,7 +2217,7 @@ def run_cycle(
         try:
             held_width = execute_pickup(arm, plan, settings, carry, target)
             print(f"Pickup confirmed: gripper width={held_width:.2f}mm", flush=True)
-            deliver_to_palm(arm, objects, hands, scan, transform, settings, maximum_age, carry)
+            deliver_to_palm(arm, objects, hands, scan, camera_to_gripper, settings, maximum_age, carry)
         except GraspVerificationError as exc:
             print(f"Pickup missed: {exc}; scanning again", flush=True)
             return False
@@ -2323,7 +2323,7 @@ def main() -> int:
         )
         hands = HandClient(args.hand_url)
         check_services(HttpClient(args.vision_url), objects, hands, camera_serial)
-        settings, transform, scans = load_setup(args, hand_eye)
+        settings, camera_to_gripper, scans = load_setup(args, hand_eye)
         print(f"[OK] Accepted D435 calibration and {len(scans)} taught scan pose(s)", flush=True)
         if args.check_only:
             print("Preflight passed; no CAN connection or arm motion", flush=True)
@@ -2346,7 +2346,7 @@ def main() -> int:
         while args.max_cycles == 0 or cycle < args.max_cycles:
             cycle += 1
             print(f"\nIGNITE CYCLE {cycle}", flush=True)
-            run_cycle(arm, objects, hands, scans, transform, settings, MAXIMUM_HAND_AGE_SECONDS)
+            run_cycle(arm, objects, hands, scans, camera_to_gripper, settings, MAXIMUM_HAND_AGE_SECONDS)
             time.sleep(float(settings["retry_delay_seconds"]))
     except KeyboardInterrupt:
         if arm is None:
