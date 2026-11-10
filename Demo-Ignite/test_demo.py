@@ -1329,10 +1329,9 @@ print("Standalone preflight passed without older demo folders")
                 "scan_poses": Path("/unused/scan_poses.json"), "vision_url": "http://camera",
                 "detection_url": "http://detector", "hand_url": "http://hand",
                 "can_interface": "can_piper", "max_cycles": 2,
-                "check_only": False, "allow_motion": True, "allow_pick": True,
+                "check_only": False, "allow_motion": True,
                 "detector": "yolo",
-                "verbose": False,
-                "allow_hand_delivery": True, "setup_reviewed": True, **fields,
+                "verbose": False, **fields,
             }
         )
 
@@ -1404,17 +1403,22 @@ print("Standalone preflight passed without older demo folders")
         connect.assert_not_called()
         self.assertEqual(services.call_args.args[-1], "D435")
 
-    def test_each_motion_gate_prevents_can_connection(self):
-        for flag in ("allow_motion", "allow_pick", "allow_hand_delivery", "setup_reviewed"):
-            with self.subTest(flag=flag), mock.patch.object(
-                demo, "parse_args", return_value=self.args(**{flag: False})
-            ), mock.patch.object(
-                demo, "load_hand_eye", return_value={"camera": {"serial": "D435"}}
-            ), mock.patch.object(demo, "check_services"), mock.patch.object(
-                demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
-            ), mock.patch.object(demo, "connect_robot") as connect:
-                self.assertEqual(demo.main(), 2)
-            connect.assert_not_called()
+    def test_missing_allow_motion_prevents_can_connection(self):
+        with mock.patch.object(demo, "parse_args", return_value=self.args(allow_motion=False)), \
+                mock.patch.object(demo, "load_hand_eye", return_value={"camera": {"serial": "D435"}}), \
+                mock.patch.object(demo, "check_services"), mock.patch.object(
+                    demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
+                ), mock.patch.object(demo, "connect_robot") as connect, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(demo.main(), 2)
+        connect.assert_not_called()
+        self.assertIn("motion requires --allow-motion", stderr.getvalue())
+
+    def test_removed_motion_gate_flags_are_rejected(self):
+        for flag in ("--allow-pick", "--allow-hand-delivery", "--setup-reviewed"):
+            with self.subTest(flag=flag), mock.patch.object(sys, "argv", ["demo.py", "--allow-motion", flag]), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+                demo.parse_args()
 
     def test_removed_scan_option_is_rejected(self):
         with mock.patch.object(sys, "argv", ["demo.py", "--scan-only"]), \
@@ -1538,7 +1542,8 @@ print("Standalone preflight passed without older demo folders")
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--check-only", result.stdout)
-        self.assertIn("--allow-hand-delivery", result.stdout)
+        self.assertIn("--allow-motion", result.stdout)
+        self.assertNotIn("--setup-reviewed", result.stdout)
 
 
 if __name__ == "__main__":

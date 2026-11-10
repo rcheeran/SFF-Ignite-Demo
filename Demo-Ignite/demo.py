@@ -1750,12 +1750,10 @@ def parse_args() -> argparse.Namespace:
         help="test override for the grasp tilt from vertical (0-30 degrees; 0 = vertical) "
         "instead of DEMO_SETTINGS grasp_rpy_deg pitch",
     )
-    parser.add_argument("--allow-motion", action="store_true")
-    parser.add_argument("--allow-pick", action="store_true")
-    parser.add_argument("--allow-hand-delivery", action="store_true")
     parser.add_argument(
-        "--setup-reviewed", action="store_true",
-        help="confirm new-surface motion settings, tool-tip floor, and collision clearances reviewed",
+        "--allow-motion", action="store_true",
+        help="connect to the arm and run the pickup and hand-delivery loop; "
+        "without it only the preflight runs",
     )
     parser.add_argument("--max-cycles", type=int, default=0, help="zero loops until Ctrl+C")
     return parser.parse_args()
@@ -2328,10 +2326,8 @@ def main() -> int:
         if args.check_only:
             print("Preflight passed; no CAN connection or arm motion", flush=True)
             return 0
-        if not all((args.allow_motion, args.allow_pick, args.allow_hand_delivery, args.setup_reviewed)):
-            raise DemoError(
-                "motion requires --allow-motion --allow-pick --allow-hand-delivery --setup-reviewed"
-            )
+        if not args.allow_motion:
+            raise DemoError("motion requires --allow-motion")
         if settings.get("pause_before_grip") and not sys.stdin.isatty():
             raise DemoError("--pause-before-grip needs an interactive terminal to type candy offsets")
         print(

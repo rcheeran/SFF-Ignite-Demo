@@ -250,13 +250,12 @@ success-shaped bypass of missing prerequisites.
 For the full pickup/delivery cycle:
 
 ```bash
-python Demo-Ignite/demo.py \
-  --allow-motion --allow-pick --allow-hand-delivery --setup-reviewed \
-  --max-cycles 1
+python Demo-Ignite/demo.py --allow-motion --max-cycles 1
 ```
 
-The four flags explicitly permit motor enablement, pickup, hand delivery, and
-confirm physical setup review. A five-second countdown precedes connection.
+`--allow-motion` is the single motion gate: without it the demo runs the
+preflight and exits without connecting to CAN. Review the physical setup before
+adding it. A five-second countdown precedes connection.
 `connect_robot()` takes exclusive CAN control and enables the arm without
 stopping camera services (`connect_for_teach` remains a compatibility alias for
 existing teaching tools). After connection, the demo first executes a checked
@@ -299,8 +298,8 @@ To save a run for later review, log to `Demo-Ignite/logs/` (git-ignored).
 so the shutdown lines are captured:
 
 ```bash
-python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
-  --setup-reviewed --detector opencv --verbose --max-cycles 10 2>&1 \
+python -u Demo-Ignite/demo.py --allow-motion \
+  --detector opencv --verbose --max-cycles 10 2>&1 \
   | tee -i Demo-Ignite/logs/run-$(date +%Y%m%d-%H%M%S).log
 ```
 
@@ -336,8 +335,8 @@ The correction applies to candies only, not palms. The option needs an
 interactive terminal; `| tee -i` logging keeps the keyboard connected:
 
 ```bash
-python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
-  --setup-reviewed --pause-before-grip --verbose --max-cycles 6 2>&1 \
+python -u Demo-Ignite/demo.py --allow-motion \
+  --pause-before-grip --verbose --max-cycles 6 2>&1 \
   | tee -i Demo-Ignite/logs/offsets-$(date +%Y%m%d-%H%M%S).log
 ```
 
@@ -360,8 +359,8 @@ along X out to about X 420 mm. Run the same candy placement once with the
 default and once with `--grasp-tilt-deg 0`, both with `--pause-before-grip`:
 
 ```bash
-python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
-  --setup-reviewed --pause-before-grip --verbose --max-cycles 3 --grasp-tilt-deg 0 2>&1 \
+python -u Demo-Ignite/demo.py --allow-motion \
+  --pause-before-grip --verbose --max-cycles 3 --grasp-tilt-deg 0 2>&1 \
   | tee -i Demo-Ignite/logs/tilt0-$(date +%Y%m%d-%H%M%S).log
 ```
 

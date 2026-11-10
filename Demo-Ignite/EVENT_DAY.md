@@ -160,11 +160,13 @@ Each must end with `Preflight passed; no CAN connection or arm motion`. Any
 ## 8. Run the demo
 
 ```bash
-python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
-  --setup-reviewed --detector opencv --verbose --max-cycles 0 2>&1 \
+python -u Demo-Ignite/demo.py --allow-motion \
+  --detector opencv --verbose --max-cycles 0 2>&1 \
   | tee -i Demo-Ignite/logs/run-$(date +%Y%m%d-%H%M%S).log
 ```
 
+- `--allow-motion` is the only motion gate; add it only after the physical
+  setup in section 7 is checked. Without it the demo runs the preflight only.
 - `--max-cycles 0` loops until Ctrl+C; use a number for a bounded run.
 - Drop `--detector opencv` to use YOLO instead. OpenCV is recommended: YOLO can
   miss some wrappers and has mistaken palms for candy.
