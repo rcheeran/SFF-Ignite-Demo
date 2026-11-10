@@ -1120,7 +1120,7 @@ def transform_object_candidate(
             robot_transform,
             camera_to_gripper,
             verbose=demo.get("verbose", False),
-            label=f"candy scan {scan_index}",
+            label="candy scan",
         )
         camera_axis = finite_vector(
             candidate.get("long_axis_camera_unit"),
@@ -1153,7 +1153,7 @@ def transform_object_candidate(
             base_point[:2] += correction
             if demo.get("verbose"):
                 print(
-                    f"candy scan {scan_index}: applied candy XY correction "
+                    f"candy scan: applied candy XY correction "
                     f"{np.round(correction, 3).tolist()}mm -> {np.round(base_point, 3).tolist()}mm",
                     flush=True,
                 )
@@ -1396,7 +1396,7 @@ def capture_scan_pair(
     object_result["scan_timing_seconds"] = timing
     hand_result["scan_timing_seconds"] = timing
     print(
-        f"SCAN TIMING {scan_index}: move={move_seconds:.2f}s, "
+        f"SCAN TIMING: move={move_seconds:.2f}s, "
         f"settle={settle_seconds:.2f}s, object={object_seconds:.2f}s, "
         f"hand={hand_seconds:.2f}s, "
         f"concurrent={concurrent_inference_seconds:.2f}s, "
@@ -1497,7 +1497,7 @@ def process_hand_capture(
             robot_transform,
             camera_to_gripper,
             verbose=demo.get("verbose", False),
-            label=f"palm scan {scan_index}",
+            label="palm scan",
         )
         result["base_point_mm"] = base_point.tolist()
         try:
@@ -1510,12 +1510,12 @@ def process_hand_capture(
             result["status"] = "rejected"
             result["error"] = str(exc)
             print(
-                f"HAND SCAN {slot}: rejected "
+                f"OPEN PALM SCAN: rejected "
                 f"base={np.round(base_point, 1).tolist()}mm: {exc}"
             )
             return result
         print(
-            f"OPEN PALM SCAN {slot}: detected "
+            f"OPEN PALM SCAN: detected "
             f"{service_result.get('handedness', 'unknown')} "
             f"score={float(service_result['score']):.3f}, "
             f"base={np.round(base_point, 1).tolist()}mm, "
@@ -1523,7 +1523,7 @@ def process_hand_capture(
         )
     else:
         print(
-            f"OPEN PALM SCAN {slot}: {service_result['status']}, "
+            f"OPEN PALM SCAN: {service_result['status']}, "
             f"snapshot={client.base_url}{service_result.get('snapshot_url', '')}"
         )
     return result

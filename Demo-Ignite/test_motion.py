@@ -557,8 +557,8 @@ class MotionTests(unittest.TestCase):
             ]
             self.assertEqual(len(traces), 2 if verbose else 0)
             if verbose:
-                self.assertIn("[TRANSFORM candy scan 1]", traces[0])
-                self.assertIn("[TRANSFORM palm scan 1]", traces[1])
+                self.assertIn("[TRANSFORM candy scan]", traces[0])
+                self.assertIn("[TRANSFORM palm scan]", traces[1])
 
     def test_motion_checks_use_local_constants(self):
         import piper.robot as robot
