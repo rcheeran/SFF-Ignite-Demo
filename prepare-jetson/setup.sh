@@ -181,6 +181,9 @@ install_piper_can_service() {
 # Pin it to a stable interface name regardless of boot enumeration order,
 # so it doesn't race with any native CAN controllers (e.g. Jetson mttcan).
 SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", NAME="$PIPER_IFACE"
+# Bring the link up whenever the adapter appears (late enumeration at boot,
+# arm power cycle, or replug), not only during piper-can's boot-time retries.
+SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", RUN+="/bin/systemctl --no-block restart piper-can.service"
 EOF
 
     echo "    bring-up script -> /usr/local/sbin/piper-can-up.sh"

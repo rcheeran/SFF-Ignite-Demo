@@ -1,5 +1,11 @@
 # Ignite demo: event-day checklist
 
+> **Automatic start is enabled.** About a minute after the Jetson boots, the
+> `ignite-demo` service starts the demo and **the arm moves on its own**. Keep the
+> area clear and the emergency stop reachable whenever the Jetson powers on. To
+> run the checks below or start the demo by hand instead, stop it first:
+> `sudo systemctl stop ignite-demo` (see section 8).
+
 Work through the sections in order. Steps 1-7 never move the arm. Run every
 command from the repository root with the demo environment active:
 
@@ -159,6 +165,42 @@ Each must end with `Preflight passed; no CAN connection or arm motion`. Any
 
 ## 8. Run the demo
 
+### Automatic start at boot
+
+The `ignite-demo` systemd service ([ignite-demo.service](ignite-demo.service))
+runs [run_demo_at_boot.sh](run_demo_at_boot.sh) at every boot. It waits until the
+CAN link is up, the camera (8094) and hand (8095) services are healthy, YOLO
+detection (8096) is healthy (or 5 minutes have passed, since OpenCV mode does not
+need it), and the no-motion preflight passes, then starts:
+`demo.py --allow-motion --detector opencv --verbose --max-cycles 0`. If anything
+is still not ready after 15 minutes it gives up without moving. It does not
+restart after an error. Output goes to `Demo-Ignite/logs/run-<timestamp>.log`
+and the journal.
+
+```bash
+systemctl status ignite-demo           # waiting, running, or stopped
+journalctl -u ignite-demo -f           # live output
+sudo systemctl stop ignite-demo        # same as Ctrl+C: arm returns to zero, gripper opens
+sudo systemctl start ignite-demo       # start again (waits, then the arm moves)
+sudo systemctl disable ignite-demo     # turn off automatic start at boot
+sudo systemctl enable ignite-demo      # turn it back on
+Demo-Ignite/run_demo_at_boot.sh --wait-only   # readiness checks only, no motion
+```
+
+Stop the service before running the demo by hand or `check_connection.py`: only
+one program may control the arm. The CAN link also comes up automatically
+whenever the USB-CAN adapter appears (late boot, arm power cycle, or replug),
+via a udev rule installed by [setup.sh](../prepare-jetson/setup.sh).
+
+To install the service on a freshly set-up Jetson:
+
+```bash
+sudo install -m 0644 Demo-Ignite/ignite-demo.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable ignite-demo
+```
+
+### Manual start
+
 ```bash
 python -u Demo-Ignite/demo.py --allow-motion \
   --detector opencv --verbose --max-cycles 0 2>&1 \
@@ -176,8 +218,9 @@ python -u Demo-Ignite/demo.py --allow-motion \
 
 ## 9. Stop and shut down
 
-1. Press Ctrl+C once. The arm returns to SDK zero, opens the gripper, and
-   disconnects. Wait for the prompt before touching the arm.
+1. Press Ctrl+C once (or `sudo systemctl stop ignite-demo` for the automatic
+   start). The arm returns to SDK zero, opens the gripper, and disconnects.
+   Wait for it to finish before touching the arm.
 2. If anything looks wrong, press the emergency stop instead.
 3. Power off the Piper controller, then shut down the Jetson
    (`sudo shutdown -h now`).
@@ -191,6 +234,7 @@ python -u Demo-Ignite/demo.py --allow-motion \
 | Preflight `[FAILED] OpenCV camera` | Re-seat the D435 on USB 3, then restart `opencv-vision`, then `hand-landmarker` (section 4). |
 | Preflight `[FAILED] YOLO / Foundry detection` | Check the `candy-yolo11s` model deployment (section 4), restart `vision-detection`, or run with `--detector opencv`. |
 | `vision-detection` in `CrashLoopBackOff` with `Foundry response must be a JSON object` | The model pod is up without a loaded model. Restart it, wait for `2/2 Running`, then restart detection: `sudo kubectl -n foundry-local-operator delete pod -l app.kubernetes.io/name=candy-yolo11s`, then `sudo kubectl -n productdaydemo rollout restart deploy/vision-detection`. The model loads from the on-device store, so this works offline. |
+| Demo did not start after boot | `journalctl -u ignite-demo -b` shows what it was waiting for. Fix that item (sections 2-5), then `sudo systemctl start ignite-demo`. |
 | `kubectl logs` fails with `proxy error ... localhost:40343, code 502` | k3s routes its own connections through the Azure Arc proxy. Read container logs directly: `sudo k3s crictl ps -a --name detection`, then `sudo k3s crictl logs <container-id>`. |
 | Preflight `[FAILED] MediaPipe hand service` | Restart `hand-landmarker` after `opencv-vision` is healthy. |
 | `No accepted candy/palm pair` every cycle | A pickup needs a candy and an open palm in the same scan. Check both on the 8094/8095 views; move the candy toward the board centre. |
