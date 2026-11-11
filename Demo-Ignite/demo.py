@@ -70,10 +70,11 @@ DEMO_SETTINGS = {
     # Re-taught 2026-11-04 (candy_grip.json): candy centred between the open jaws.
     "grasp_tip_z_mm": 16.584,
     "grip_open_mm": 60.000,
-    "grip_close_mm": 5.000,
+    # Close fully: grip force is effort-limited, so a held candy still stops the jaws
+    # (9.9-21.4 mm measured) while an empty gripper closes below 3 mm.
+    "grip_close_mm": 0.000,
     # Measured jaw width after lift; below this the gripper is assumed empty.
-    # An empty gripper closes to ~5 mm; a held Starburst measured 20.9-22.4 mm.
-    "minimum_held_grip_mm": 8.000,
+    "minimum_held_grip_mm": 4.000,
     # Roll/pitch 180/20 (20 degrees from vertical) instead of the hand-held teaching
     # tilt (~9 degrees): offline planning reaches ~98% of candy angles out to X 500 mm
     # versus ~54% for the taught tilt. Yaw is replaced by candy alignment at runtime.

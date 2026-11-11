@@ -18,8 +18,9 @@ the [event-day checklist](EVENT_DAY.md).
    synchronized RGB-D for open palms. Reject movement during inference.
 3. Pick an orientation-valid, reachable candy using measured XY and the
    reviewed/taught grasp-tip Z. After lift, the measured jaw width must be at
-   least `minimum_held_grip_mm` (**8 mm**; an empty gripper closes to ~5 mm and a
-   held Starburst measured 22.4 mm). Below that, the demo assumes no candy,
+   least `minimum_held_grip_mm` (**4 mm**). The gripper is commanded fully closed
+   (`grip_close_mm` 0 mm, effort-limited), so an empty gripper reads below 3 mm
+   while a held Starburst stops the jaws at about 10-21 mm. Below that, the demo assumes no candy,
    prints `No candy in gripper: ...`, opens the gripper where it is (above the
    table, so a loosely held candy may drop), returns to the scan pose, and
    continues the loop to find another candy.

@@ -804,7 +804,8 @@ class MotionTests(unittest.TestCase):
 
     def test_minimum_held_width_must_lie_between_close_and_open_commands(self) -> None:
         settings = fixtures.IgniteTests.example_config()["demo"]
-        self.assertEqual(demo.DEMO_SETTINGS["minimum_held_grip_mm"], 8.0)
+        self.assertEqual(demo.DEMO_SETTINGS["minimum_held_grip_mm"], 4.0)
+        self.assertEqual(demo.DEMO_SETTINGS["grip_close_mm"], 0.0)
         demo.validate_demo_settings(demo.DEMO_SETTINGS)
         for value in (0.0, -1.0, float("nan"), 70.0, 80.0):
             with self.subTest(value=value), self.assertRaises(demo.DemoError):
