@@ -460,6 +460,26 @@ class MotionTests(unittest.TestCase):
             with self.subTest(result=result), self.assertRaises(demo.DemoError):
                 demo.return_to_zero(arm)
 
+    def test_zero_return_tolerates_resting_slightly_past_zero_limits(self):
+        tolerance = demo.ZERO_RETURN_START_TOLERANCE_DEG
+        for start, allowed in (
+            ([-1.6, -2.0, 2.3, 6.5, 25.0, -12.8], True),   # after power cycle, 2026-11-11
+            ([0.0, 0.3, 0.48, 0.0, 0.0, 0.0], True),       # J3 just past its 0 deg limit
+            ([0.0, -tolerance, tolerance, 0.0, 0.0, 0.0], True),
+            ([0.0, -(tolerance + 0.1), 0.0, 0.0, 0.0, 0.0], False),
+            ([0.0, 0.0, tolerance + 0.1, 0.0, 0.0, 0.0], False),
+        ):
+            arm = self.zero_return_arm()
+            arm.joints_deg.side_effect = [np.array(start), np.zeros(6)]
+            with self.subTest(start=start), mock.patch("builtins.print"):
+                if allowed:
+                    demo.return_to_zero(arm, context="startup zero")
+                    arm.move_to_zero.assert_called_once()
+                else:
+                    with self.assertRaisesRegex(demo.DemoError, "more than 5deg outside"):
+                        demo.return_to_zero(arm, context="startup zero")
+                    arm.move_to_zero.assert_not_called()
+
     def test_current_pose_hand_capture_does_not_command_a_scan_move(self):
         arm, hands, objects = mock.Mock(), mock.Mock(), mock.Mock()
         arm.pose.return_value = np.array([200, 0, 250, 180, 20, 180])

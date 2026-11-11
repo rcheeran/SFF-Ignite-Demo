@@ -124,6 +124,12 @@ command, otherwise the startup stops or the shutdown reports the error.
 Clear and review that return path too. The return checks
 arm health, sampled flange workspace, tool-tip floor, and factory joint limits
 (zero is on the J2/J3 boundaries, outside the normal inward-margined limits).
+Because zero sits on those boundaries, an arm resting at or near zero (for
+example settled after a power cycle) can read slightly past them, such as J2
+-2.0 or J3 +0.48 degrees. The zero return therefore accepts a start up to
+`ZERO_RETURN_START_TOLERANCE_DEG` (**5 degrees**) past any factory limit,
+clamped onto the limit for path sampling, since the move ends inside the
+limits; readings further out are still refused before any motion.
 If those checks fail, the return times out, or Ctrl+C interrupts the return,
 the script reports it and disconnects without retrying or commanding further motion.
 There is no hold loop or power-off confirmation in the main demo. Disconnecting

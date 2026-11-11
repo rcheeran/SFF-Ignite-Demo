@@ -42,6 +42,10 @@ CALIBRATION_DIR = ROOT / "prepare-piper/hand-eye-realsense435"
 RELEASE_CLEARANCE_MM = 76.2
 # A move counts as arrived when every joint is within this many degrees of its target.
 ARRIVAL_TOLERANCE_DEG = 2.0
+# SDK zero lies on the J2 and J3 factory limits, so an arm resting at or near zero
+# (e.g. settled after a power cycle) can read a few degrees past them. A zero return
+# moves back inside the limits, so its start may be this far outside them.
+ZERO_RETURN_START_TOLERANCE_DEG = 5.0
 MAXIMUM_HAND_AGE_SECONDS = 10.0
 MAXIMUM_CANDY_XY_CORRECTION_MM = 60.0
 MAXIMUM_GRASP_TILT_OVERRIDE_DEG = 30.0
@@ -616,24 +620,25 @@ def validate_joint_path_safety(
 
 def measured_start_joints(
     arm: Any, name: str, joint_limits: np.ndarray = MARGINED_LIMITS,
+    tolerance_deg: float = ARRIVAL_TOLERANCE_DEG,
 ) -> np.ndarray:
     """Return measured joints as a path-check start, tolerating arrival settling.
 
     A joint may settle up to the 2-degree arrival tolerance past a planned
     waypoint, so a waypoint planned exactly on an inward-margined limit can read
-    slightly beyond it. Such overshoot is clamped back onto the limit for path
-    sampling; anything further out raises. With the default margined limits this
-    allows readings up to, but never past, the factory joint limits. Planned
-    waypoints themselves are not relaxed.
+    slightly beyond it. Overshoot up to tolerance_deg is clamped back onto the
+    limit for path sampling; anything further out raises. With the default
+    margined limits this allows readings up to, but never past, the factory joint
+    limits. Planned waypoints themselves are not relaxed.
     """
     current = finite_vector(arm.joints_deg(), 6, f"{name} measured joints")
     limits = np.asarray(joint_limits, dtype=np.float64)
     overshoot = np.maximum(limits[:, 0] - current, current - limits[:, 1])
-    if np.any(overshoot > ARRIVAL_TOLERANCE_DEG):
+    if np.any(overshoot > tolerance_deg):
         joint = int(np.argmax(overshoot))
         raise DemoError(
             f"{name}: measured J{joint + 1}={current[joint]:.2f}deg is more than "
-            f"{ARRIVAL_TOLERANCE_DEG:.0f}deg outside "
+            f"{tolerance_deg:.0f}deg outside "
             f"[{limits[joint, 0]:.1f}, {limits[joint, 1]:.1f}]deg"
         )
     return np.clip(current, limits[:, 0], limits[:, 1])
@@ -2248,17 +2253,19 @@ def return_to_zero(
     """Validate and execute a slow SDK-zero return, optionally opening the gripper there.
 
     Reject unhealthy arms or unsafe sampled paths before sending a zero command,
-    and require measured convergence. The gripper is unchanged during the move;
+    and require measured convergence. The start may read up to
+    ZERO_RETURN_START_TOLERANCE_DEG past a factory limit (zero sits on the J2/J3
+    limits); it is clamped onto the limit for path sampling. The gripper is unchanged during the move;
     when open_grip_mm is given it opens only after zero is reached and verified
     (a held candy drops at the zero pose), and the measured width must come
     within 5 mm of the command. Failures are raised without recovery motion.
     """
     require_healthy(arm, f"before {context}")
-    current = finite_vector(arm.joints_deg(), 6, f"{context} joint position")
-    validate_joint_path_safety(
-        context, [current, np.zeros(6)],
-        joint_limits=np.asarray(PIPER_C.JOINT_LIMITS_DEG, dtype=np.float64),
+    factory_limits = np.asarray(PIPER_C.JOINT_LIMITS_DEG, dtype=np.float64)
+    current = measured_start_joints(
+        arm, context, factory_limits, ZERO_RETURN_START_TOLERANCE_DEG,
     )
+    validate_joint_path_safety(context, [current, np.zeros(6)], joint_limits=factory_limits)
     if verbose:
         detail = "gripper opens on arrival" if open_grip_mm is not None else "without opening the gripper"
         print(f"{context}: moving to SDK zero pose; {detail}.", flush=True)
