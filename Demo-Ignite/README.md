@@ -282,7 +282,7 @@ Joint-limit summaries, enable-time joint/twitch diagnostics, connection status,
 zero-motion announcements, the initial scan-pose motion announcement, the
 per-cycle `motion: scan 1` announcement, and the pickup motion announcements
 (`pick transit`, `pick approach`, `grasp`, `close gripper`, `lift`,
-`lift transit`) are
+`lift transit`, and `return to scan pose after missed grasp`) are
 also verbose-only in the main demo. Errors,
 safety warnings, joint-limit restoration warnings, and zero-arrival confirmation
 remain visible without `--verbose`. Standalone teaching/replay tools retain their

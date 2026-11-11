@@ -366,6 +366,18 @@ class MotionTests(unittest.TestCase):
             motions = [str(call.args[0]) for call in output.call_args_list if str(call.args[0]).startswith("motion:")]
             self.assertEqual(motions, expected if verbose else [])
             self.assertEqual(arm.move_joints.call_count, 5)
+            arm.move_joints.reset_mock()
+            arm.grip_mm.return_value = 3.2
+            with self.subTest(verbose=verbose, grasp="missed"), mock.patch.object(demo, "require_healthy"), \
+                    mock.patch.object(demo, "hold_gripper"), mock.patch("builtins.print") as output, \
+                    self.assertRaises(demo.GraspVerificationError):
+                demo.execute_pickup(arm, plan, settings)
+            printed = [str(call.args[0]) for call in output.call_args_list]
+            self.assertTrue(any(line.startswith("No candy in gripper: measured width 3.2mm") for line in printed))
+            self.assertEqual(
+                "motion: return to scan pose after missed grasp" in printed, verbose,
+            )
+            self.assertEqual(arm.move_joints.call_count, 6)
 
     def test_enable_diagnostics_follow_verbose_setting(self):
         import piper.robot as robot
@@ -698,7 +710,7 @@ class MotionTests(unittest.TestCase):
         self.assertAlmostEqual(raised.exception.measured_width_mm, 0.0)
         self.assertEqual(
             moves,
-            ["pick approach", "grasp", "lift", "scan 1 after missed grasp"],
+            ["pick approach", "grasp", "lift", "return to scan pose after missed grasp"],
         )
         self.assertEqual(holds, [0.0, 70.0])
 
@@ -745,7 +757,7 @@ class MotionTests(unittest.TestCase):
                 self.assertTrue(carry.holding)
             else:
                 # Open at the lift transit pose (candy, if any, drops), then go back to scan.
-                self.assertEqual(moves, pickup_moves + ["scan 1 after missed grasp"])
+                self.assertEqual(moves, pickup_moves + ["return to scan pose after missed grasp"])
                 self.assertEqual(holds, [(1.0, 5.0), (4.0, 60.0)])
                 self.assertFalse(carry.holding)
                 self.assertEqual(raised.exception.minimum_held_mm, 8.0)

@@ -1037,11 +1037,12 @@ def execute_pickup(
         hold_gripper(arm, missed_grasp_pose, open_mm, hold_seconds)
         move_robot(
             arm,
-            "scan 1 after missed grasp",
+            "return to scan pose after missed grasp",
             waypoints["scan 1"],
             open_mm,
             timeout,
             speed,
+            verbose=verbose,
         )
         raise GraspVerificationError(held_width, minimum_held)
     return held_width
