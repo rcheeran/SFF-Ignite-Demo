@@ -190,6 +190,8 @@ python -u Demo-Ignite/demo.py --allow-motion \
 | `ArmStatus.Hz: 0.0` | Arm in Master mode or needs a power cycle; see [SETUP.md](../prepare-jetson/SETUP.md). |
 | Preflight `[FAILED] OpenCV camera` | Re-seat the D435 on USB 3, then restart `opencv-vision`, then `hand-landmarker` (section 4). |
 | Preflight `[FAILED] YOLO / Foundry detection` | Check the `candy-yolo11s` model deployment (section 4), restart `vision-detection`, or run with `--detector opencv`. |
+| `vision-detection` in `CrashLoopBackOff` with `Foundry response must be a JSON object` | The model pod is up without a loaded model. Restart it, wait for `2/2 Running`, then restart detection: `sudo kubectl -n foundry-local-operator delete pod -l app.kubernetes.io/name=candy-yolo11s`, then `sudo kubectl -n productdaydemo rollout restart deploy/vision-detection`. The model loads from the on-device store, so this works offline. |
+| `kubectl logs` fails with `proxy error ... localhost:40343, code 502` | k3s routes its own connections through the Azure Arc proxy. Read container logs directly: `sudo k3s crictl ps -a --name detection`, then `sudo k3s crictl logs <container-id>`. |
 | Preflight `[FAILED] MediaPipe hand service` | Restart `hand-landmarker` after `opencv-vision` is healthy. |
 | `No accepted candy/palm pair` every cycle | A pickup needs a candy and an open palm in the same scan. Check both on the 8094/8095 views; move the candy toward the board centre. |
 | `Pickup missed` | The arm rescans and retries automatically. Repeated misses on one candy: reposition it, or check the verbose `PICK PLAN` lines in the log. |

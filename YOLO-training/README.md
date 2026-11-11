@@ -93,6 +93,24 @@ The exported ONNX graph has a fixed batch dimension of one. The manifest sets
 `BATCH_SIZE=1`; otherwise the predictive runtime defaults to 32 and pads a
 single request to a shape the model rejects.
 
+The model pod loads the ONNX file from the on-device Foundry model store, not
+from the registry. The operator's `model-store-pull` init container copies
+`best.onnx` from the local store (on the `foundry-model-store` 100 GiB PVC) into
+`/home/foundry/.foundry/cache`, and the manifest sets `USE_ORAS=false` and
+`MODEL_PATH=/home/foundry/.foundry/cache` so the inference server loads that
+copy. By default the server re-downloads from `ignitedemoregistry.azurecr.io`
+at every pod start; on 2026-11-11 that download failed with a TLS hostname
+mismatch after a reboot, so the pod ran with no model, answered `/v1/model` with
+`null`, and `vision-detection` crash-looped. The registry is still needed to
+populate the model store for a new model tag, but not to start or restart the
+pod.
+
+Apply manifest changes with:
+
+```bash
+sudo kubectl apply -f YOLO-training/foundry/modeldeployment.yaml
+```
+
 Deployed endpoint:
 
 ```text
