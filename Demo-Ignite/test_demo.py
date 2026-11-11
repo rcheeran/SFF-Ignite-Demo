@@ -364,7 +364,7 @@ print("Standalone preflight passed without older demo folders")
             detected = palm()
             old = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
 
-            def move(_arm, name, *_args):
+            def move(_arm, name, *_args, **_kwargs):
                 if name == stale_at:
                     detected["captured_at"] = old
 
@@ -395,7 +395,7 @@ print("Standalone preflight passed without older demo folders")
             ("hand retreat", np.full(6, 7.0)), ("scan 1", np.ones(6)),
         ]
 
-        def move(_arm, name, *_args):
+        def move(_arm, name, *_args, **_kwargs):
             if name == failing_step:
                 raise demo.DemoError(f"{name} did not reach its planned joint target")
 
@@ -452,7 +452,7 @@ print("Standalone preflight passed without older demo folders")
         ):
             carry = demo.CandyCarry()
 
-            def move(_arm, name, *_args):
+            def move(_arm, name, *_args, **_kwargs):
                 if name == failing:
                     raise demo.DemoError(f"{name} failed")
 
@@ -1240,7 +1240,7 @@ print("Standalone preflight passed without older demo folders")
                         mock.patch.object(demo, "GRASP_OFFSET_LOG", log), \
                         mock.patch.object(demo, "record_grasp_offset", wraps=demo.record_grasp_offset) as record, \
                         mock.patch("builtins.input", side_effect=answer), mock.patch("builtins.print"), \
-                        mock.patch.object(demo, "move_robot", side_effect=lambda _a, name, *_: events.append(name)), \
+                        mock.patch.object(demo, "move_robot", side_effect=lambda _a, name, *_, **__: events.append(name)), \
                         mock.patch.object(demo, "hold_gripper", side_effect=lambda _a, _j, grip, _s: events.append(("grip", grip))):
                     demo.execute_pickup(self.arm, plan, settings, demo.CandyCarry(), target)
                 self.assertEqual(events[:2], ["pick approach", "grasp"])

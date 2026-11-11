@@ -342,6 +342,31 @@ class MotionTests(unittest.TestCase):
             self.assertEqual(move.call_args.args[1], "scan 1")
             self.assertEqual(move.call_args.kwargs["verbose"], verbose)
 
+    def test_pickup_motion_announcements_follow_verbose_setting(self):
+        plan = [
+            ("pick transit", np.full(6, 1.0)), ("pick approach", np.full(6, 2.0)), ("grasp", np.full(6, 3.0)),
+            ("lift", np.full(6, 2.0)), ("lift transit", np.full(6, 1.0)), ("scan 1", np.zeros(6)),
+        ]
+        expected = [
+            "motion: pick transit", "motion: pick approach", "motion: grasp",
+            "motion: close gripper", "motion: lift", "motion: lift transit",
+        ]
+        for verbose in (False, True):
+            arm = mock.Mock()
+            arm.move_joints.return_value = True
+            arm.joints_deg.return_value = np.full(6, 3.0)
+            arm.grip_mm.return_value = 15.0
+            settings = {
+                "verbose": verbose, "move_timeout_seconds": 8.0, "grip_open_mm": 60.0, "grip_close_mm": 3.0,
+                "gripper_hold_seconds": 0.0, "motion_speed_percent": 10, "minimum_held_grip_mm": 5.0,
+            }
+            with self.subTest(verbose=verbose), mock.patch.object(demo, "require_healthy"), \
+                    mock.patch.object(demo, "hold_gripper"), mock.patch("builtins.print") as output:
+                demo.execute_pickup(arm, plan, settings)
+            motions = [str(call.args[0]) for call in output.call_args_list if str(call.args[0]).startswith("motion:")]
+            self.assertEqual(motions, expected if verbose else [])
+            self.assertEqual(arm.move_joints.call_count, 5)
+
     def test_enable_diagnostics_follow_verbose_setting(self):
         import piper.robot as robot
 
@@ -615,7 +640,7 @@ class MotionTests(unittest.TestCase):
             mock.patch.object(
                 demo,
                 "move_robot",
-                side_effect=lambda _arm, name, *_args: moves.append(
+                side_effect=lambda _arm, name, *_args, **_kwargs: moves.append(
                     (name, _args[-1])
                 ),
             ),
@@ -659,7 +684,7 @@ class MotionTests(unittest.TestCase):
             mock.patch.object(
                 demo,
                 "move_robot",
-                side_effect=lambda _arm, name, *_args: moves.append(name),
+                side_effect=lambda _arm, name, *_args, **_kwargs: moves.append(name),
             ),
             mock.patch.object(
                 demo,
@@ -703,7 +728,7 @@ class MotionTests(unittest.TestCase):
             carry = demo.CandyCarry()
             moves, holds = [], []
             with self.subTest(width=width), mock.patch.object(
-                demo, "move_robot", side_effect=lambda _arm, name, *_args: moves.append(name),
+                demo, "move_robot", side_effect=lambda _arm, name, *_args, **_kwargs: moves.append(name),
             ), mock.patch.object(
                 demo, "hold_gripper",
                 side_effect=lambda _arm, joints, grip, _seconds: holds.append((joints[0], grip)),

@@ -975,6 +975,7 @@ def execute_pickup(
     speed = int(
         demo.get("pick_motion_speed_percent", demo["motion_speed_percent"])
     )
+    verbose = bool(demo.get("verbose", False))
     if "pick transit" in waypoints:
         move_robot(
             arm,
@@ -983,12 +984,14 @@ def execute_pickup(
             open_mm,
             timeout,
             speed,
+            verbose=verbose,
         )
     move_robot(
-        arm, "pick approach", waypoints["pick approach"], open_mm, timeout, speed
+        arm, "pick approach", waypoints["pick approach"], open_mm, timeout, speed,
+        verbose=verbose,
     )
-    move_robot(arm, "grasp", waypoints["grasp"], open_mm, timeout, speed)
-    if demo.get("verbose"):
+    move_robot(arm, "grasp", waypoints["grasp"], open_mm, timeout, speed, verbose=verbose)
+    if verbose:
         measured = finite_vector(arm.joints_deg(), 6, "measured grasp joints")
         planned_tip, measured_tip = tip_position(waypoints["grasp"]), tip_position(measured)
         print(
@@ -1000,11 +1003,12 @@ def execute_pickup(
         )
     if demo.get("pause_before_grip"):
         pause_for_grasp_offset(arm, waypoints["grasp"], open_mm, target or {}, demo)
-    print("motion: close gripper")
+    if verbose:
+        print("motion: close gripper")
     hold_gripper(arm, waypoints["grasp"], close_mm, hold_seconds)
     if carry is not None:
         carry.gripped_at(waypoints["grasp"])
-    move_robot(arm, "lift", waypoints["lift"], close_mm, timeout, speed)
+    move_robot(arm, "lift", waypoints["lift"], close_mm, timeout, speed, verbose=verbose)
     if carry is not None:
         carry.reached("lift", waypoints["lift"])
     if "lift transit" in waypoints:
@@ -1015,6 +1019,7 @@ def execute_pickup(
             close_mm,
             timeout,
             speed,
+            verbose=verbose,
         )
         if carry is not None:
             carry.reached("lift transit", waypoints["lift transit"])
