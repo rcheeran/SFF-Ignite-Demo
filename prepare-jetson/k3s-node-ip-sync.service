@@ -1,0 +1,11 @@
+[Unit]
+Description=Restart k3s if the Jetson's network address changed while it ran
+Documentation=file:///home/clouduser/SFF-Ignite-Demo/Demo-Ignite/EVENT_DAY.md
+# Started by the networkd-dispatcher hook (k3s-node-ip-sync.hook) and by
+# run_demo_at_boot.sh; let a k3s start that is in progress finish first.
+After=k3s.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/k3s-node-ip-sync.sh
+TimeoutStartSec=10min

@@ -19,15 +19,26 @@ say() { echo "[boot $(date +%H:%M:%S)] $*"; }
 healthy() { curl -fs -m 5 "http://127.0.0.1:$1/healthz" 2>/dev/null | grep -q '"status": "ok"'; }
 can_up() { ip link show can_piper 2>/dev/null | grep -q "state UP"; }
 
-say "waiting for CAN link, camera (8094), hand (8095), and YOLO detection (8096); log: $LOG"
+say "waiting for CAN link, camera (8094), hand (8095), YOLO detection (8096), and the k3s address; log: $LOG"
 start=$(date +%s)
 yolo_warned=0
+last_ip_fix=0
 while :; do
     elapsed=$(( $(date +%s) - start ))
     missing=()
     can_up || missing+=("CAN can_piper")
     healthy 8094 || missing+=("camera 8094")
     healthy 8095 || missing+=("hand 8095")
+    # k3s must still use this host's address; an unknown result (k3s not up yet) does not block.
+    ip_status=$(prepare-jetson/k3s-node-ip-sync.sh --check 2>&1)
+    if [ $? -eq 1 ]; then
+        missing+=("k3s address: $ip_status")
+        if [ $(( $(date +%s) - last_ip_fix )) -ge 60 ]; then
+            sudo -n systemctl --no-block start k3s-node-ip-sync.service 2>/dev/null \
+                && say "$ip_status; started k3s-node-ip-sync to restart k3s"
+            last_ip_fix=$(date +%s)
+        fi
+    fi
     yolo_missing=0
     healthy 8096 || yolo_missing=1
     if [ ${#missing[@]} -eq 0 ] && { [ $yolo_missing -eq 0 ] || [ $elapsed -ge $YOLO_TIMEOUT_SECONDS ]; }; then

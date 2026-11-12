@@ -1,0 +1,10 @@
+#!/bin/sh
+# networkd-dispatcher "routable" hook, installed as
+# /etc/networkd-dispatcher/routable.d/60-k3s-node-ip-sync.
+# When a network interface gets a usable address, check that k3s still uses an
+# address this host has. The check runs as k3s-node-ip-sync.service so this
+# hook returns at once.
+case "$IFACE" in
+    lo|cni*|flannel*|veth*|docker*|br-*) exit 0 ;;   # loopback and container links
+esac
+exec systemctl --no-block start k3s-node-ip-sync.service
