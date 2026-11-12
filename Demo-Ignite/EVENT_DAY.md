@@ -25,6 +25,11 @@ cd ~/SFF-Ignite-Demo
    now on.
 4. Wait about two minutes for k3s and the services to start.
 
+The demo does not need internet access. Its container images are already on the
+Jetson and are never pulled. The hand model is built into its image, and the
+YOLO model loads from the on-device model store. Only the Azure Arc agents
+contact Azure, and the demo does not depend on them.
+
 ## 2. Host checks
 
 ```bash
