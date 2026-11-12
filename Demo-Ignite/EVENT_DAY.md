@@ -138,7 +138,8 @@ done
 | 8095 | Hand (MediaPipe) | `"status": "ok"`, `"source_url": "http://127.0.0.1:8094/stream.mjpg"` |
 | 8096 | YOLO detection | `"status": "ok"`, `"model": "candy-yolo11s"`, `"cuda": true` |
 
-Live views for the audience screen (find the address with `hostname -I`):
+Live views for the audience screen (find the address with `hostname -I`; it
+changes with the network, so check it on the event network):
 
 - Camera, detections, and workspace outline: `http://<jetson-ip>:8094/`
 - Hand detection: `http://<jetson-ip>:8095/`
@@ -240,6 +241,7 @@ python -u Demo-Ignite/demo.py --allow-motion \
 | `No accepted candy/palm pair` every cycle | A pickup needs a candy and an open palm in the same scan. Check both on the 8094/8095 views; move the candy toward the board centre. |
 | `Pickup missed` | The arm rescans and retries automatically. Repeated misses on one candy: reposition it, or check the verbose `PICK PLAN` lines in the log. |
 | `No reachable candy` | The candy is too far or at an unreachable angle; move it closer to the robot. |
+| `opencv-vision` / `hand-landmarker` restarting, `0/1`, probes report `network is unreachable` | The Jetson's network address changed while k3s was running (new network or DHCP lease), and k3s still uses the old address. Compare `hostname -I` with `sudo kubectl get node -o wide` (INTERNAL-IP). If they differ: `sudo systemctl restart k3s`, wait for the node to show the new address, then `sudo kubectl -n productdaydemo rollout restart deploy/opencv-vision` and, once it is `1/1`, `deploy/hand-landmarker`. Booting on the event network avoids this. |
 | Arm faults or joints disabled | Press the emergency stop, power-cycle the arm, run `can_up.sh`, then repeat section 3. |
 
 Keep the run logs in `Demo-Ignite/logs/` for later review.
