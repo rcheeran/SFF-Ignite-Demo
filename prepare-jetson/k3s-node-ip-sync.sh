@@ -14,7 +14,8 @@
 #
 # Installed as /usr/local/sbin/k3s-node-ip-sync.sh and run by
 # k3s-node-ip-sync.service, which the networkd-dispatcher hook
-# k3s-node-ip-sync.hook starts whenever a network interface becomes routable.
+# k3s-node-ip-sync.hook starts whenever a network interface becomes routable,
+# and which Demo-Ignite/demo.py's preflight starts after a failed --check.
 # See Demo-Ignite/EVENT_DAY.md.
 set -uo pipefail
 

@@ -99,6 +99,8 @@ scans.write_text(json.dumps({"pose_count": 1, "poses": [{
 sys.argv = ["demo.py", "--check-only",
             "--calibration-dir", str(calibration), "--scan-poses", str(scans)]
 with mock.patch.object(demo, "check_services") as services, mock.patch.object(
+    demo, "ensure_k3s_address"
+), mock.patch.object(
     demo, "connect_robot", side_effect=AssertionError("CAN connection forbidden")
 ):
     assert demo.main() == 0
@@ -157,6 +159,11 @@ print("Standalone preflight passed without older demo folders")
         zero = mock.patch.object(demo, "return_to_zero")
         self.zero = zero.start()
         self.addCleanup(zero.stop)
+        # main() must never run the real k3s check (sudo kubectl) or restart k3s in tests.
+        self.ensure_k3s_address = demo.ensure_k3s_address
+        k3s_address = mock.patch.object(demo, "ensure_k3s_address")
+        self.k3s_address = k3s_address.start()
+        self.addCleanup(k3s_address.stop)
         self.arm = mock.Mock()
         self.arm.joints_deg.return_value = np.zeros(6)
         self.arm.faults.return_value = []
@@ -823,6 +830,54 @@ print("Standalone preflight passed without older demo folders")
             ))
         delivery.assert_not_called()
 
+    def k3s_commands(self, *check_results, fix_result=None):
+        """Patch subprocess.run with scripted k3s-node-ip-sync.sh --check results."""
+        checks = iter(check_results)
+
+        def run(command, **_):
+            if command[-1] == "--check":
+                code, status = next(checks)
+                return subprocess.CompletedProcess(command, code, stdout=status + "\n", stderr="")
+            return fix_result or subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        return mock.patch.object(demo.subprocess, "run", side_effect=run)
+
+    def test_k3s_address_in_sync_or_unknown_never_restarts_k3s(self):
+        for code, status, tag in (
+            (0, "in sync: k3s uses 10.0.0.5, which this host has", "[OK]"),
+            (2, "unknown: cannot read the k3s node address", "[WARN]"),
+        ):
+            with self.subTest(code=code), self.k3s_commands((code, status)) as run, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.ensure_k3s_address()
+            self.assertEqual(run.call_count, 1)
+            self.assertIn(f"{tag} k3s address {status}", stdout.getvalue())
+
+    def test_stale_k3s_address_restarts_k3s_then_passes(self):
+        with self.k3s_commands(
+            (1, "OUT OF SYNC: k3s uses 10.0.0.5, but this host has 10.0.0.9"),
+            (0, "in sync: k3s uses 10.0.0.9, which this host has"),
+        ) as run, mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.ensure_k3s_address()
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(
+            run.call_args_list[1].args[0], ["sudo", "-n", "systemctl", "start", "k3s-node-ip-sync.service"]
+        )
+        self.assertIn("[FIXING] k3s address OUT OF SYNC", stdout.getvalue())
+        self.assertIn("[OK] k3s address in sync: k3s uses 10.0.0.9", stdout.getvalue())
+
+    def test_k3s_address_still_stale_after_restart_stops_preflight(self):
+        stale = (1, "OUT OF SYNC: k3s uses 10.0.0.5, but this host has 10.0.0.9")
+        not_installed = subprocess.CompletedProcess(
+            [], 5, stdout="", stderr="Unit k3s-node-ip-sync.service not found."
+        )
+        with self.k3s_commands(stale, stale, fix_result=not_installed), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                self.assertRaises(demo.DemoError):
+            self.ensure_k3s_address()
+        self.assertIn("[FAILED] k3s address OUT OF SYNC", stdout.getvalue())
+        self.assertIn("restart failed: Unit k3s-node-ip-sync.service not found.", stdout.getvalue())
+
     def test_all_services_report_even_when_one_fails(self):
         camera = mock.Mock(base_url="http://camera:8094")
         camera.health.side_effect = demo.DemoError("offline")
@@ -1401,6 +1456,7 @@ print("Standalone preflight passed without older demo folders")
                 ), mock.patch.object(demo, "connect_robot") as connect:
             self.assertEqual(demo.main(), 0)
         connect.assert_not_called()
+        self.k3s_address.assert_called_once_with()
         self.assertEqual(services.call_args.args[-1], "D435")
 
     def test_missing_allow_motion_prevents_can_connection(self):

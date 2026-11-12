@@ -138,8 +138,10 @@ k3s records the Jetson's network address when it starts and does not follow
 later changes (a new network or DHCP lease). When an interface comes up with a
 usable address, a networkd-dispatcher hook starts the `k3s-node-ip-sync`
 service. If k3s is using an address the Jetson no longer has, the service
-restarts k3s on the new one. Running pods, including a running demo, keep
-running through the restart. The check prints `OUT OF SYNC` if they differ.
+restarts k3s on the new one. The `demo.py` preflight (section 6) runs the same
+check before every run and starts the same service if needed. Running pods,
+including a running demo, keep running through the restart. The check prints
+`OUT OF SYNC` if they differ.
 
 ```bash
 prepare-jetson/k3s-node-ip-sync.sh --check   # in sync / OUT OF SYNC
@@ -187,6 +189,12 @@ python Demo-Ignite/demo.py --check-only --detector yolo
 Each must end with `Preflight passed; no CAN connection or arm motion`. Any
 `[FAILED]` line names the service to fix in sections 4-5.
 
+The first line checks that k3s still uses the Jetson's network address. If it
+prints `[FIXING] k3s address OUT OF SYNC`, the preflight restarts k3s through
+`k3s-node-ip-sync` (section 4) and checks again, which can take a few minutes.
+Running pods keep running. `[WARN] k3s address unknown` does not stop the
+preflight.
+
 ## 7. Physical setup
 
 - Board and table in the taught position; nothing has moved since calibration.
@@ -205,8 +213,8 @@ The `ignite-demo` systemd service ([ignite-demo.service](ignite-demo.service))
 runs [run_demo_at_boot.sh](run_demo_at_boot.sh) at every boot. It waits until the
 CAN link is up, the camera (8094) and hand (8095) services are healthy, YOLO
 detection (8096) is healthy (or 5 minutes have passed, since OpenCV mode does not
-need it), k3s uses the Jetson's current address (it starts `k3s-node-ip-sync` if
-not; section 4), and the no-motion preflight passes, then starts:
+need it), and the no-motion preflight passes (it also restarts k3s if its
+address is stale; section 6), then starts:
 `demo.py --allow-motion --detector opencv --verbose --max-cycles 0`. If anything
 is still not ready after 15 minutes it gives up without moving. It does not
 restart after an error. Output goes to `Demo-Ignite/logs/run-<timestamp>.log`
@@ -275,7 +283,7 @@ python -u Demo-Ignite/demo.py --allow-motion \
 | `No accepted candy/palm pair` every cycle | A pickup needs a candy and an open palm in the same scan. Check both on the 8094/8095 views; move the candy toward the board centre. |
 | `Pickup missed` | The arm rescans and retries automatically. Repeated misses on one candy: reposition it, or check the verbose `PICK PLAN` lines in the log. |
 | `No reachable candy` | The candy is too far or at an unreachable angle; move it closer to the robot. |
-| `k3s-node-ip-sync.sh --check` prints `OUT OF SYNC`, `sudo kubectl get node -o wide` shows an old INTERNAL-IP, or `opencv-vision` / `hand-landmarker` probes report `network is unreachable` | The Jetson's network address changed while k3s was running, and k3s still uses the old address. The automatic fix should restart k3s within a minute of the network coming up; `sudo journalctl -u k3s-node-ip-sync -b` shows what it did. To fix it by hand: `sudo systemctl start k3s-node-ip-sync` (or `sudo systemctl restart k3s`), then run the check again. If `opencv-vision` or `hand-landmarker` still restart afterwards, `sudo kubectl -n productdaydemo rollout restart deploy/opencv-vision` and, once it is `1/1`, `deploy/hand-landmarker`. |
+| Preflight `[FAILED] k3s address OUT OF SYNC`, `k3s-node-ip-sync.sh --check` prints `OUT OF SYNC`, `sudo kubectl get node -o wide` shows an old INTERNAL-IP, or `opencv-vision` / `hand-landmarker` probes report `network is unreachable` | The Jetson's network address changed while k3s was running, and k3s still uses the old address. The automatic fix should restart k3s within a minute of the network coming up; `sudo journalctl -u k3s-node-ip-sync -b` shows what it did. To fix it by hand: `sudo systemctl start k3s-node-ip-sync` (or `sudo systemctl restart k3s`), then run the check again. If `opencv-vision` or `hand-landmarker` still restart afterwards, `sudo kubectl -n productdaydemo rollout restart deploy/opencv-vision` and, once it is `1/1`, `deploy/hand-landmarker`. |
 | Arm faults or joints disabled | Press the emergency stop, power-cycle the arm, run `can_up.sh`, then repeat section 3. |
 
 Keep the run logs in `Demo-Ignite/logs/` for later review.

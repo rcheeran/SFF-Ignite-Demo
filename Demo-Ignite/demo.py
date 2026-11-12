@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 import math
 from pathlib import Path
+import subprocess
 import sys
 import time
 import threading
@@ -39,6 +40,8 @@ from piper.transforms import euler_to_rot, fk_flange, tip_position  # noqa: E402
 
 #camera to robot calbibrations
 CALIBRATION_DIR = ROOT / "prepare-piper/hand-eye-realsense435"
+K3S_NODE_IP_SYNC = ROOT / "prepare-jetson/k3s-node-ip-sync.sh"
+K3S_ADDRESS_FIX_TIMEOUT_SECONDS = 600.0  # TimeoutStartSec of k3s-node-ip-sync.service
 RELEASE_CLEARANCE_MM = 76.2
 # A move counts as arrived when every joint is within this many degrees of its target.
 ARRIVAL_TOLERANCE_DEG = 2.0
@@ -1747,7 +1750,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hand-url", default="http://127.0.0.1:8095")
     parser.add_argument("--can-interface", default="can_piper")
-    parser.add_argument("--check-only", action="store_true", help="preflight only; never connect to CAN")
+    parser.add_argument(
+        "--check-only", action="store_true",
+        help="preflight only (restarts k3s if its address is stale); never connect to CAN",
+    )
     parser.add_argument(
         "--verbose", action="store_true",
         help="print camera, gripper, and robot-base XYZ and transformation matrices",
@@ -1769,6 +1775,49 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--max-cycles", type=int, default=0, help="zero loops until Ctrl+C")
     return parser.parse_args()
+
+
+def ensure_k3s_address() -> None:
+    """Check that k3s still uses this host's network address; restart k3s if not.
+
+    k3s keeps the address it started with, so a network change while it runs
+    leaves the cluster on an address the host no longer has. The restart goes
+    through k3s-node-ip-sync.service; running pods keep running. An unknown
+    result (k3s not reachable, or sudo needs a password) is only a warning,
+    because the service checks report any outage that matters to the demo.
+    """
+    def check() -> tuple[int, str]:
+        try:
+            result = subprocess.run(
+                [str(K3S_NODE_IP_SYNC), "--check"], capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return 2, f"unknown: cannot run {K3S_NODE_IP_SYNC.name}: {exc}"
+        return result.returncode, result.stdout.strip() or result.stderr.strip()
+
+    code, status = check()
+    if code == 1:
+        print(f"[FIXING] k3s address {status}; restarting k3s (running pods keep running)", flush=True)
+        fix_error = ""
+        try:
+            fix = subprocess.run(
+                ["sudo", "-n", "systemctl", "start", "k3s-node-ip-sync.service"],
+                capture_output=True, text=True, timeout=K3S_ADDRESS_FIX_TIMEOUT_SECONDS,
+            )
+            if fix.returncode:
+                fix_error = fix.stderr.strip() or f"exit code {fix.returncode}"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            fix_error = str(exc)
+        code, status = check()
+        if code == 1 and fix_error:
+            status += f" (restart failed: {fix_error})"
+    if code == 0:
+        print(f"[OK] k3s address {status}", flush=True)
+    elif code == 1:
+        print(f"[FAILED] k3s address {status}", flush=True)
+        raise DemoError("k3s is not using this host's network address; see EVENT_DAY.md troubleshooting")
+    else:
+        print(f"[WARN] k3s address {status}", flush=True)
 
 
 def check_services(
@@ -2315,8 +2364,9 @@ def prepare_robot_for_scan(arm: Piper, scan: dict, settings: dict) -> None:
 
 
 def main() -> int:
-    """Preflight services/setup, enforce motion gates, and run the supervised loop.
+    """Preflight k3s, services, and setup, enforce motion gates, and run the supervised loop.
 
+    A stale k3s address is fixed by restarting k3s, also in check-only mode.
     Check-only never connects to CAN. Every connected exit attempts a checked
     SDK-zero return, opens the gripper once zero is reached, then disconnects.
     """
@@ -2334,6 +2384,7 @@ def main() -> int:
             detector=OpenCVCandyDetector() if args.detector == "opencv" else None,
         )
         hands = HandClient(args.hand_url)
+        ensure_k3s_address()
         check_services(HttpClient(args.vision_url), objects, hands, camera_serial)
         settings, camera_to_gripper, scans = load_setup(args, hand_eye)
         print(f"[OK] Accepted D435 calibration and {len(scans)} taught scan pose(s)", flush=True)
