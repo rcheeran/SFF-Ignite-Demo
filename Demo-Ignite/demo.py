@@ -1834,6 +1834,49 @@ def ensure_k3s_address() -> None:
         print(f"[WARN] k3s address {status}", flush=True)
 
 
+def ensure_k3s_address() -> None:
+    """Check that k3s still uses this host's network address; restart k3s if not.
+
+    k3s keeps the address it started with, so a network change while it runs
+    leaves the cluster on an address the host no longer has. The restart goes
+    through k3s-node-ip-sync.service; running pods keep running. An unknown
+    result (k3s not reachable, or sudo needs a password) is only a warning,
+    because the service checks report any outage that matters to the demo.
+    """
+    def check() -> tuple[int, str]:
+        try:
+            result = subprocess.run(
+                [str(K3S_NODE_IP_SYNC), "--check"], capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return 2, f"unknown: cannot run {K3S_NODE_IP_SYNC.name}: {exc}"
+        return result.returncode, result.stdout.strip() or result.stderr.strip()
+
+    code, status = check()
+    if code == 1:
+        print(f"[FIXING] k3s address {status}; restarting k3s (running pods keep running)", flush=True)
+        fix_error = ""
+        try:
+            fix = subprocess.run(
+                ["sudo", "-n", "systemctl", "start", "k3s-node-ip-sync.service"],
+                capture_output=True, text=True, timeout=K3S_ADDRESS_FIX_TIMEOUT_SECONDS,
+            )
+            if fix.returncode:
+                fix_error = fix.stderr.strip() or f"exit code {fix.returncode}"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            fix_error = str(exc)
+        code, status = check()
+        if code == 1 and fix_error:
+            status += f" (restart failed: {fix_error})"
+    if code == 0:
+        print(f"[OK] k3s address {status}", flush=True)
+    elif code == 1:
+        print(f"[FAILED] k3s address {status}", flush=True)
+        raise DemoError("k3s is not using this host's network address; see EVENT_DAY.md troubleshooting")
+    else:
+        print(f"[WARN] k3s address {status}", flush=True)
+
+
 def check_services(
     camera: HttpClient, objects: VisionClient, hands: HandClient | None, camera_serial: str
 ) -> None:

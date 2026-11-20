@@ -20,6 +20,13 @@ spec:
       labels:
         app: vision-detection
     spec:
+      # Resolve multi-dot names (the Foundry service FQDN) as absolute first, so
+      # each request does not first try search suffixes such as the host's
+      # "localdomain", which CoreDNS forwards to the venue network's DNS.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "2"
       containers:
         - name: detection
           image: productdaydemo/vision-detection:latest
