@@ -9,7 +9,7 @@ LOG_DIR = os.path.join(DATA_DIR, "logs")         # tools/stream_test.py csv logs
 # ---- CAN / arm ---------------------------------------------------------------
 CAN_IFACE = "can_piper"
 CAN_BITRATE = 1000000
-FEEDBACK_WAIT_S = 2.0    # connect() waits this long for the first joint feedback before giving up
+FEEDBACK_WAIT_S = 10.0   # connect() waits this long for the first joint feedback before giving up
 CONTROL_HZ = 30
 FPS = 15
 

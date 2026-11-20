@@ -5,6 +5,9 @@ orchestration, grasp planning, calibration loading, and motor-health checks.
 It does not import code from either older demo folder. It defaults to D435
 calibration, not D405.
 
+For the step-by-step power-on, health-check, run, and shutdown procedure, see
+the [event-day checklist](EVENT_DAY.md).
+
 ## Flow
 
 1. Print independent checks for the OpenCV camera, YOLO/Foundry CUDA model,
@@ -15,8 +18,10 @@ calibration, not D405.
    synchronized RGB-D for open palms. Reject movement during inference.
 3. Pick an orientation-valid, reachable candy using measured XY and the
    reviewed/taught grasp-tip Z. After lift, the measured jaw width must be at
-   least `minimum_held_grip_mm` (**8 mm**; an empty gripper closes to ~5 mm and a
-   held Starburst measured 22.4 mm). Below that, the demo assumes no candy,
+   least `minimum_held_grip_mm` (**5 mm**). The gripper is commanded to close to
+   `grip_close_mm` **3 mm**; the jaws stop at or just above the command, so an
+   empty gripper reads about 3-4 mm while a held Starburst stops them at about
+   10-21 mm. Below that, the demo assumes no candy,
    prints `No candy in gripper: ...`, opens the gripper where it is (above the
    table, so a loosely held candy may drop), returns to the scan pose, and
    continues the loop to find another candy.
@@ -119,6 +124,12 @@ command, otherwise the startup stops or the shutdown reports the error.
 Clear and review that return path too. The return checks
 arm health, sampled flange workspace, tool-tip floor, and factory joint limits
 (zero is on the J2/J3 boundaries, outside the normal inward-margined limits).
+Because zero sits on those boundaries, an arm resting at or near zero (for
+example settled after a power cycle) can read slightly past them, such as J2
+-2.0 or J3 +0.48 degrees. The zero return therefore accepts a start up to
+`ZERO_RETURN_START_TOLERANCE_DEG` (**5 degrees**) past any factory limit,
+clamped onto the limit for path sampling, since the move ends inside the
+limits; readings further out are still refused before any motion.
 If those checks fail, the return times out, or Ctrl+C interrupts the return,
 the script reports it and disconnects without retrying or commanding further motion.
 There is no hold loop or power-off confirmation in the main demo. Disconnecting
@@ -129,11 +140,17 @@ Remain ready to support the arm and use emergency stop if the return fails.
 
 ### Jetson storage
 
-The repository is stored at `/mnt/k3s-data/productdaydemo` on the encrypted
-data filesystem and persistently bind-mounted at `/home/clouduser/productdaydemo`.
-Existing commands and Kubernetes calibration host paths therefore stay unchanged.
-The `home-clouduser-productdaydemo.mount` unit is required by k3s at startup,
+The repository is stored at `/mnt/k3s-data/SFF-Ignite-Demo` on the encrypted
+data filesystem and persistently bind-mounted at `/home/clouduser/SFF-Ignite-Demo`
+by `home-clouduser-SFF\x2dIgnite\x2dDemo.mount` (create the unit name with
+`systemd-escape -p --suffix=mount /home/clouduser/SFF-Ignite-Demo`). The
+`opencv-vision` calibration host path points into this mount, so k3s requires the
+unit at startup (drop-in `/etc/systemd/system/k3s.service.d/demo-repository.conf`),
 preventing fallback to an empty root-filesystem directory if the mount fails.
+Git-ignored local data (calibration records, scan poses, `Demo-Ignite/logs/` and
+`captures/`) and the `YOLO-training/storage` and `k3s-OpenCV-service/datasets`
+links to `/var/lib/rancher/k3s/storage/productdaydemo-yolo` are not in the
+repository; copy or recreate them after a fresh clone.
 
 The separate Docker containerd store is at `/mnt/k3s-data/docker-containerd`,
 bind-mounted at `/var/lib/containerd` by `var-lib-containerd.mount`, which
@@ -227,7 +244,7 @@ a missed grasp returns to scanning rather than using the older demo's retry work
 From the repository root in the existing isolated environment:
 
 ```bash
-source ~/venv-hand-eye435/bin/activate
+source ~/venv-ignite-demo/bin/activate
 python Demo-Ignite/demo.py --check-only
 ```
 
@@ -241,13 +258,12 @@ success-shaped bypass of missing prerequisites.
 For the full pickup/delivery cycle:
 
 ```bash
-python Demo-Ignite/demo.py \
-  --allow-motion --allow-pick --allow-hand-delivery --setup-reviewed \
-  --max-cycles 1
+python Demo-Ignite/demo.py --allow-motion --max-cycles 1
 ```
 
-The four flags explicitly permit motor enablement, pickup, hand delivery, and
-confirm physical setup review. A five-second countdown precedes connection.
+`--allow-motion` is the single motion gate: without it the demo runs the
+preflight and exits without connecting to CAN. Review the physical setup before
+adding it. A five-second countdown precedes connection.
 `connect_robot()` takes exclusive CAN control and enables the arm without
 stopping camera services (`connect_for_teach` remains a compatibility alias for
 existing teaching tools). After connection, the demo first executes a checked
@@ -269,7 +285,10 @@ decimal places; calculations retain full precision. Verbose mode does not
 change motion permissions or planning. `--check-only --verbose` still performs
 only preflight; it does not capture detections or print point transformations.
 Joint-limit summaries, enable-time joint/twitch diagnostics, connection status,
-zero-motion announcements, and the initial scan-pose motion announcement are
+zero-motion announcements, the initial scan-pose motion announcement, the
+per-cycle `motion: scan 1` announcement, and the pickup motion announcements
+(`pick transit`, `pick approach`, `grasp`, `close gripper`, `lift`,
+`lift transit`, and `return to scan pose after missed grasp`) are
 also verbose-only in the main demo. Errors,
 safety warnings, joint-limit restoration warnings, and zero-arrival confirmation
 remain visible without `--verbose`. Standalone teaching/replay tools retain their
@@ -289,8 +308,8 @@ To save a run for later review, log to `Demo-Ignite/logs/` (git-ignored).
 so the shutdown lines are captured:
 
 ```bash
-python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
-  --setup-reviewed --detector opencv --verbose --max-cycles 10 2>&1 \
+python -u Demo-Ignite/demo.py --allow-motion \
+  --detector opencv --verbose --max-cycles 10 2>&1 \
   | tee -i Demo-Ignite/logs/run-$(date +%Y%m%d-%H%M%S).log
 ```
 
@@ -326,8 +345,8 @@ The correction applies to candies only, not palms. The option needs an
 interactive terminal; `| tee -i` logging keeps the keyboard connected:
 
 ```bash
-python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
-  --setup-reviewed --pause-before-grip --verbose --max-cycles 6 2>&1 \
+python -u Demo-Ignite/demo.py --allow-motion \
+  --pause-before-grip --verbose --max-cycles 6 2>&1 \
   | tee -i Demo-Ignite/logs/offsets-$(date +%Y%m%d-%H%M%S).log
 ```
 
@@ -350,8 +369,8 @@ along X out to about X 420 mm. Run the same candy placement once with the
 default and once with `--grasp-tilt-deg 0`, both with `--pause-before-grip`:
 
 ```bash
-python -u Demo-Ignite/demo.py --allow-motion --allow-pick --allow-hand-delivery \
-  --setup-reviewed --pause-before-grip --verbose --max-cycles 3 --grasp-tilt-deg 0 2>&1 \
+python -u Demo-Ignite/demo.py --allow-motion \
+  --pause-before-grip --verbose --max-cycles 3 --grasp-tilt-deg 0 2>&1 \
   | tee -i Demo-Ignite/logs/tilt0-$(date +%Y%m%d-%H%M%S).log
 ```
 
@@ -398,7 +417,7 @@ degrees tilt, ~418 mm high), modelled errors are overestimates only: length
 0-9 mm (largest near image corners), width under 2 mm, so error can reject a
 near-limit candy but cannot pass an oversized object. Captured wrappers
 measured 78-89 x 32-37 mm. Oversized candidates are rejected with their size
-in the error; accepted sizes appear in the `SCAN` line. Startup requires
+in the error; accepted sizes appear in the `CANDY SCAN` line. Startup requires
 camera intrinsics in `hand_eye.json` when `--detector opencv` is selected. The
 YOLO path is unchanged and does not apply the size check.
 Touching or partly occluded wrappers usually fail the

@@ -7,6 +7,7 @@ import argparse
 import math
 from pathlib import Path
 import sys
+import threading
 import time
 
 import numpy as np
@@ -14,11 +15,11 @@ import numpy as np
 from demo import (
     CALIBRATION_DIR, WORKSPACE_MIN_MM, WORKSPACE_MAX_MM,
     DEMO_SETTINGS, DemoError, MARGINED_LIMITS, PIPER_C, finite_vector,
-    euler_to_rot, fk_flange, flange_for_tip, hold_until_power_off, load_json,
+    euler_to_rot, fk_flange, flange_for_tip, load_json,
     move_robot, require_healthy, solve_waypoint,
     return_to_zero, tip_position, validate_joint_path_safety, validate_target_workspace,
 )
-from piper.robot import connect_for_teach
+from piper.robot import Piper, connect_for_teach
 
 DEFAULT_RECORD = CALIBRATION_DIR / "calibration/workspace_teaching.json"
 PREVIEW_CORNER_OFFSETS_MM = {
@@ -31,6 +32,28 @@ PREVIEW_CORNER_OFFSETS_MM = {
 }
 PREVIEW_MINIMUM_XY_MM = [144.0, -170.0]
 PREVIEW_MAXIMUM_Y_MM = 206.3166357672802
+
+
+def hold_until_power_off(piper: Piper, hold_joints: np.ndarray) -> None:
+    """Hold the supplied joints without changing grip until the operator confirms power-off.
+
+    Confirmation is manual; this does not electronically detect controller power
+    or automatically disable motors while the arm may be unsupported.
+    """
+    confirmed = threading.Event()
+
+    def wait_for_confirmation() -> None:
+        """Wait for the operator's power-off confirmation and signal the hold loop."""
+        input(
+            "Turn the Piper controller OFF while supporting the arm. "
+            "Once it is OFF, press Enter: "
+        )
+        confirmed.set()
+
+    threading.Thread(target=wait_for_confirmation, daemon=True).start()
+    while not confirmed.is_set():
+        piper.send_joints(hold_joints, None, PIPER_C.SPEED_REST)
+        confirmed.wait(timeout=0.05)
 
 
 def parse_args() -> argparse.Namespace:

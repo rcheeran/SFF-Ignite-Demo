@@ -44,6 +44,16 @@ exposed on the LAN. This is not a public/authenticated upload endpoint.
 
 ## Configuration and deployment
 
+The OpenCV demo does not need this service or its Foundry endpoint. Run the
+demo with `--detector opencv`; its boot script must use that option for both
+preflight and execution and must not wait for port 8096.
+
+YOLO deployment is opt-in: the manifest defaults to zero replicas, and running
+the deployment script without arguments makes no cluster changes. This does
+not stop an existing deployment unless the updated manifest is applied.
+The Service definition and HTTP routes remain available for optional YOLO use;
+zero replicas means no detection pods back that Service.
+
 `DETECTION_MODEL` defaults to `candy-yolo11s`; `PORT` defaults to 8096.
 Foundry settings moved here from the camera deployment:
 
@@ -59,14 +69,14 @@ The model must be loaded with input shape `[1,3,640,640]` and
 When ready to deploy, from the repository root:
 
 ```bash
-bash k3s-vision-detection/build-and-deploy.sh
+bash k3s-vision-detection/build-and-deploy.sh --enable-yolo
 bash k3s-OpenCV-service/build-and-deploy.sh
 ```
 
 Neither service requires the other to start. The detection script creates the namespace before copying the Foundry operator's
 API key and CA into namespace-local resources, builds/tests/imports the image,
 and rolls out detection. The camera script separately deploys the camera/API.
-Only the demo requires both healthy services before it can begin scanning.
+Only a demo using the YOLO detector requires both healthy services before scanning.
 These scripts change running services; do not run them for offline validation.
 
 ## Hardware-free validation

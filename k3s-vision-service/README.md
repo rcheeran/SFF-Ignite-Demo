@@ -11,7 +11,10 @@ This service is the exclusive owner of the wrist-mounted D405. It provides:
 
 This is the alternative **combined OWL-ViT service**, not the independent
 [camera service](../k3s-OpenCV-service/README.md) used by the current demo.
-Its legacy `/api/capture` endpoint remains available. The current demo instead
+It is **not deployed**: the `owlvit-vision` deployment, service, and image were
+removed from the Jetson on 2026-11-10. Running `build-and-deploy.sh` would
+recreate it and compete with `opencv-vision` for the camera.
+When deployed, it serves the legacy `/api/capture` endpoint. The current demo instead
 orchestrates independent camera and YOLO detection services.
 
 The service does not connect to the Piper CAN interface and does not transform
@@ -21,7 +24,7 @@ the robot pose measured around each HTTP capture.
 ## Deploy
 
 ```bash
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 ./k3s-vision-service/build-and-deploy.sh
 ```
 
@@ -65,7 +68,7 @@ curl -X POST http://127.0.0.1:8094/api/capture \
 No-robot prompt and threshold sweep:
 
 ```bash
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 python Demo-Product-Day/test_owlvit.py "red cube" --legacy-capture
 ```
 

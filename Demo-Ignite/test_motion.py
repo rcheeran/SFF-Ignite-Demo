@@ -325,6 +325,60 @@ class MotionTests(unittest.TestCase):
             if verbose:
                 self.assertEqual(output.call_args.args[0], "motion: initial scan pose after zero")
 
+    def test_scan_pose_motion_announcement_follows_verbose_setting(self):
+        scan = {"index": 1, "joints_deg": np.ones(6)}
+        for verbose in (False, True):
+            settings = {
+                "verbose": verbose, "grip_open_mm": 60.0, "move_timeout_seconds": 8.0,
+                "motion_speed_percent": 10, "scan_settle_seconds": 0.0,
+            }
+            with self.subTest(verbose=verbose), \
+                    mock.patch.object(demo, "move_robot", side_effect=RuntimeError("stop after move")) as move, \
+                    self.assertRaisesRegex(RuntimeError, "stop after move"):
+                demo.capture_scan_pair(
+                    mock.Mock(), mock.Mock(), mock.Mock(), scan, 4, "starburst candy", 0.5, np.eye(4), settings,
+                )
+            move.assert_called_once()
+            self.assertEqual(move.call_args.args[1], "scan 1")
+            self.assertEqual(move.call_args.kwargs["verbose"], verbose)
+
+    def test_pickup_motion_announcements_follow_verbose_setting(self):
+        plan = [
+            ("pick transit", np.full(6, 1.0)), ("pick approach", np.full(6, 2.0)), ("grasp", np.full(6, 3.0)),
+            ("lift", np.full(6, 2.0)), ("lift transit", np.full(6, 1.0)), ("scan 1", np.zeros(6)),
+        ]
+        expected = [
+            "motion: pick transit", "motion: pick approach", "motion: grasp",
+            "motion: close gripper", "motion: lift", "motion: lift transit",
+        ]
+        for verbose in (False, True):
+            arm = mock.Mock()
+            arm.move_joints.return_value = True
+            arm.joints_deg.return_value = np.full(6, 3.0)
+            arm.grip_mm.return_value = 15.0
+            settings = {
+                "verbose": verbose, "move_timeout_seconds": 8.0, "grip_open_mm": 60.0, "grip_close_mm": 3.0,
+                "gripper_hold_seconds": 0.0, "motion_speed_percent": 10, "minimum_held_grip_mm": 5.0,
+            }
+            with self.subTest(verbose=verbose), mock.patch.object(demo, "require_healthy"), \
+                    mock.patch.object(demo, "hold_gripper"), mock.patch("builtins.print") as output:
+                demo.execute_pickup(arm, plan, settings)
+            motions = [str(call.args[0]) for call in output.call_args_list if str(call.args[0]).startswith("motion:")]
+            self.assertEqual(motions, expected if verbose else [])
+            self.assertEqual(arm.move_joints.call_count, 5)
+            arm.move_joints.reset_mock()
+            arm.grip_mm.return_value = 3.2
+            with self.subTest(verbose=verbose, grasp="missed"), mock.patch.object(demo, "require_healthy"), \
+                    mock.patch.object(demo, "hold_gripper"), mock.patch("builtins.print") as output, \
+                    self.assertRaises(demo.GraspVerificationError):
+                demo.execute_pickup(arm, plan, settings)
+            printed = [str(call.args[0]) for call in output.call_args_list]
+            self.assertTrue(any(line.startswith("No candy in gripper: measured width 3.2mm") for line in printed))
+            self.assertEqual(
+                "motion: return to scan pose after missed grasp" in printed, verbose,
+            )
+            self.assertEqual(arm.move_joints.call_count, 6)
+
     def test_enable_diagnostics_follow_verbose_setting(self):
         import piper.robot as robot
 
@@ -405,6 +459,26 @@ class MotionTests(unittest.TestCase):
             arm.move_to_zero.return_value = result
             with self.subTest(result=result), self.assertRaises(demo.DemoError):
                 demo.return_to_zero(arm)
+
+    def test_zero_return_tolerates_resting_slightly_past_zero_limits(self):
+        tolerance = demo.ZERO_RETURN_START_TOLERANCE_DEG
+        for start, allowed in (
+            ([-1.6, -2.0, 2.3, 6.5, 25.0, -12.8], True),   # after power cycle, 2026-11-11
+            ([0.0, 0.3, 0.48, 0.0, 0.0, 0.0], True),       # J3 just past its 0 deg limit
+            ([0.0, -tolerance, tolerance, 0.0, 0.0, 0.0], True),
+            ([0.0, -(tolerance + 0.1), 0.0, 0.0, 0.0, 0.0], False),
+            ([0.0, 0.0, tolerance + 0.1, 0.0, 0.0, 0.0], False),
+        ):
+            arm = self.zero_return_arm()
+            arm.joints_deg.side_effect = [np.array(start), np.zeros(6)]
+            with self.subTest(start=start), mock.patch("builtins.print"):
+                if allowed:
+                    demo.return_to_zero(arm, context="startup zero")
+                    arm.move_to_zero.assert_called_once()
+                else:
+                    with self.assertRaisesRegex(demo.DemoError, "more than 5deg outside"):
+                        demo.return_to_zero(arm, context="startup zero")
+                    arm.move_to_zero.assert_not_called()
 
     def test_current_pose_hand_capture_does_not_command_a_scan_move(self):
         arm, hands, objects = mock.Mock(), mock.Mock(), mock.Mock()
@@ -540,8 +614,8 @@ class MotionTests(unittest.TestCase):
             ]
             self.assertEqual(len(traces), 2 if verbose else 0)
             if verbose:
-                self.assertIn("[TRANSFORM candy scan 1]", traces[0])
-                self.assertIn("[TRANSFORM palm scan 1]", traces[1])
+                self.assertIn("[TRANSFORM candy scan]", traces[0])
+                self.assertIn("[TRANSFORM palm scan]", traces[1])
 
     def test_motion_checks_use_local_constants(self):
         import piper.robot as robot
@@ -598,7 +672,7 @@ class MotionTests(unittest.TestCase):
             mock.patch.object(
                 demo,
                 "move_robot",
-                side_effect=lambda _arm, name, *_args: moves.append(
+                side_effect=lambda _arm, name, *_args, **_kwargs: moves.append(
                     (name, _args[-1])
                 ),
             ),
@@ -642,7 +716,7 @@ class MotionTests(unittest.TestCase):
             mock.patch.object(
                 demo,
                 "move_robot",
-                side_effect=lambda _arm, name, *_args: moves.append(name),
+                side_effect=lambda _arm, name, *_args, **_kwargs: moves.append(name),
             ),
             mock.patch.object(
                 demo,
@@ -656,7 +730,7 @@ class MotionTests(unittest.TestCase):
         self.assertAlmostEqual(raised.exception.measured_width_mm, 0.0)
         self.assertEqual(
             moves,
-            ["pick approach", "grasp", "lift", "scan 1 after missed grasp"],
+            ["pick approach", "grasp", "lift", "return to scan pose after missed grasp"],
         )
         self.assertEqual(holds, [0.0, 70.0])
 
@@ -686,7 +760,7 @@ class MotionTests(unittest.TestCase):
             carry = demo.CandyCarry()
             moves, holds = [], []
             with self.subTest(width=width), mock.patch.object(
-                demo, "move_robot", side_effect=lambda _arm, name, *_args: moves.append(name),
+                demo, "move_robot", side_effect=lambda _arm, name, *_args, **_kwargs: moves.append(name),
             ), mock.patch.object(
                 demo, "hold_gripper",
                 side_effect=lambda _arm, joints, grip, _seconds: holds.append((joints[0], grip)),
@@ -703,7 +777,7 @@ class MotionTests(unittest.TestCase):
                 self.assertTrue(carry.holding)
             else:
                 # Open at the lift transit pose (candy, if any, drops), then go back to scan.
-                self.assertEqual(moves, pickup_moves + ["scan 1 after missed grasp"])
+                self.assertEqual(moves, pickup_moves + ["return to scan pose after missed grasp"])
                 self.assertEqual(holds, [(1.0, 5.0), (4.0, 60.0)])
                 self.assertFalse(carry.holding)
                 self.assertEqual(raised.exception.minimum_held_mm, 8.0)
@@ -787,7 +861,8 @@ class MotionTests(unittest.TestCase):
 
     def test_minimum_held_width_must_lie_between_close_and_open_commands(self) -> None:
         settings = fixtures.IgniteTests.example_config()["demo"]
-        self.assertEqual(demo.DEMO_SETTINGS["minimum_held_grip_mm"], 8.0)
+        self.assertEqual(demo.DEMO_SETTINGS["minimum_held_grip_mm"], 5.0)
+        self.assertEqual(demo.DEMO_SETTINGS["grip_close_mm"], 3.0)
         demo.validate_demo_settings(demo.DEMO_SETTINGS)
         for value in (0.0, -1.0, float("nan"), 70.0, 80.0):
             with self.subTest(value=value), self.assertRaises(demo.DemoError):

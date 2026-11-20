@@ -31,6 +31,14 @@ spec:
   env:
     - name: BATCH_SIZE
       value: "1"
+    # Load the copy the model-store-pull init container places in the pod from the
+    # on-device Foundry model store, instead of re-downloading from the registry at
+    # every pod start (a registry TLS failure after a reboot left the model unloaded).
+    # These entries follow the operator's own USE_ORAS, so they take precedence.
+    - name: USE_ORAS
+      value: "false"
+    - name: MODEL_PATH
+      value: /home/foundry/.foundry/cache
   replicas: 1
   endpoint:
     enabled: true

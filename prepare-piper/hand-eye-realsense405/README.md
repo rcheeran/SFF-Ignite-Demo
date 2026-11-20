@@ -85,7 +85,7 @@ Use Bash because `source` is not available in `/bin/sh`:
 ```bash
 bash
 source ~/venv/bin/activate
-cd ~/productdaydemo
+cd ~/SFF-Ignite-Demo
 python prepare-piper/check_connection.py can_piper
 ```
 
@@ -101,7 +101,7 @@ Resolve hardware or CAN errors before calibration.
 ## 2. Collect eye-in-hand samples
 
 ```bash
-python prepare-piper/hand-eye/capture_samples.py
+python prepare-piper/hand-eye-realsense405/capture_samples.py
 ```
 
 Procedure:
@@ -125,7 +125,7 @@ sample set when its first observation is accepted.
 This step is offline and does not connect to the robot:
 
 ```bash
-python prepare-piper/hand-eye/solve_hand_eye.py
+python prepare-piper/hand-eye-realsense405/solve_hand_eye.py
 ```
 
 The solver runs Tsai, Park, Horaud, Andreff, and Daniilidis methods. It selects
@@ -147,7 +147,7 @@ Do not move Marker ID 1 or the D405 mount. Use at least five poses that were
 not part of calibration:
 
 ```bash
-python prepare-piper/hand-eye/validate_hand_eye.py
+python prepare-piper/hand-eye-realsense405/validate_hand_eye.py
 ```
 
 Vary distance, tilt, position, and wrist roll. After the final pose, follow the
@@ -168,7 +168,7 @@ Hand-eye calibration uses ArUco geometry; arbitrary objects require metric D405
 depth. Collect the fixed marker at multiple distances:
 
 ```bash
-python prepare-piper/hand-eye/calibrate_depth.py
+python prepare-piper/hand-eye-realsense405/calibrate_depth.py
 ```
 
 Procedure:
@@ -205,7 +205,7 @@ Recalibrate rather than copying these values to another camera or mount.
 Use the continuous hold workflow:
 
 ```bash
-python prepare-piper/hand-eye/verify_depth_coordinates.py --align-in-teach
+python prepare-piper/hand-eye-realsense405/verify_depth_coordinates.py --align-in-teach
 ```
 
 Procedure:
@@ -246,7 +246,7 @@ This diagnostic exercises the exact coordinate pipeline that object detection
 will use:
 
 ```bash
-python prepare-piper/hand-eye/click_to_coordinate.py
+python prepare-piper/hand-eye-realsense405/click_to_coordinate.py
 ```
 
 Procedure:
@@ -274,21 +274,15 @@ the configured depth-quality and robot-stability limits.
 ## 8. Run software tests
 
 ```bash
-cd ~/productdaydemo/prepare-piper/hand-eye
+cd ~/SFF-Ignite-Demo/prepare-piper/hand-eye-realsense405
 python -m unittest -v \
   test_hand_eye.py \
   test_depth_calibration.py \
   test_depth_coordinates.py \
   test_click_to_coordinate.py
-
-cd ~/productdaydemo/Demo-VLA-On-Piper/piper-openpi-V2
-python -m pytest -q tests/test_robot.py -k 'teach_stop or not lerobot'
-
-cd ~/productdaydemo/Demo-Product-Day
-python -m unittest -v test_demo.py
 ```
 
-The two excluded tests require the optional LeRobot package.
+These tools use the Piper control package bundled in `Demo-Ignite/piper`.
 
 ## 9. Run the text-prompted pick/drop demo
 

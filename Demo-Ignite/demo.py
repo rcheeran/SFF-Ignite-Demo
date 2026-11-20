@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 import math
 from pathlib import Path
+import subprocess
 import sys
 import time
 import threading
@@ -39,20 +40,27 @@ from piper.transforms import euler_to_rot, fk_flange, tip_position  # noqa: E402
 
 #camera to robot calbibrations
 CALIBRATION_DIR = ROOT / "prepare-piper/hand-eye-realsense435"
-RELEASE_CLEARANCE_MM = 76.2
+K3S_NODE_IP_SYNC = ROOT / "prepare-jetson/k3s-node-ip-sync.sh"
+K3S_ADDRESS_FIX_TIMEOUT_SECONDS = 600.0  # TimeoutStartSec of k3s-node-ip-sync.service
+RELEASE_CLEARANCE_MM = 35.0
 # A move counts as arrived when every joint is within this many degrees of its target.
 ARRIVAL_TOLERANCE_DEG = 2.0
+# SDK zero lies on the J2 and J3 factory limits, so an arm resting at or near zero
+# (e.g. settled after a power cycle) can read a few degrees past them. A zero return
+# moves back inside the limits, so its start may be this far outside them.
+ZERO_RETURN_START_TOLERANCE_DEG = 5.0
 MAXIMUM_HAND_AGE_SECONDS = 10.0
 MAXIMUM_CANDY_XY_CORRECTION_MM = 60.0
 MAXIMUM_GRASP_TILT_OVERRIDE_DEG = 30.0
+MAXIMUM_RANDOM_PLACEMENT_ATTEMPTS = 20
 GRASP_OFFSET_LOG = Path(__file__).resolve().parent / "logs" / "grasp_offsets.jsonl"
 PROMPT = "starburst candy"
 DEFAULT_SCAN_POSES = ROOT / "prepare-piper/scan-poses/scan_poses.json"
 WORKSPACE_CORNERS_MM = (
     (144.644, 206.317, 18.0),  # C2
     (144.0, -170.0, 18.0),  # C4
-    (570.0, -170.0, 18.0),  # C6
-    (570.0, 206.0, 18.0),  # C8
+    (595.0, -170.0, 18.0),  # C6
+    (595.0, 206.0, 18.0),  # C8
 )
 WORKSPACE_MIN_Z_MM = 17.423
 WORKSPACE_MAX_Z_MM = 263.323
@@ -70,10 +78,10 @@ DEMO_SETTINGS = {
     # Re-taught 2026-11-04 (candy_grip.json): candy centred between the open jaws.
     "grasp_tip_z_mm": 16.584,
     "grip_open_mm": 60.000,
-    "grip_close_mm": 5.000,
-    # Measured jaw width after lift; below this the gripper is assumed empty.
-    # An empty gripper closes to ~5 mm; a held Starburst measured 20.9-22.4 mm.
-    "minimum_held_grip_mm": 8.000,
+    # Empty/held widths must be remeasured after changing the close command.
+    "grip_close_mm": 1.000,
+    # Measured jaw width after lift; 2.5 mm may also accept an empty gripper.
+    "minimum_held_grip_mm": 2.500,
     # Roll/pitch 180/20 (20 degrees from vertical) instead of the hand-held teaching
     # tilt (~9 degrees): offline planning reaches ~98% of candy angles out to X 500 mm
     # versus ~54% for the taught tilt. Yaw is replaced by candy alignment at runtime.
@@ -82,8 +90,8 @@ DEMO_SETTINGS = {
     # from the base; candies lying along X), grasp vertically if reachable instead.
     # 2026-11-05/06: forward leans picked 2/18 and toppled candies; vertical picked 3/3.
     "forward_lean_vertical_threshold": 0.700,
-    "motion_speed_percent": 10,
-    "pick_motion_speed_percent": 10,
+    "motion_speed_percent": 20,
+    "pick_motion_speed_percent": 20,
     "approach_height_mm": 100.000,
     "pregrasp_height_mm": 50.000,
     "hand_approach_height_mm": 20.000,
@@ -100,7 +108,7 @@ DEMO_SETTINGS = {
     "candy_max_z_mm": 30.000,
     # Added to every detected candy's base XY before planning. Measure it with
     # --pause-before-grip, which prints the suggested value after each reading.
-    "candy_xy_correction_mm": [0.000, 0.000],
+    "candy_xy_correction_mm": [-3.9, 0.000],
     "grasp_yaw_offset_step_deg": 5.000,
     "gripper_hold_seconds": 1.000,
     "maximum_approach_inward_offset_mm": 120.000,
@@ -220,28 +228,6 @@ def transform_camera_point_to_base(
             flush=True,
         )
     return base_point
-
-
-def hold_until_power_off(piper: Piper, hold_joints: np.ndarray) -> None:
-    """Hold the supplied joints without changing grip until the operator confirms power-off.
-
-    Confirmation is manual; this does not electronically detect controller power
-    or automatically disable motors while the arm may be unsupported.
-    """
-    confirmed = threading.Event()
-
-    def wait_for_confirmation() -> None:
-        """Wait for the operator's power-off confirmation and signal the hold loop."""
-        input(
-            "Turn the Piper controller OFF while supporting the arm. "
-            "Once it is OFF, press Enter: "
-        )
-        confirmed.set()
-
-    threading.Thread(target=wait_for_confirmation, daemon=True).start()
-    while not confirmed.is_set():
-        piper.send_joints(hold_joints, None, PIPER_C.SPEED_REST)
-        confirmed.wait(timeout=0.05)
 
 
 class GraspVerificationError(DemoError):
@@ -637,24 +623,25 @@ def validate_joint_path_safety(
 
 def measured_start_joints(
     arm: Any, name: str, joint_limits: np.ndarray = MARGINED_LIMITS,
+    tolerance_deg: float = ARRIVAL_TOLERANCE_DEG,
 ) -> np.ndarray:
     """Return measured joints as a path-check start, tolerating arrival settling.
 
     A joint may settle up to the 2-degree arrival tolerance past a planned
     waypoint, so a waypoint planned exactly on an inward-margined limit can read
-    slightly beyond it. Such overshoot is clamped back onto the limit for path
-    sampling; anything further out raises. With the default margined limits this
-    allows readings up to, but never past, the factory joint limits. Planned
-    waypoints themselves are not relaxed.
+    slightly beyond it. Overshoot up to tolerance_deg is clamped back onto the
+    limit for path sampling; anything further out raises. With the default
+    margined limits this allows readings up to, but never past, the factory joint
+    limits. Planned waypoints themselves are not relaxed.
     """
     current = finite_vector(arm.joints_deg(), 6, f"{name} measured joints")
     limits = np.asarray(joint_limits, dtype=np.float64)
     overshoot = np.maximum(limits[:, 0] - current, current - limits[:, 1])
-    if np.any(overshoot > ARRIVAL_TOLERANCE_DEG):
+    if np.any(overshoot > tolerance_deg):
         joint = int(np.argmax(overshoot))
         raise DemoError(
             f"{name}: measured J{joint + 1}={current[joint]:.2f}deg is more than "
-            f"{ARRIVAL_TOLERANCE_DEG:.0f}deg outside "
+            f"{tolerance_deg:.0f}deg outside "
             f"[{limits[joint, 0]:.1f}, {limits[joint, 1]:.1f}]deg"
         )
     return np.clip(current, limits[:, 0], limits[:, 1])
@@ -996,6 +983,7 @@ def execute_pickup(
     speed = int(
         demo.get("pick_motion_speed_percent", demo["motion_speed_percent"])
     )
+    verbose = bool(demo.get("verbose", False))
     if "pick transit" in waypoints:
         move_robot(
             arm,
@@ -1004,12 +992,14 @@ def execute_pickup(
             open_mm,
             timeout,
             speed,
+            verbose=verbose,
         )
     move_robot(
-        arm, "pick approach", waypoints["pick approach"], open_mm, timeout, speed
+        arm, "pick approach", waypoints["pick approach"], open_mm, timeout, speed,
+        verbose=verbose,
     )
-    move_robot(arm, "grasp", waypoints["grasp"], open_mm, timeout, speed)
-    if demo.get("verbose"):
+    move_robot(arm, "grasp", waypoints["grasp"], open_mm, timeout, speed, verbose=verbose)
+    if verbose:
         measured = finite_vector(arm.joints_deg(), 6, "measured grasp joints")
         planned_tip, measured_tip = tip_position(waypoints["grasp"]), tip_position(measured)
         print(
@@ -1021,11 +1011,12 @@ def execute_pickup(
         )
     if demo.get("pause_before_grip"):
         pause_for_grasp_offset(arm, waypoints["grasp"], open_mm, target or {}, demo)
-    print("motion: close gripper")
+    if verbose:
+        print("motion: close gripper")
     hold_gripper(arm, waypoints["grasp"], close_mm, hold_seconds)
     if carry is not None:
         carry.gripped_at(waypoints["grasp"])
-    move_robot(arm, "lift", waypoints["lift"], close_mm, timeout, speed)
+    move_robot(arm, "lift", waypoints["lift"], close_mm, timeout, speed, verbose=verbose)
     if carry is not None:
         carry.reached("lift", waypoints["lift"])
     if "lift transit" in waypoints:
@@ -1036,6 +1027,7 @@ def execute_pickup(
             close_mm,
             timeout,
             speed,
+            verbose=verbose,
         )
         if carry is not None:
             carry.reached("lift transit", waypoints["lift transit"])
@@ -1053,11 +1045,12 @@ def execute_pickup(
         hold_gripper(arm, missed_grasp_pose, open_mm, hold_seconds)
         move_robot(
             arm,
-            "scan 1 after missed grasp",
+            "return to scan pose after missed grasp",
             waypoints["scan 1"],
             open_mm,
             timeout,
             speed,
+            verbose=verbose,
         )
         raise GraspVerificationError(held_width, minimum_held)
     return held_width
@@ -1120,7 +1113,7 @@ def transform_object_candidate(
             robot_transform,
             camera_to_gripper,
             verbose=demo.get("verbose", False),
-            label=f"candy scan {scan_index}",
+            label="candy scan",
         )
         camera_axis = finite_vector(
             candidate.get("long_axis_camera_unit"),
@@ -1153,7 +1146,7 @@ def transform_object_candidate(
             base_point[:2] += correction
             if demo.get("verbose"):
                 print(
-                    f"candy scan {scan_index}: applied candy XY correction "
+                    f"candy scan: applied candy XY correction "
                     f"{np.round(correction, 3).tolist()}mm -> {np.round(base_point, 3).tolist()}mm",
                     flush=True,
                 )
@@ -1249,7 +1242,7 @@ def process_object_capture(
             if "length_mm" in result else ""
         )
         print(
-            f"SCAN {index}: detected {len(valid_candidates)} candy(ies), "
+            f"CANDY SCAN: detected {len(valid_candidates)} candy(ies), "
             f"best score={float(result['score']):.3f}, "
             f"camera={np.round(result['camera_point_mm'], 1).tolist()}mm{size}, "
             f"snapshot={client.base_url}{result['snapshot_url']}"
@@ -1275,7 +1268,7 @@ def process_object_capture(
             else ""
         )
         print(
-            f"SCAN {index}: {result['status']} at "
+            f"CANDY SCAN: {result['status']} at "
             f"confidence={confidence:.3f}{reason}, "
             f"snapshot={client.base_url}{result['snapshot_url']}"
         )
@@ -1285,7 +1278,7 @@ def process_object_capture(
 def capture_scan_pair(
     arm: Piper,
     object_client: VisionClient,
-    hand_client: HandClient,
+    hand_client: HandClient | None,
     scan: dict[str, Any],
     hand_slot: int,
     prompt: str,
@@ -1293,7 +1286,7 @@ def capture_scan_pair(
     camera_to_gripper: np.ndarray,
     demo: dict,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Capture object and palm concurrently at one settled scan pose."""
+    """Capture candy and, when requested, a palm at one settled scan pose."""
     pose_started_at = time.perf_counter()
     scan_index = int(scan["index"])
     move_started_at = time.perf_counter()
@@ -1304,6 +1297,7 @@ def capture_scan_pair(
         float(demo["grip_open_mm"]),
         float(demo["move_timeout_seconds"]),
         int(demo["motion_speed_percent"]),
+        verbose=bool(demo.get("verbose", False)),
     )
     move_seconds = time.perf_counter() - move_started_at
     settle_started_at = time.perf_counter()
@@ -1336,9 +1330,12 @@ def capture_scan_pair(
             timed_call,
             hand_client.capture_hand,
             hand_slot,
-        )
+        ) if hand_client is not None else None
         object_service_result, object_seconds = object_future.result()
-        hand_service_result, hand_seconds = hand_future.result()
+        if hand_future is not None:
+            hand_service_result, hand_seconds = hand_future.result()
+        else:
+            hand_service_result, hand_seconds = None, 0.0
     concurrent_inference_seconds = time.perf_counter() - inference_started_at
     after_pose = arm.pose()
     after_transform = piper_pose_to_transform(after_pose)
@@ -1383,7 +1380,7 @@ def capture_scan_pair(
         after_transform,
         camera_to_gripper,
         demo,
-    )
+    ) if hand_client is not None else {"status": "not_requested"}
     timing = {
         "move_seconds": move_seconds,
         "settle_seconds": settle_seconds,
@@ -1395,7 +1392,7 @@ def capture_scan_pair(
     object_result["scan_timing_seconds"] = timing
     hand_result["scan_timing_seconds"] = timing
     print(
-        f"SCAN TIMING {scan_index}: move={move_seconds:.2f}s, "
+        f"SCAN TIMING: move={move_seconds:.2f}s, "
         f"settle={settle_seconds:.2f}s, object={object_seconds:.2f}s, "
         f"hand={hand_seconds:.2f}s, "
         f"concurrent={concurrent_inference_seconds:.2f}s, "
@@ -1496,7 +1493,7 @@ def process_hand_capture(
             robot_transform,
             camera_to_gripper,
             verbose=demo.get("verbose", False),
-            label=f"palm scan {scan_index}",
+            label="palm scan",
         )
         result["base_point_mm"] = base_point.tolist()
         try:
@@ -1509,12 +1506,12 @@ def process_hand_capture(
             result["status"] = "rejected"
             result["error"] = str(exc)
             print(
-                f"HAND SCAN {slot}: rejected "
+                f"OPEN PALM SCAN: rejected "
                 f"base={np.round(base_point, 1).tolist()}mm: {exc}"
             )
             return result
         print(
-            f"OPEN PALM SCAN {slot}: detected "
+            f"OPEN PALM SCAN: detected "
             f"{service_result.get('handedness', 'unknown')} "
             f"score={float(service_result['score']):.3f}, "
             f"base={np.round(base_point, 1).tolist()}mm, "
@@ -1522,7 +1519,7 @@ def process_hand_capture(
         )
     else:
         print(
-            f"OPEN PALM SCAN {slot}: {service_result['status']}, "
+            f"OPEN PALM SCAN: {service_result['status']}, "
             f"snapshot={client.base_url}{service_result.get('snapshot_url', '')}"
         )
     return result
@@ -1756,7 +1753,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--hand-url", default="http://127.0.0.1:8095")
     parser.add_argument("--can-interface", default="can_piper")
-    parser.add_argument("--check-only", action="store_true", help="preflight only; never connect to CAN")
+    parser.add_argument(
+        "--check-only", action="store_true",
+        help="preflight only (restarts k3s if its address is stale); never connect to CAN",
+    )
     parser.add_argument(
         "--verbose", action="store_true",
         help="print camera, gripper, and robot-base XYZ and transformation matrices",
@@ -1771,19 +1771,71 @@ def parse_args() -> argparse.Namespace:
         help="test override for the grasp tilt from vertical (0-30 degrees; 0 = vertical) "
         "instead of DEMO_SETTINGS grasp_rpy_deg pitch",
     )
-    parser.add_argument("--allow-motion", action="store_true")
-    parser.add_argument("--allow-pick", action="store_true")
-    parser.add_argument("--allow-hand-delivery", action="store_true")
     parser.add_argument(
-        "--setup-reviewed", action="store_true",
-        help="confirm new-surface motion settings, tool-tip floor, and collision clearances reviewed",
+        "--pick-candy-only", action="store_true",
+        help="pick and place at a random reachable tabletop location inside the workspace; "
+        "no hand service required; defaults to one cycle",
     )
-    parser.add_argument("--max-cycles", type=int, default=0, help="zero loops until Ctrl+C")
-    return parser.parse_args()
+    parser.add_argument(
+        "--allow-motion", action="store_true",
+        help="connect to the arm and run the pickup and hand-delivery loop; "
+        "without it only the preflight runs",
+    )
+    parser.add_argument(
+        "--max-cycles", type=int, default=None,
+        help="default: one for --pick-candy-only, otherwise continuous; zero loops until Ctrl+C",
+    )
+    args = parser.parse_args()
+    if args.max_cycles is None:
+        args.max_cycles = 1 if args.pick_candy_only else 0
+    return args
+
+
+def ensure_k3s_address() -> None:
+    """Check that k3s still uses this host's network address; restart k3s if not.
+
+    k3s keeps the address it started with, so a network change while it runs
+    leaves the cluster on an address the host no longer has. The restart goes
+    through k3s-node-ip-sync.service; running pods keep running. An unknown
+    result (k3s not reachable, or sudo needs a password) is only a warning,
+    because the service checks report any outage that matters to the demo.
+    """
+    def check() -> tuple[int, str]:
+        try:
+            result = subprocess.run(
+                [str(K3S_NODE_IP_SYNC), "--check"], capture_output=True, text=True, timeout=60,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return 2, f"unknown: cannot run {K3S_NODE_IP_SYNC.name}: {exc}"
+        return result.returncode, result.stdout.strip() or result.stderr.strip()
+
+    code, status = check()
+    if code == 1:
+        print(f"[FIXING] k3s address {status}; restarting k3s (running pods keep running)", flush=True)
+        fix_error = ""
+        try:
+            fix = subprocess.run(
+                ["sudo", "-n", "systemctl", "start", "k3s-node-ip-sync.service"],
+                capture_output=True, text=True, timeout=K3S_ADDRESS_FIX_TIMEOUT_SECONDS,
+            )
+            if fix.returncode:
+                fix_error = fix.stderr.strip() or f"exit code {fix.returncode}"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            fix_error = str(exc)
+        code, status = check()
+        if code == 1 and fix_error:
+            status += f" (restart failed: {fix_error})"
+    if code == 0:
+        print(f"[OK] k3s address {status}", flush=True)
+    elif code == 1:
+        print(f"[FAILED] k3s address {status}", flush=True)
+        raise DemoError("k3s is not using this host's network address; see EVENT_DAY.md troubleshooting")
+    else:
+        print(f"[WARN] k3s address {status}", flush=True)
 
 
 def check_services(
-    camera: HttpClient, objects: VisionClient, hands: HandClient, camera_serial: str
+    camera: HttpClient, objects: VisionClient, hands: HandClient | None, camera_serial: str
 ) -> None:
     """Check all three services independently and report their availability.
 
@@ -1796,11 +1848,13 @@ def check_services(
     local_opencv = isinstance(objects.detector, OpenCVCandyDetector)
     detector_label = "OpenCV candy detection" if local_opencv else "YOLO / Foundry detection"
     detector_ready = " (local CPU colour detector)" if local_opencv else " (CUDA model loaded)"
-    for label, check in (
+    checks = [
         ("OpenCV camera", camera.health),
         (detector_label, objects.detector.check),
-        ("MediaPipe hand service", hands.health),
-    ):
+    ]
+    if hands is not None:
+        checks.append(("MediaPipe hand service", hands.health))
+    for label, check in checks:
         try:
             result = check()
             if label == "OpenCV camera":
@@ -1847,6 +1901,7 @@ def load_setup(
     settings = validate_demo_settings(DEMO_SETTINGS)
     settings["verbose"] = args.verbose
     settings["pause_before_grip"] = bool(getattr(args, "pause_before_grip", False))
+    settings["pick_candy_only"] = bool(getattr(args, "pick_candy_only", False))
     for key in ("grasp_rpy_deg", "hand_delivery_rpy_deg"):
         settings[key] = finite_vector(settings[key], 3, key)
     tilt_override = getattr(args, "grasp_tilt_deg", None)
@@ -1924,7 +1979,7 @@ def verify_palm(palm: dict, maximum_age: float) -> np.ndarray:
 
 
 def plan_delivery(palm: dict, arm: Any, scan: dict, settings: dict, maximum_age: float):
-    """Plan and path-check release at palm Z + 76.2 mm, retreat, and return to scan.
+    """Plan and path-check release at palm Z + 35 mm, retreat, and return to scan.
 
     Validate palm freshness and workspace bounds before IK; no motion is sent.
     """
@@ -1947,17 +2002,17 @@ def plan_delivery(palm: dict, arm: Any, scan: dict, settings: dict, maximum_age:
 
 def reacquire_palm(
     arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    transform: np.ndarray, settings: dict,
+    camera_to_gripper: np.ndarray, settings: dict,
 ) -> dict:
     """Capture a new palm at the current arm pose for delivery-plan validation."""
     return capture_hand_at_current_pose(
-        arm, hands, objects, scan, int(scan["index"]) + 3, transform, settings,
+        arm, hands, objects, scan, int(scan["index"]) + 3, camera_to_gripper, settings,
     )
 
 
 def wait_for_deliverable_palm(
     arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    transform: np.ndarray, settings: dict, maximum_age: float,
+    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
 ) -> tuple[dict, np.ndarray, dict]:
     """Hold the scan pose with the candy, capturing until a palm has an accepted delivery plan.
 
@@ -1971,7 +2026,7 @@ def wait_for_deliverable_palm(
         require_healthy(arm, "waiting at scan pose with candy")
         attempt += 1
         try:
-            palm = reacquire_palm(arm, objects, hands, scan, transform, settings)
+            palm = reacquire_palm(arm, objects, hands, scan, camera_to_gripper, settings)
             center = finite_vector(palm.get("base_point_mm"), 3, "reacquired palm center")
             plan = dict(plan_delivery(palm, arm, scan, settings, maximum_age))
             verify_palm(palm, maximum_age)
@@ -1987,7 +2042,7 @@ def wait_for_deliverable_palm(
 
 def deliver_to_palm(
     arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    transform: np.ndarray, settings: dict, maximum_age: float,
+    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
     carry: CandyCarry | None = None,
 ) -> None:
     """Wait at the scan pose for a deliverable palm, then approach and release above it.
@@ -2005,13 +2060,13 @@ def deliver_to_palm(
     carry.reached("scan pose", scan["joints_deg"])
     time.sleep(float(settings["scan_settle_seconds"]))
     palm, current, plan = wait_for_deliverable_palm(
-        arm, objects, hands, scan, transform, settings, maximum_age,
+        arm, objects, hands, scan, camera_to_gripper, settings, maximum_age,
     )
     print(f"Palm detected after pickup: {np.round(current, 3).tolist()}mm")
     checked_move(arm, "hand approach", plan["hand approach"], closed, settings)
     carry.reached("hand approach", plan["hand approach"])
     verify_palm(palm, maximum_age)
-    checked_move(arm, "hand release height (palm Z + 76.2mm)", plan["hand release"], closed, settings)
+    checked_move(arm, "hand release height (palm Z + 35mm)", plan["hand release"], closed, settings)
     carry.reached("hand release height", plan["hand release"])
     verify_palm(palm, maximum_age)
     # Once opening starts at the palm, never carry anything back to the pickup location.
@@ -2191,9 +2246,77 @@ def pick_diagnostic(capture: dict, target: dict, plan: list[tuple[str, np.ndarra
     )
 
 
+def plan_random_placement(
+    capture: dict, pickup_plan: list[tuple[str, np.ndarray]], scan: dict, settings: dict,
+) -> tuple[np.ndarray, list[tuple[str, np.ndarray]]]:
+    """Find a bounded, path-checked placement before picking anything up."""
+    clearance = float(settings["grip_open_mm"])
+    lower = np.asarray(settings["target_workspace_min_mm"][:2]) + clearance
+    upper = np.asarray(settings["target_workspace_max_mm"][:2]) - clearance
+    if np.any(lower >= upper):
+        raise DemoError("workspace is too small for random placement clearance")
+    candidates = capture.get("object_candidates", [capture])
+    occupied = [
+        finite_vector(candidate["base_point_mm"], 3, "occupied candy position")[:2]
+        for candidate in candidates if candidate.get("status") == "detected"
+    ]
+    grasp_frame = fk(dict(pickup_plan)["grasp"])
+    rpy = Rot.from_matrix(grasp_frame[:3, :3]).as_euler("xyz", degrees=True)
+    rng = np.random.default_rng()
+    last_reason = "sampled locations overlap detected candies"
+    for _ in range(MAXIMUM_RANDOM_PLACEMENT_ATTEMPTS):
+        point = np.append(rng.uniform(lower, upper), float(settings["grasp_tip_z_mm"]))
+        if any(np.linalg.norm(point[:2] - other) < clearance for other in occupied):
+            continue
+        validate_target_workspace(
+            point, settings["target_workspace_min_mm"], settings["target_workspace_max_mm"],
+            check_z=False,
+        )
+        try:
+            plan = plan_pickup(
+                point, scan["joints_deg"], scan["joints_deg"], rpy,
+                float(settings["grasp_tip_z_mm"]), float(settings["approach_height_mm"]),
+                float(settings["pregrasp_height_mm"]), float(settings["minimum_pregrasp_height_mm"]),
+                float(settings["pregrasp_height_step_mm"]),
+                float(settings["maximum_approach_inward_offset_mm"]),
+                float(settings["approach_inward_step_mm"]),
+            )
+        except DemoError as exc:
+            last_reason = str(exc)
+            continue
+        return point, plan
+    raise DemoError(
+        f"no accepted random placement after {MAXIMUM_RANDOM_PLACEMENT_ATTEMPTS} attempts: "
+        f"{last_reason}; no pickup attempted"
+    )
+
+
+def place_candy(
+    arm: Any, plan: list[tuple[str, np.ndarray]], scan: dict, settings: dict, carry: CandyCarry,
+) -> None:
+    """Carry through scan, descend, release at grasp height, and retreat."""
+    validate_joint_path_safety(
+        "random placement and retreat",
+        [measured_start_joints(arm, "random placement"), scan["joints_deg"],
+         *[joints for _, joints in plan]],
+    )
+    closed, opened = float(settings["grip_close_mm"]), float(settings["grip_open_mm"])
+    checked_move(arm, "placement: return to scan", scan["joints_deg"], closed, settings)
+    carry.reached("placement scan", scan["joints_deg"])
+    for name, joints in plan:
+        checked_move(
+            arm, f"placement: {name}", joints, closed if carry.holding else opened, settings,
+        )
+        if carry.holding:
+            carry.reached(f"placement {name}", joints)
+        if name == "grasp":
+            carry.holding = False
+            hold_gripper(arm, joints, opened, float(settings["gripper_hold_seconds"]))
+
+
 def run_cycle(
     arm: Any, objects: VisionClient, hands: HandClient, scans: list[dict],
-    transform: np.ndarray, settings: dict, maximum_age: float,
+    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
 ) -> bool:
     """Scan taught poses, pick one accepted candy, then deliver to a freshly checked palm.
 
@@ -2206,18 +2329,23 @@ def run_cycle(
     error: delivery waits at the scan pose until one is deliverable. Ctrl+C,
     errors with nothing gripped, and failed returns stop the outer loop.
     """
+    pick_only = bool(settings.get("pick_candy_only", False))
     for scan in scans:
         validate_joint_path_safety(
             "scan approach", [measured_start_joints(arm, "scan approach"), scan["joints_deg"]],
         )
         candy, palm = capture_scan_pair(
-            arm, objects, hands, scan, int(scan["index"]) + 3,
-            PROMPT, float(settings["detection_confidence_threshold"]), transform, settings,
+            arm, objects, None if pick_only else hands, scan, int(scan["index"]) + 3,
+            PROMPT, float(settings["detection_confidence_threshold"]), camera_to_gripper, settings,
         )
-        if candy.get("status") != "detected" or palm.get("status") != "detected":
-            print("No accepted candy/palm pair; continuing scan without pickup", flush=True)
+        if candy.get("status") != "detected" or (not pick_only and palm.get("status") != "detected"):
+            print(
+                "No accepted candy; continuing scan without pickup" if pick_only else
+                "No accepted candy/palm pair; continuing scan without pickup", flush=True,
+            )
             continue
-        verify_palm(palm, maximum_age)
+        if not pick_only:
+            verify_palm(palm, maximum_age)
         try:
             target, plan = pick_plan(arm, [candy], scan, settings)
         except NoReachableCandyError as exc:
@@ -2231,6 +2359,9 @@ def run_cycle(
             if settings.get("verbose"):
                 print(f"  details: {exc}", flush=True)
             continue
+        if pick_only:
+            placement_point, placement_plan = plan_random_placement(candy, plan, scan, settings)
+            print(f"PLACE PLAN: tip at {np.round(placement_point, 3).tolist()}mm", flush=True)
         print(f"Picking Starburst at {np.round(target['base_point_mm'], 3).tolist()}mm", flush=True)
         if settings.get("verbose"):
             print(pick_diagnostic(candy, target, plan), flush=True)
@@ -2238,7 +2369,10 @@ def run_cycle(
         try:
             held_width = execute_pickup(arm, plan, settings, carry, target)
             print(f"Pickup confirmed: gripper width={held_width:.2f}mm", flush=True)
-            deliver_to_palm(arm, objects, hands, scan, transform, settings, maximum_age, carry)
+            if pick_only:
+                place_candy(arm, placement_plan, scan, settings, carry)
+            else:
+                deliver_to_palm(arm, objects, hands, scan, camera_to_gripper, settings, maximum_age, carry)
         except GraspVerificationError as exc:
             print(f"Pickup missed: {exc}; scanning again", flush=True)
             return False
@@ -2251,6 +2385,8 @@ def run_cycle(
                 return_candy_to_pickup(arm, plan, carry, settings)
             except (RuntimeError, OSError, KeyError, TypeError, ValueError) as return_exc:
                 raise DemoError(f"candy return failed after '{exc}': {return_exc}") from return_exc
+            if pick_only:
+                raise
             print("Candy returned; continuing scan loop", flush=True)
             return False
         return True
@@ -2264,17 +2400,19 @@ def return_to_zero(
     """Validate and execute a slow SDK-zero return, optionally opening the gripper there.
 
     Reject unhealthy arms or unsafe sampled paths before sending a zero command,
-    and require measured convergence. The gripper is unchanged during the move;
+    and require measured convergence. The start may read up to
+    ZERO_RETURN_START_TOLERANCE_DEG past a factory limit (zero sits on the J2/J3
+    limits); it is clamped onto the limit for path sampling. The gripper is unchanged during the move;
     when open_grip_mm is given it opens only after zero is reached and verified
     (a held candy drops at the zero pose), and the measured width must come
     within 5 mm of the command. Failures are raised without recovery motion.
     """
     require_healthy(arm, f"before {context}")
-    current = finite_vector(arm.joints_deg(), 6, f"{context} joint position")
-    validate_joint_path_safety(
-        context, [current, np.zeros(6)],
-        joint_limits=np.asarray(PIPER_C.JOINT_LIMITS_DEG, dtype=np.float64),
+    factory_limits = np.asarray(PIPER_C.JOINT_LIMITS_DEG, dtype=np.float64)
+    current = measured_start_joints(
+        arm, context, factory_limits, ZERO_RETURN_START_TOLERANCE_DEG,
     )
+    validate_joint_path_safety(context, [current, np.zeros(6)], joint_limits=factory_limits)
     if verbose:
         detail = "gripper opens on arrival" if open_grip_mm is not None else "without opening the gripper"
         print(f"{context}: moving to SDK zero pose; {detail}.", flush=True)
@@ -2324,8 +2462,9 @@ def prepare_robot_for_scan(arm: Piper, scan: dict, settings: dict) -> None:
 
 
 def main() -> int:
-    """Preflight services/setup, enforce motion gates, and run the supervised loop.
+    """Preflight k3s, services, and setup, enforce motion gates, and run the supervised loop.
 
+    A stale k3s address is fixed by restarting k3s, also in check-only mode.
     Check-only never connects to CAN. Every connected exit attempts a checked
     SDK-zero return, opens the gripper once zero is reached, then disconnects.
     """
@@ -2343,16 +2482,18 @@ def main() -> int:
             detector=OpenCVCandyDetector() if args.detector == "opencv" else None,
         )
         hands = HandClient(args.hand_url)
-        check_services(HttpClient(args.vision_url), objects, hands, camera_serial)
-        settings, transform, scans = load_setup(args, hand_eye)
+        ensure_k3s_address()
+        check_services(
+            HttpClient(args.vision_url), objects,
+            None if getattr(args, "pick_candy_only", False) else hands, camera_serial,
+        )
+        settings, camera_to_gripper, scans = load_setup(args, hand_eye)
         print(f"[OK] Accepted D435 calibration and {len(scans)} taught scan pose(s)", flush=True)
         if args.check_only:
             print("Preflight passed; no CAN connection or arm motion", flush=True)
             return 0
-        if not all((args.allow_motion, args.allow_pick, args.allow_hand_delivery, args.setup_reviewed)):
-            raise DemoError(
-                "motion requires --allow-motion --allow-pick --allow-hand-delivery --setup-reviewed"
-            )
+        if not args.allow_motion:
+            raise DemoError("motion requires --allow-motion")
         if settings.get("pause_before_grip") and not sys.stdin.isatty():
             raise DemoError("--pause-before-grip needs an interactive terminal to type candy offsets")
         print(
@@ -2367,7 +2508,7 @@ def main() -> int:
         while args.max_cycles == 0 or cycle < args.max_cycles:
             cycle += 1
             print(f"\nIGNITE CYCLE {cycle}", flush=True)
-            run_cycle(arm, objects, hands, scans, transform, settings, MAXIMUM_HAND_AGE_SECONDS)
+            run_cycle(arm, objects, hands, scans, camera_to_gripper, settings, MAXIMUM_HAND_AGE_SECONDS)
             time.sleep(float(settings["retry_delay_seconds"]))
     except KeyboardInterrupt:
         if arm is None:

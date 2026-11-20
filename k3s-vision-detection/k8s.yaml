@@ -9,7 +9,7 @@ metadata:
   name: vision-detection
   namespace: productdaydemo
 spec:
-  replicas: 1
+  replicas: 0
   strategy:
     type: Recreate
   selector:

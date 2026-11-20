@@ -81,7 +81,7 @@ def check_dependencies() -> None:
     if missing:
         raise RuntimeError(
             f"OpenCV {cv2.__version__} is missing {', '.join(missing)}. "
-            "Activate ~/venv-hand-eye435 and install this workflow's requirements.txt."
+            "Activate ~/venv-ignite-demo and install this workflow's requirements.txt."
         )
     for name in ("numpy", "scipy", "can", "piper_sdk", "pyrealsense2"):
         importlib.import_module(name)

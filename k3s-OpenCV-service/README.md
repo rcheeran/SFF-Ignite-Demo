@@ -29,7 +29,7 @@ identity as `camera_name`, `camera_serial`, and `camera_owner_service`.
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/healthz` | Camera health and capabilities, without model/CUDA claims |
-| GET | `/` | Live stream, object scan panels, proxied hand panels |
+| GET | `/` | Dashboard: live stream beside the latest candy and hand scans, scan details below |
 | GET | `/stream.mjpg` | Live MJPEG stream |
 | POST | `/api/rgbd-capture` | Capture one aligned RGB/depth pair and return its token |
 | GET | `/rgbd/{token}.png` | Lossless RGB image for detection |
@@ -97,8 +97,15 @@ frame. The cache holds the latest **30 captures**; callers must finish before
 their token is evicted. Localization bodies are limited to 2 MiB / 1000 boxes.
 
 The hand service's JPEG, RGB-D, deprojection, and MJPEG contracts are unchanged.
-Object scan panels update when the demo or threshold tester publishes localized
-results, not through background inference.
+
+The dashboard shows the live stream (about 70% of the page width, up to
+1113 x 835 px on a 1920 px screen) beside the latest candy scan stacked above
+the latest hand scan (up to 460 x 345 px each). The candy and hand scan
+metadata appear side by side below. When several scan poses publish
+snapshots, the most recently captured candy and hand scans are shown. Below
+900 px of window width everything stacks in one column. The candy panel
+updates when the demo or threshold tester publishes localized results, not
+through background inference.
 
 ## Dataset collection
 
@@ -124,8 +131,9 @@ bash k3s-OpenCV-service/build-and-deploy.sh
 bash k3s-vision-detection/build-and-deploy.sh
 ```
 
-Keep the alternative OWL-ViT deployment scaled to zero: only one process can
-own the USB camera. The camera script no longer provisions Foundry credentials.
+The alternative OWL-ViT deployment has been removed from the cluster; do not
+redeploy it alongside this service, because only one process can own the USB
+camera. The camera script no longer provisions Foundry credentials.
 The detection manifest maps port 8096 to Jetson loopback for local demo callers,
 while also providing an internal ClusterIP service.
 

@@ -14,10 +14,10 @@ The existing environment has overlapping OpenCV installations and lacks
 `calibrateHandEye`. Use an isolated environment with one pinned OpenCV build:
 
 ```bash
-cd ~/productdaydemo/prepare-piper/hand-eye-realsense435
-python3 -m venv ~/venv-hand-eye435
-~/venv-hand-eye435/bin/python -m pip install -r requirements.txt
-source ~/venv-hand-eye435/bin/activate
+cd ~/SFF-Ignite-Demo/prepare-piper/hand-eye-realsense435
+python3 -m venv ~/venv-ignite-demo
+~/venv-ignite-demo/bin/python -m pip install -r requirements.txt
+source ~/venv-ignite-demo/bin/activate
 python calibrate.py check
 ```
 
@@ -236,7 +236,7 @@ before operation; the approved reused values above provide the current settings.
 ## Compare a candy-surface point against camera coordinates
 
 ```bash
-~/venv-hand-eye435/bin/python prepare-piper/Teach-scripts/verify_candy_point.py
+~/venv-ignite-demo/bin/python prepare-piper/Teach-scripts/verify_candy_point.py
 ```
 
 [verify_candy_point.py](../Teach-scripts/verify_candy_point.py) uses feedback-only

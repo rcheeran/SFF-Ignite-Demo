@@ -57,6 +57,9 @@ spec:
               hostPort: 8095
           readinessProbe:
             httpGet:
+              # hostNetwork pod: probe over loopback so a change of the Jetson's
+              # DHCP address cannot fail the probe and restart the pod.
+              host: 127.0.0.1
               path: /healthz
               port: http
             initialDelaySeconds: 10
@@ -65,6 +68,9 @@ spec:
             failureThreshold: 24
           livenessProbe:
             httpGet:
+              # hostNetwork pod: probe over loopback so a change of the Jetson's
+              # DHCP address cannot fail the probe and restart the pod.
+              host: 127.0.0.1
               path: /healthz
               port: http
             initialDelaySeconds: 60

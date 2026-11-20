@@ -1,6 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
+if [ "$#" -eq 0 ]; then
+  echo "YOLO deployment disabled for the OpenCV demo; no cluster changes made."
+  echo "To explicitly enable YOLO, rerun with --enable-yolo."
+  exit 0
+fi
+if [ "$#" -ne 1 ] || [ "$1" != "--enable-yolo" ]; then
+  echo "Usage: $0 [--enable-yolo]" >&2
+  exit 2
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE="productdaydemo/vision-detection:latest"
 ARCHIVE="$(mktemp --suffix=.tar)"
@@ -30,5 +40,6 @@ sudo docker run --rm "$IMAGE" python -m unittest discover -s /app/tests -v
 sudo docker save "$IMAGE" -o "$ARCHIVE"
 sudo k3s ctr images import "$ARCHIVE"
 sudo kubectl apply -f "$SCRIPT_DIR/k8s.yaml"
+sudo kubectl -n productdaydemo scale deployment/vision-detection --replicas=1
 sudo kubectl -n productdaydemo rollout restart deployment/vision-detection
 sudo kubectl -n productdaydemo rollout status deployment/vision-detection --timeout=10m

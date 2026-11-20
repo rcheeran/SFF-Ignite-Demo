@@ -99,6 +99,8 @@ scans.write_text(json.dumps({"pose_count": 1, "poses": [{
 sys.argv = ["demo.py", "--check-only",
             "--calibration-dir", str(calibration), "--scan-poses", str(scans)]
 with mock.patch.object(demo, "check_services") as services, mock.patch.object(
+    demo, "ensure_k3s_address"
+), mock.patch.object(
     demo, "connect_robot", side_effect=AssertionError("CAN connection forbidden")
 ):
     assert demo.main() == 0
@@ -157,6 +159,11 @@ print("Standalone preflight passed without older demo folders")
         zero = mock.patch.object(demo, "return_to_zero")
         self.zero = zero.start()
         self.addCleanup(zero.stop)
+        # main() must never run the real k3s check (sudo kubectl) or restart k3s in tests.
+        self.ensure_k3s_address = demo.ensure_k3s_address
+        k3s_address = mock.patch.object(demo, "ensure_k3s_address")
+        self.k3s_address = k3s_address.start()
+        self.addCleanup(k3s_address.stop)
         self.arm = mock.Mock()
         self.arm.joints_deg.return_value = np.zeros(6)
         self.arm.faults.return_value = []
@@ -364,7 +371,7 @@ print("Standalone preflight passed without older demo folders")
             detected = palm()
             old = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
 
-            def move(_arm, name, *_args):
+            def move(_arm, name, *_args, **_kwargs):
                 if name == stale_at:
                     detected["captured_at"] = old
 
@@ -395,7 +402,7 @@ print("Standalone preflight passed without older demo folders")
             ("hand retreat", np.full(6, 7.0)), ("scan 1", np.ones(6)),
         ]
 
-        def move(_arm, name, *_args):
+        def move(_arm, name, *_args, **_kwargs):
             if name == failing_step:
                 raise demo.DemoError(f"{name} did not reach its planned joint target")
 
@@ -452,7 +459,7 @@ print("Standalone preflight passed without older demo folders")
         ):
             carry = demo.CandyCarry()
 
-            def move(_arm, name, *_args):
+            def move(_arm, name, *_args, **_kwargs):
                 if name == failing:
                     raise demo.DemoError(f"{name} failed")
 
@@ -823,6 +830,54 @@ print("Standalone preflight passed without older demo folders")
             ))
         delivery.assert_not_called()
 
+    def k3s_commands(self, *check_results, fix_result=None):
+        """Patch subprocess.run with scripted k3s-node-ip-sync.sh --check results."""
+        checks = iter(check_results)
+
+        def run(command, **_):
+            if command[-1] == "--check":
+                code, status = next(checks)
+                return subprocess.CompletedProcess(command, code, stdout=status + "\n", stderr="")
+            return fix_result or subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        return mock.patch.object(demo.subprocess, "run", side_effect=run)
+
+    def test_k3s_address_in_sync_or_unknown_never_restarts_k3s(self):
+        for code, status, tag in (
+            (0, "in sync: k3s uses 10.0.0.5, which this host has", "[OK]"),
+            (2, "unknown: cannot read the k3s node address", "[WARN]"),
+        ):
+            with self.subTest(code=code), self.k3s_commands((code, status)) as run, \
+                    mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.ensure_k3s_address()
+            self.assertEqual(run.call_count, 1)
+            self.assertIn(f"{tag} k3s address {status}", stdout.getvalue())
+
+    def test_stale_k3s_address_restarts_k3s_then_passes(self):
+        with self.k3s_commands(
+            (1, "OUT OF SYNC: k3s uses 10.0.0.5, but this host has 10.0.0.9"),
+            (0, "in sync: k3s uses 10.0.0.9, which this host has"),
+        ) as run, mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            self.ensure_k3s_address()
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual(
+            run.call_args_list[1].args[0], ["sudo", "-n", "systemctl", "start", "k3s-node-ip-sync.service"]
+        )
+        self.assertIn("[FIXING] k3s address OUT OF SYNC", stdout.getvalue())
+        self.assertIn("[OK] k3s address in sync: k3s uses 10.0.0.9", stdout.getvalue())
+
+    def test_k3s_address_still_stale_after_restart_stops_preflight(self):
+        stale = (1, "OUT OF SYNC: k3s uses 10.0.0.5, but this host has 10.0.0.9")
+        not_installed = subprocess.CompletedProcess(
+            [], 5, stdout="", stderr="Unit k3s-node-ip-sync.service not found."
+        )
+        with self.k3s_commands(stale, stale, fix_result=not_installed), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout, \
+                self.assertRaises(demo.DemoError):
+            self.ensure_k3s_address()
+        self.assertIn("[FAILED] k3s address OUT OF SYNC", stdout.getvalue())
+        self.assertIn("restart failed: Unit k3s-node-ip-sync.service not found.", stdout.getvalue())
+
     def test_all_services_report_even_when_one_fails(self):
         camera = mock.Mock(base_url="http://camera:8094")
         camera.health.side_effect = demo.DemoError("offline")
@@ -980,7 +1035,7 @@ print("Standalone preflight passed without older demo folders")
                 np.eye(4), np.eye(4), np.eye(4), settings,
             )
         summary = output.call_args.args[0]
-        self.assertIn("SCAN 1: detected 1 candy(ies)", summary)
+        self.assertIn("CANDY SCAN: detected 1 candy(ies)", summary)
         self.assertNotIn("candidate(s)", summary)
         plan = [("pick approach", np.ones(6)), ("grasp", np.ones(6)), ("lift", np.ones(6)), ("scan 1", np.zeros(6))]
         with mock.patch.object(demo, "validate_joint_path_safety"), \
@@ -1240,7 +1295,7 @@ print("Standalone preflight passed without older demo folders")
                         mock.patch.object(demo, "GRASP_OFFSET_LOG", log), \
                         mock.patch.object(demo, "record_grasp_offset", wraps=demo.record_grasp_offset) as record, \
                         mock.patch("builtins.input", side_effect=answer), mock.patch("builtins.print"), \
-                        mock.patch.object(demo, "move_robot", side_effect=lambda _a, name, *_: events.append(name)), \
+                        mock.patch.object(demo, "move_robot", side_effect=lambda _a, name, *_, **__: events.append(name)), \
                         mock.patch.object(demo, "hold_gripper", side_effect=lambda _a, _j, grip, _s: events.append(("grip", grip))):
                     demo.execute_pickup(self.arm, plan, settings, demo.CandyCarry(), target)
                 self.assertEqual(events[:2], ["pick approach", "grasp"])
@@ -1329,10 +1384,9 @@ print("Standalone preflight passed without older demo folders")
                 "scan_poses": Path("/unused/scan_poses.json"), "vision_url": "http://camera",
                 "detection_url": "http://detector", "hand_url": "http://hand",
                 "can_interface": "can_piper", "max_cycles": 2,
-                "check_only": False, "allow_motion": True, "allow_pick": True,
+                "check_only": False, "allow_motion": True,
                 "detector": "yolo",
-                "verbose": False,
-                "allow_hand_delivery": True, "setup_reviewed": True, **fields,
+                "verbose": False, **fields,
             }
         )
 
@@ -1402,19 +1456,25 @@ print("Standalone preflight passed without older demo folders")
                 ), mock.patch.object(demo, "connect_robot") as connect:
             self.assertEqual(demo.main(), 0)
         connect.assert_not_called()
+        self.k3s_address.assert_called_once_with()
         self.assertEqual(services.call_args.args[-1], "D435")
 
-    def test_each_motion_gate_prevents_can_connection(self):
-        for flag in ("allow_motion", "allow_pick", "allow_hand_delivery", "setup_reviewed"):
-            with self.subTest(flag=flag), mock.patch.object(
-                demo, "parse_args", return_value=self.args(**{flag: False})
-            ), mock.patch.object(
-                demo, "load_hand_eye", return_value={"camera": {"serial": "D435"}}
-            ), mock.patch.object(demo, "check_services"), mock.patch.object(
-                demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
-            ), mock.patch.object(demo, "connect_robot") as connect:
-                self.assertEqual(demo.main(), 2)
-            connect.assert_not_called()
+    def test_missing_allow_motion_prevents_can_connection(self):
+        with mock.patch.object(demo, "parse_args", return_value=self.args(allow_motion=False)), \
+                mock.patch.object(demo, "load_hand_eye", return_value={"camera": {"serial": "D435"}}), \
+                mock.patch.object(demo, "check_services"), mock.patch.object(
+                    demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
+                ), mock.patch.object(demo, "connect_robot") as connect, \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            self.assertEqual(demo.main(), 2)
+        connect.assert_not_called()
+        self.assertIn("motion requires --allow-motion", stderr.getvalue())
+
+    def test_removed_motion_gate_flags_are_rejected(self):
+        for flag in ("--allow-pick", "--allow-hand-delivery", "--setup-reviewed"):
+            with self.subTest(flag=flag), mock.patch.object(sys, "argv", ["demo.py", "--allow-motion", flag]), \
+                    mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+                demo.parse_args()
 
     def test_removed_scan_option_is_rejected(self):
         with mock.patch.object(sys, "argv", ["demo.py", "--scan-only"]), \
@@ -1432,13 +1492,11 @@ print("Standalone preflight passed without older demo folders")
                     demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
                 ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                 mock.patch.object(demo, "run_cycle", return_value=True) as cycle, \
-                mock.patch.object(demo, "hold_until_power_off") as hold, \
                 mock.patch.object(demo.time, "sleep"):
             self.assertEqual(demo.main(), 0)
         self.assertEqual(cycle.call_count, 2)
         self.startup.assert_called_once_with(self.arm, self.scan, self.settings)
         self.assertEqual(cycle.call_args.args[-1], demo.MAXIMUM_HAND_AGE_SECONDS)
-        hold.assert_not_called()
         self.assertEqual(shutdown.mock_calls, [
             mock.call.zero(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2),
             mock.call.disconnect(),
@@ -1468,11 +1526,9 @@ print("Standalone preflight passed without older demo folders")
                     demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
                 ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                 mock.patch.object(demo, "run_cycle") as cycle, \
-                mock.patch.object(demo, "hold_until_power_off") as hold, \
                 mock.patch.object(demo.time, "sleep"):
             self.assertEqual(demo.main(), 2)
         cycle.assert_not_called()
-        hold.assert_not_called()
         self.zero.assert_called_once_with(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2)
         self.arm.disconnect.assert_called_once()
 
@@ -1486,13 +1542,11 @@ print("Standalone preflight passed without older demo folders")
                 demo, "load_setup", return_value=(self.settings, np.eye(4), [self.scan])
             ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                     mock.patch.object(demo, "run_cycle", side_effect=failure) as cycle, \
-                    mock.patch.object(demo, "hold_until_power_off") as hold, \
                     mock.patch.object(demo, "hold_gripper") as release, \
                     mock.patch.object(demo, "return_to_zero") as zero, \
                     mock.patch.object(demo.time, "sleep"):
                 self.assertEqual(demo.main(), code)
             self.assertEqual(cycle.call_count, 1)
-            hold.assert_not_called()
             release.assert_not_called()
             zero.assert_called_once_with(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2)
 
@@ -1512,11 +1566,9 @@ print("Standalone preflight passed without older demo folders")
             ), mock.patch.object(demo, "connect_robot", return_value=self.arm), \
                     mock.patch.object(demo, "run_cycle", side_effect=cycle_failure), \
                     mock.patch.object(demo, "return_to_zero", side_effect=failure) as zero, \
-                    mock.patch.object(demo, "hold_until_power_off") as hold, \
                     mock.patch.object(demo.time, "sleep"), \
                     mock.patch("builtins.print") as output:
                 self.assertEqual(demo.main(), code)
-            hold.assert_not_called()
             zero.assert_called_once_with(self.arm, context="shutdown zero return", verbose=False, open_grip_mm=40.0, open_seconds=0.2)
             self.assertTrue(any("disconnecting without further motion" in str(call) for call in output.call_args_list))
         self.assertEqual(self.arm.disconnect.call_count, 4)
@@ -1525,12 +1577,10 @@ print("Standalone preflight passed without older demo folders")
         with mock.patch.object(demo, "parse_args", return_value=self.args()), \
                 mock.patch.object(demo, "load_hand_eye", side_effect=KeyboardInterrupt()), \
                 mock.patch.object(demo, "connect_robot") as connect, \
-                mock.patch.object(demo, "return_to_zero") as zero, \
-                mock.patch.object(demo, "hold_until_power_off") as hold:
+                mock.patch.object(demo, "return_to_zero") as zero:
             self.assertEqual(demo.main(), 130)
         connect.assert_not_called()
         zero.assert_not_called()
-        hold.assert_not_called()
 
     def test_runtime_settings_exclude_obsolete_candy_bounds_and_config_argument(self):
         self.assertNotIn("target_workspace_min_mm", demo.DEMO_SETTINGS)
@@ -1548,7 +1598,8 @@ print("Standalone preflight passed without older demo folders")
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--check-only", result.stdout)
-        self.assertIn("--allow-hand-delivery", result.stdout)
+        self.assertIn("--allow-motion", result.stdout)
+        self.assertNotIn("--setup-reviewed", result.stdout)
 
 
 if __name__ == "__main__":
