@@ -67,8 +67,11 @@ BOWL_SETTINGS = {
     "split_peak_fraction": 0.6,     # distance-transform peaks used as watershed seeds
     "maximum_chain_candies": 4,     # split straight rows of up to this many candies
     "minimum_candies": 1,
-    # Live checks (demo.py): rim depth must show a raised rim, not a flat circle.
+    # Live checks (demo.py): depth just inside the rim on the side away from the
+    # camera reads the top of the bowl's inner wall; a flat circle reads the table.
     "rim_depth_samples": 8,
+    "rim_depth_inset_mm": 4.0,
+    "rim_depth_arc_deg": 120.0,
     "minimum_rim_depth_samples": 4,
     "minimum_rim_height_fraction": 0.5,
     # Grasp selection inside the bowl.
@@ -434,9 +437,7 @@ def find_bowl(
             "radius_mm": circle["radius_px"] * view.mm_per_px,
             "plane_z_mm": view.plane_z_mm,
         }
-        bowl["rim_pixels"] = view.plane_to_image(
-            circle_points(bowl["plane_center_mm"], bowl["radius_mm"], int(settings["rim_depth_samples"]))
-        ).round().astype(int).tolist()
+        bowl["rim_depth_pixels"] = rim_depth_pixels(view, bowl["plane_center_mm"], bowl["radius_mm"], settings)
         if len(candies) >= settings["minimum_candies"]:
             result.update(
                 status="detected", bowl=bowl,
@@ -449,6 +450,18 @@ def find_bowl(
     if empty is not None:
         result.update(status="empty", bowl=empty[0], rejected_candies=[to_base(view, item) for item in empty[1]])
     return result
+
+
+def rim_depth_pixels(view: PlaneView, center_xy: Any, radius_mm: float, settings: dict) -> list[list[int]]:
+    """Photo pixels just inside the rim on the far side, where depth reads the inner wall top."""
+    center = np.asarray(center_xy, dtype=np.float64)[:2]
+    away = center - view.camera_position[:2]
+    heading = math.atan2(away[1], away[0])
+    half_arc = math.radians(settings["rim_depth_arc_deg"]) / 2.0
+    angles = np.linspace(heading - half_arc, heading + half_arc, int(settings["rim_depth_samples"]))
+    radius = radius_mm - settings["rim_depth_inset_mm"]
+    points = center + radius * np.column_stack([np.cos(angles), np.sin(angles)])
+    return view.plane_to_image(points).round().astype(int).tolist()
 
 
 def check_rim_height(rim_z_mm: list[float | None], settings: dict = BOWL_SETTINGS) -> tuple[bool, str]:
@@ -474,6 +487,14 @@ def jaw_footprint(center_xy: Any, closing_yaw_deg: float, settings: dict) -> np.
     return np.array([center + sa * half_along * along + sc * half_across * across for sa, sc in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
 
 
+def jaw_clear_of_wall(center_xy: Any, closing_yaw_deg: float, bowl_center_xy: Any, settings: dict) -> bool:
+    """True if the open jaws around a candy centre stay inside the bowl with the wall margin."""
+    clear_radius = settings["bowl_diameter_mm"] / 2.0 - settings["bowl_wall_mm"] - settings["wall_margin_mm"]
+    footprint = jaw_footprint(center_xy, closing_yaw_deg, settings)
+    center = np.asarray(bowl_center_xy, dtype=np.float64)[:2]
+    return bool(np.all(np.linalg.norm(footprint - center, axis=1) <= clear_radius))
+
+
 def grasp_options(
     candies: list[dict[str, Any]], bowl_center_xy: Any, rim_z_mm: float, settings: dict = BOWL_SETTINGS,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -486,7 +507,6 @@ def grasp_options(
     """
     sides = sorted(settings["candy_size_mm"], reverse=True)
     tolerance = settings["candy_size_tolerance"]
-    clear_radius = settings["bowl_diameter_mm"] / 2.0 - settings["bowl_wall_mm"] - settings["wall_margin_mm"]
     center = np.asarray(bowl_center_xy, dtype=np.float64)[:2]
     pickable, rejected = [], []
     for candy in candies:
@@ -497,11 +517,10 @@ def grasp_options(
             reasons.append(f"size {candy['true_long_mm']:.0f} x {candy['true_short_mm']:.0f} mm is not a candy")
         if point[2] < rim_z_mm - settings["maximum_descent_below_rim_mm"]:
             reasons.append(f"too deep ({rim_z_mm - point[2]:.0f} mm below the rim)")
-        closing = []
-        for yaw in (candy["edge_yaw_deg"] + 90.0, candy["edge_yaw_deg"]):
-            footprint = jaw_footprint(point, yaw % 180.0, settings)
-            if np.all(np.linalg.norm(footprint - center, axis=1) <= clear_radius):
-                closing.append(yaw % 180.0)
+        closing = [
+            yaw % 180.0 for yaw in (candy["edge_yaw_deg"] + 90.0, candy["edge_yaw_deg"])
+            if jaw_clear_of_wall(point, yaw % 180.0, center, settings)
+        ]
         if not closing:
             reasons.append("too close to the bowl wall for the open jaws")
         if reasons:
@@ -517,8 +536,8 @@ def annotate(frame_bgr: np.ndarray, result: dict[str, Any], chosen: dict[str, An
     image = frame_bgr.copy()
     bowl = result.get("bowl")
     if bowl:
-        rim = bowl.get("rim_outline_pixels") or bowl.get("rim_pixels")
-        cv2.polylines(image, [np.asarray(rim, np.int32)], True, (255, 200, 0), 2)
+        rim = bowl.get("rim_outline_pixels") or bowl.get("rim_depth_pixels")
+        cv2.polylines(image, [np.asarray(rim, np.int32)], "rim_outline_pixels" in bowl, (255, 200, 0), 2)
     for item, colour in [(c, (0, 200, 0)) for c in result.get("candies", [])] + [
         (r, (0, 0, 255)) for r in result.get("rejected_candies", [])
     ]:

@@ -77,7 +77,13 @@ class BowlDetectionTests(unittest.TestCase):
         bowl = result["bowl"]
         self.assertLess(np.linalg.norm(np.subtract(bowl["plane_center_mm"], BOWL_CENTER)), 3.0)
         self.assertAlmostEqual(bowl["radius_mm"], 76.2, delta=3.0)
-        self.assertEqual(len(bowl["rim_pixels"]), bv.BOWL_SETTINGS["rim_depth_samples"])
+        self.assertEqual(len(bowl["rim_depth_pixels"]), bv.BOWL_SETTINGS["rim_depth_samples"])
+        # Depth samples sit just inside the rim, on the side away from the camera.
+        view = bv.bowl_view(INTRINSICS, c2b)
+        center = np.asarray(bowl["plane_center_mm"])
+        for point in view.image_to_plane(bowl["rim_depth_pixels"]):
+            self.assertAlmostEqual(np.linalg.norm(point - center), bowl["radius_mm"] - 4.0, delta=1.5)
+            self.assertGreater(np.dot(point - center, center - c2b[:2, 3]), 0.0)
         self.assertEqual(len(result["candies"]), 3)
         for x, y, yaw, _ in candies:
             found = min(result["candies"], key=lambda c: np.linalg.norm(np.subtract(c["plane_center_mm"], (x, y))))

@@ -66,39 +66,18 @@ class HttpClient:
         return health
 
 
-class VisionClient(HttpClient):
-    def __init__(
-        self, base_url: str, timeout: float = 90.0, *,
-        detection_url: str = DEFAULT_DETECTION_URL,
-        detector: Any = None,
-    ) -> None:
-        """Use the YOLO detection service unless a local detector is supplied."""
-        super().__init__(base_url, timeout)
-        if detector is not None:
-            self.detector = detector
-            return
-        try:
-            self.detector = DetectionClient(EXPECTED_VISION_MODEL, detection_url, timeout)
-        except DetectionError as exc:
-            raise DemoError(str(exc)) from exc
+class CameraClient(HttpClient):
+    """The camera service alone: token-bound RGB-D photos and depth at a pixel."""
 
     def health(self) -> dict[str, Any]:
         health = super().health()
         capabilities = health.get("capabilities")
         if (
             health.get("service") != "camera" or not isinstance(capabilities, list)
-            or "localize" not in capabilities
+            or not {"rgbd-capture", "deproject"}.issubset(capabilities)
         ):
-            raise DemoError("demo requires the independent camera service with token localization")
-        try:
-            self.detector.check()
-        except DetectionError as exc:
-            raise DemoError(str(exc)) from exc
-        return {
-            **health, "model": self.detector.model_name,
-            "cuda": getattr(self.detector, "uses_cuda", True),
-            "detection_url": self.detector.url,
-        }
+            raise DemoError("demo requires the camera service with RGB-D capture and deprojection")
+        return health
 
     def capture_png(self) -> tuple[dict[str, Any], bytes]:
         """Capture one token-bound RGB-D frame and download its lossless PNG."""
@@ -115,6 +94,62 @@ class VisionClient(HttpClient):
         if not image.startswith(b"\x89PNG\r\n\x1a\n"):
             raise DemoError("camera frame download is not a PNG image")
         return captured, image
+
+    def deproject(self, token: str, pixel: Any) -> np.ndarray:
+        """Camera-frame point (mm) at a pixel of a captured frame, from its depth.
+
+        Raises DemoError when the camera has no usable depth there.
+        """
+        u, v = (int(round(float(value))) for value in pixel)
+        result = self._json_request("/api/deproject", {"token": token, "pixel_uv": [u, v]})
+        point = np.asarray(result.get("camera_point_mm"), dtype=np.float64)
+        if point.shape != (3,) or not np.all(np.isfinite(point)):
+            raise DemoError(f"camera returned no finite point for pixel {[u, v]}")
+        return point
+
+    def set_workspace_overlay(
+        self, base_to_camera: np.ndarray, minimum_mm: np.ndarray, maximum_mm: np.ndarray
+    ) -> None:
+        self._json_request("/api/workspace-overlay", {
+            "base_to_camera": np.asarray(base_to_camera, dtype=np.float64).tolist(),
+            "minimum_mm": np.asarray(minimum_mm, dtype=np.float64).tolist(),
+            "maximum_mm": np.asarray(maximum_mm, dtype=np.float64).tolist(),
+        })
+
+
+class VisionClient(CameraClient):
+    def __init__(
+        self, base_url: str, timeout: float = 90.0, *,
+        detection_url: str = DEFAULT_DETECTION_URL,
+        detector: Any = None,
+    ) -> None:
+        """Use the YOLO detection service unless a local detector is supplied."""
+        super().__init__(base_url, timeout)
+        if detector is not None:
+            self.detector = detector
+            return
+        try:
+            self.detector = DetectionClient(EXPECTED_VISION_MODEL, detection_url, timeout)
+        except DetectionError as exc:
+            raise DemoError(str(exc)) from exc
+
+    def health(self) -> dict[str, Any]:
+        health = HttpClient.health(self)
+        capabilities = health.get("capabilities")
+        if (
+            health.get("service") != "camera" or not isinstance(capabilities, list)
+            or "localize" not in capabilities
+        ):
+            raise DemoError("demo requires the independent camera service with token localization")
+        try:
+            self.detector.check()
+        except DetectionError as exc:
+            raise DemoError(str(exc)) from exc
+        return {
+            **health, "model": self.detector.model_name,
+            "cuda": getattr(self.detector, "uses_cuda", True),
+            "detection_url": self.detector.url,
+        }
 
     def capture(self, slot: int, prompt: str, confidence: float) -> dict[str, Any]:
         if slot not in (1, 2, 3) or not prompt.strip() or not 0 < confidence < 1:
@@ -152,15 +187,6 @@ class VisionClient(HttpClient):
                     "deploy the updated OpenCV camera service before running Ignite"
                 )
         return result
-
-    def set_workspace_overlay(
-        self, base_to_camera: np.ndarray, minimum_mm: np.ndarray, maximum_mm: np.ndarray
-    ) -> None:
-        self._json_request("/api/workspace-overlay", {
-            "base_to_camera": np.asarray(base_to_camera, dtype=np.float64).tolist(),
-            "minimum_mm": np.asarray(minimum_mm, dtype=np.float64).tolist(),
-            "maximum_mm": np.asarray(maximum_mm, dtype=np.float64).tolist(),
-        })
 
 
 class HandClient(HttpClient):

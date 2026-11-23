@@ -1,5 +1,18 @@
 #!/usr/bin/env python3
-"""Supervised D435 Starburst pickup and delivery loop."""
+"""GTC candy demo: pick a candy from a bowl and drop it on an open hand.
+
+Each cycle, at the taught scan pose:
+  1. Find the bowl and the candies in it with OpenCV (bowl_vision.py), confirm
+     the rim with depth, and pick the highest reachable candy straight down.
+  2. Hold the candy at the scan pose until an open palm's finger base is
+     visible inside the hand workspace (hand_target.py).
+  3. Release 35 mm above the palm centre, or above the finger base when the
+     palm centre is not visible, then repeat.
+
+  --check-only   preflight only; never connects to CAN
+  --scan-only    move to the scan pose and report the bowl, candies, and hand; no pick
+  --pick-only    pick from the bowl and drop the candy back in; no hand needed
+"""
 
 from __future__ import annotations
 
@@ -12,33 +25,29 @@ import subprocess
 import sys
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Iterable
 
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation as Rot
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-#vision_client interfaces with the camera service, the model service, and provides convenient clients for both.
 from vision_client import (  # noqa: E402
-    DEFAULT_DETECTION_URL,
     DEFAULT_VISION_URL,
+    CameraClient,
     DemoError,
     HandClient,
-    HttpClient,
-    VisionClient,
 )
-from opencv_detector import OpenCVCandyDetector, candy_size_mm, check_candy_size  # noqa: E402
+import bowl_vision  # noqa: E402
+from hand_target import choose_drop_target  # noqa: E402
 
-#The piper module provides interfaces for controlling the robotic arm, including kinematics, robot state, and transformations.
 from piper import config as PIPER_C  # noqa: E402
 from piper.kinematics import MARGINED_LIMITS, fk, ik  # noqa: E402
 from piper.robot import Piper, connect_robot  # noqa: E402
 from piper.transforms import euler_to_rot, fk_flange, tip_position  # noqa: E402
 
-#camera to robot calbibrations
 CALIBRATION_DIR = ROOT / "prepare-piper/hand-eye-realsense435"
 K3S_NODE_IP_SYNC = ROOT / "prepare-jetson/k3s-node-ip-sync.sh"
 K3S_ADDRESS_FIX_TIMEOUT_SECONDS = 600.0  # TimeoutStartSec of k3s-node-ip-sync.service
@@ -51,10 +60,13 @@ ARRIVAL_TOLERANCE_DEG = 2.0
 ZERO_RETURN_START_TOLERANCE_DEG = 5.0
 MAXIMUM_HAND_AGE_SECONDS = 10.0
 MAXIMUM_CANDY_XY_CORRECTION_MM = 60.0
-MAXIMUM_GRASP_TILT_OVERRIDE_DEG = 30.0
-MAXIMUM_RANDOM_PLACEMENT_ATTEMPTS = 20
-GRASP_OFFSET_LOG = Path(__file__).resolve().parent / "logs" / "grasp_offsets.jsonl"
-PROMPT = "starburst candy"
+HAND_SLOT = 4
+# The finger pads reach this far below the tool tip (pads span 105..135 mm past the flange).
+FINGER_EXTENSION_BELOW_TIP_MM = 15.0
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+GRASP_OFFSET_LOG = LOG_DIR / "grasp_offsets.jsonl"
+BOWL_SCAN_IMAGE = LOG_DIR / "latest_bowl_scan.jpg"
+PROMPT = "christmas candy"  # label for capture_scan_images.py reference detections
 DEFAULT_SCAN_POSES = ROOT / "prepare-piper/scan-poses/scan_poses.json"
 WORKSPACE_CORNERS_MM = (
     (144.644, 206.317, 18.0),  # C2
@@ -75,55 +87,55 @@ WORKSPACE_MAX_MM = np.array([
     WORKSPACE_MAX_Z_MM,
 ])
 DEMO_SETTINGS = {
-    # Re-taught 2026-11-04 (candy_grip.json): candy centred between the open jaws.
-    "grasp_tip_z_mm": 16.584,
-    "grip_open_mm": 60.000,
-    # Empty/held widths must be remeasured after changing the close command.
+    # 40 mm clears the 25.4 mm candy and keeps the open jaws away from the bowl wall
+    # (bowl_vision checks the jaw footprint against the wall at this width).
+    "grip_open_mm": 40.000,
     "grip_close_mm": 1.000,
-    # Measured jaw width after lift; 2.5 mm may also accept an empty gripper.
-    "minimum_held_grip_mm": 2.500,
-    # Roll/pitch 180/20 (20 degrees from vertical) instead of the hand-held teaching
-    # tilt (~9 degrees): offline planning reaches ~98% of candy angles out to X 500 mm
-    # versus ~54% for the taught tilt. Yaw is replaced by candy alignment at runtime.
-    "grasp_rpy_deg": [180.000, 20.000, 123.142],
-    # When the tilted grasp's fingertips would point within ~45 degrees of +X (away
-    # from the base; candies lying along X), grasp vertically if reachable instead.
-    # 2026-11-05/06: forward leans picked 2/18 and toppled candies; vertical picked 3/3.
-    "forward_lean_vertical_threshold": 0.700,
+    # The candy is 19-25 mm across and an empty close reads about 1 mm.
+    # Not yet measured with the new candy.
+    "minimum_held_grip_mm": 12.000,
+    # Vertical grasp; yaw is set per candy so the jaws close across one of its edges.
+    "grasp_rpy_deg": [180.000, 0.000, 0.000],
+    # The tool tip is the middle of the finger pads, which reach ~15 mm below it.
+    # At the candy's top surface the fingertips are ~15 mm down its side.
+    # Confirm with --pause-before-grip.
+    "grasp_tip_above_candy_top_mm": 0.000,
+    # Fingertips 15 mm below the tool tip stay above the bowl floor (table -3 mm,
+    # floor ~6 mm thick) with margin.
+    "minimum_grasp_tip_z_mm": 20.000,
+    # Approach and lift this far above the rim, then move straight down/up.
+    "rim_clearance_mm": 30.000,
+    # Waypoints along the vertical descent keep the joint-space path straight; any
+    # sampled tip position below the rim (plus finger length) must stay within
+    # this distance of the vertical line through the candy.
+    "vertical_step_mm": 15.000,
+    "maximum_vertical_deviation_mm": 3.000,
+    "grasp_yaw_offset_step_deg": 5.000,
+    "maximum_grasp_yaw_offset_deg": 10.000,
+    # Added to every candy's base XY before planning. Measure it with
+    # --pause-before-grip, which prints the suggested value after each reading.
+    "candy_xy_correction_mm": [0.000, 0.000],
     "motion_speed_percent": 20,
     "pick_motion_speed_percent": 20,
-    "approach_height_mm": 100.000,
-    "pregrasp_height_mm": 50.000,
     "hand_approach_height_mm": 20.000,
     # Pitch raised from the taught 10.012 degrees: at 10 degrees J5 (wrist pitch,
     # +/-70 degrees) limited palm reach to X ~410-440 mm; 20 degrees reaches X 500 mm.
     "hand_delivery_rpy_deg": [178.517, 20.000, 171.532],
-    "approach_inward_step_mm": 20.000,
-    # YOLO picks scored 0.05-0.49 were gripper-occluded or bad-depth detections while
-    # real candies scored 0.84-0.99. OpenCV's fill score is already >= 0.6.
-    "detection_confidence_threshold": 0.500,
-    # Candy centres sit near the table plane (Z ~ -3 mm); real candies measured
-    # -12..+7 mm while a bad depth reading put one detection at Z -348 mm.
-    "candy_min_z_mm": -30.000,
-    "candy_max_z_mm": 30.000,
-    # Added to every detected candy's base XY before planning. Measure it with
-    # --pause-before-grip, which prints the suggested value after each reading.
-    "candy_xy_correction_mm": [-3.9, 0.000],
-    "grasp_yaw_offset_step_deg": 5.000,
     "gripper_hold_seconds": 1.000,
-    "maximum_approach_inward_offset_mm": 120.000,
-    "maximum_cross_view_orientation_difference_deg": 20.000,
-    "maximum_cross_view_target_difference_mm": 25.000,
-    "maximum_grasp_yaw_offset_deg": 20.000,
     "maximum_scan_position_deviation_mm": 2.000,
     "maximum_scan_rotation_deviation_deg": 0.750,
-    "minimum_pregrasp_height_mm": 30.000,
     "move_timeout_seconds": 8.000,
-    "pregrasp_height_step_mm": 5.000,
     "retry_delay_seconds": 1.000,
     "scan_settle_seconds": 1.000,
 }
 
+
+class NoReachableCandyError(DemoError):
+    """No pickable candy in the bowl has an accepted, path-checked vertical grasp."""
+
+    def __init__(self, message: str, rejections: list[dict] | None = None) -> None:
+        super().__init__(message)
+        self.rejections = list(rejections or [])
 
 
 class CalibrationError(ValueError):
@@ -244,14 +256,6 @@ class GraspVerificationError(DemoError):
         )
 
 
-class NoReachableCandyError(DemoError):
-    """No detected candy in a scan has an accepted, path-checked pickup plan."""
-
-    def __init__(self, message: str, targets: list[dict] | None = None) -> None:
-        super().__init__(message)
-        self.targets = list(targets or [])
-
-
 def summarize_rejection(reason: str) -> str:
     """Shorten a planner rejection to its first underlying failure for console output."""
     text = str(reason)
@@ -297,119 +301,6 @@ def require_quality(document: dict, name: str, path: Path) -> None:
     acceptance = document.get("acceptance")
     if not isinstance(acceptance, dict) or acceptance.get("quality_passed") is not True:
         raise DemoError(f"{name} has not passed quality checks: {path}")
-
-
-def validate_demo_settings(settings: dict) -> dict:
-    """Validate code-defined runtime settings and return normalized workspace bounds."""
-    try:
-        demo = dict(settings)
-        target_min = finite_vector(
-            WORKSPACE_MIN_MM, 3, "code-defined workspace minimum"
-        ).copy()
-        target_max = finite_vector(
-            WORKSPACE_MAX_MM, 3, "code-defined workspace maximum"
-        ).copy()
-        finite_vector(demo["hand_delivery_rpy_deg"], 3, "demo.hand_delivery_rpy_deg")
-        correction = finite_vector(
-            demo["candy_xy_correction_mm"], 2, "demo.candy_xy_correction_mm"
-        ).copy()
-        candy_min_z, candy_max_z = float(demo["candy_min_z_mm"]), float(demo["candy_max_z_mm"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise DemoError(f"invalid demo configuration: {exc}") from exc
-    if np.any(target_min >= target_max):
-        raise DemoError("demo target workspace minimum must be below maximum")
-    if np.any(np.abs(correction) > MAXIMUM_CANDY_XY_CORRECTION_MM):
-        raise DemoError(
-            f"demo.candy_xy_correction_mm components must be within "
-            f"+/-{MAXIMUM_CANDY_XY_CORRECTION_MM:.0f}mm"
-        )
-    if not (math.isfinite(candy_min_z) and math.isfinite(candy_max_z) and candy_min_z < candy_max_z):
-        raise DemoError("demo.candy_min_z_mm must be finite and below demo.candy_max_z_mm")
-    demo["candy_xy_correction_mm"] = correction
-    demo["candy_min_z_mm"], demo["candy_max_z_mm"] = candy_min_z, candy_max_z
-    positive_keys = (
-        "minimum_held_grip_mm",
-        "motion_speed_percent",
-        "pick_motion_speed_percent",
-        "maximum_scan_position_deviation_mm",
-        "maximum_scan_rotation_deviation_deg",
-        "maximum_cross_view_target_difference_mm",
-        "maximum_cross_view_orientation_difference_deg",
-        "scan_settle_seconds",
-        "approach_height_mm",
-        "pregrasp_height_mm",
-        "minimum_pregrasp_height_mm",
-        "pregrasp_height_step_mm",
-        "maximum_approach_inward_offset_mm",
-        "approach_inward_step_mm",
-        "maximum_grasp_yaw_offset_deg",
-        "grasp_yaw_offset_step_deg",
-        "move_timeout_seconds",
-        "gripper_hold_seconds",
-        "retry_delay_seconds",
-        "hand_approach_height_mm",
-    )
-    for key in positive_keys:
-        value = float(demo[key])
-        if not math.isfinite(value) or value <= 0:
-            raise DemoError(f"demo.{key} must be positive")
-    if not float(demo["grip_close_mm"]) < float(demo["minimum_held_grip_mm"]) < float(demo["grip_open_mm"]):
-        raise DemoError("demo.minimum_held_grip_mm must lie between the close and open gripper commands")
-    forward_lean = float(demo["forward_lean_vertical_threshold"])
-    if not 0 < forward_lean <= 1:
-        raise DemoError("demo.forward_lean_vertical_threshold must be above 0 and at most 1")
-    demo["forward_lean_vertical_threshold"] = forward_lean
-    speed = int(demo["motion_speed_percent"])
-    if speed != float(demo["motion_speed_percent"]) or speed > 100:
-        raise DemoError("demo.motion_speed_percent must be an integer from 1 to 100")
-    demo["motion_speed_percent"] = speed
-    pick_speed = int(demo["pick_motion_speed_percent"])
-    if pick_speed != float(demo["pick_motion_speed_percent"]) or pick_speed > 100:
-        raise DemoError(
-            "demo.pick_motion_speed_percent must be an integer from 1 to 100"
-        )
-    demo["pick_motion_speed_percent"] = pick_speed
-    if float(demo["pregrasp_height_mm"]) >= float(demo["approach_height_mm"]):
-        raise DemoError(
-            "demo.pregrasp_height_mm must be below demo.approach_height_mm"
-        )
-    if float(demo["minimum_pregrasp_height_mm"]) > float(
-        demo["pregrasp_height_mm"]
-    ):
-        raise DemoError(
-            "demo.minimum_pregrasp_height_mm must not exceed "
-            "demo.pregrasp_height_mm"
-        )
-    if float(demo["pregrasp_height_step_mm"]) > (
-        float(demo["pregrasp_height_mm"])
-        - float(demo["minimum_pregrasp_height_mm"])
-    ):
-        raise DemoError(
-            "demo.pregrasp_height_step_mm must not exceed the configured "
-            "pre-grasp height range"
-        )
-    if float(demo["approach_inward_step_mm"]) > float(
-        demo["maximum_approach_inward_offset_mm"]
-    ):
-        raise DemoError(
-            "demo.approach_inward_step_mm must not exceed "
-            "demo.maximum_approach_inward_offset_mm"
-        )
-    if float(demo["grasp_yaw_offset_step_deg"]) > float(
-        demo["maximum_grasp_yaw_offset_deg"]
-    ):
-        raise DemoError(
-            "demo.grasp_yaw_offset_step_deg must not exceed "
-            "demo.maximum_grasp_yaw_offset_deg"
-        )
-    confidence = float(demo["detection_confidence_threshold"])
-    if not 0 < confidence < 1:
-        raise DemoError("demo detection confidence must be between zero and one")
-    demo["target_workspace_min_mm"] = target_min
-    demo["target_workspace_max_mm"] = target_max
-    demo["hand_workspace_min_mm"] = target_min.copy()
-    demo["hand_workspace_max_mm"] = target_max.copy()
-    return demo
 
 
 def load_scan_poses(path: Path) -> list[dict[str, Any]]:
@@ -647,121 +538,6 @@ def measured_start_joints(
     return np.clip(current, limits[:, 0], limits[:, 1])
 
 
-def plan_pickup(
-    target_base_mm: np.ndarray,
-    start_joints: np.ndarray,
-    return_joints: np.ndarray,
-    grasp_rpy: np.ndarray,
-    grasp_tip_z_mm: float,
-    approach_height_mm: float,
-    pregrasp_height_mm: float = 50.0,
-    minimum_pregrasp_height_mm: float = 30.0,
-    pregrasp_height_step_mm: float = 5.0,
-    maximum_inward_offset_mm: float = 120.0,
-    inward_step_mm: float = 20.0,
-) -> list[tuple[str, np.ndarray]]:
-    """Plan pickup, lift, and return using a direct or adaptive inward approach."""
-    target = finite_vector(target_base_mm, 3, "target base point")
-    grasp_rotation = euler_to_rot(grasp_rpy)
-    grasp_tip = np.array([target[0], target[1], grasp_tip_z_mm])
-    approach_tip = grasp_tip + [0.0, 0.0, approach_height_mm]
-    try:
-        q_approach = solve_waypoint(
-            "pick approach",
-            flange_for_tip(approach_tip, grasp_rotation),
-            grasp_rotation,
-            start_joints,
-        )
-        q_grasp = solve_waypoint(
-            "grasp",
-            flange_for_tip(grasp_tip, grasp_rotation),
-            grasp_rotation,
-            q_approach,
-        )
-        # Check the whole direct route here so a failure falls through to the
-        # adaptive search, other orientations, and other candies.
-        validate_joint_path_safety(
-            "direct pick approach",
-            [
-                np.asarray(start_joints, dtype=np.float64), q_approach, q_grasp, q_approach,
-                np.asarray(return_joints, dtype=np.float64),
-            ],
-        )
-        return [
-            ("pick approach", q_approach),
-            ("grasp", q_grasp),
-            ("lift", q_approach.copy()),
-            ("scan 1", np.asarray(return_joints, dtype=np.float64).copy()),
-        ]
-    except DemoError as direct_error:
-        radial_distance = float(np.linalg.norm(target[:2]))
-        if radial_distance <= 1e-6:
-            raise direct_error
-        inward_direction = target[:2] / radial_distance
-        last_error: DemoError = direct_error
-        pregrasp_heights = np.arange(
-            pregrasp_height_mm,
-            minimum_pregrasp_height_mm - pregrasp_height_step_mm * 0.5,
-            -pregrasp_height_step_mm,
-        )
-        offsets = np.arange(
-            inward_step_mm,
-            maximum_inward_offset_mm + inward_step_mm * 0.5,
-            inward_step_mm,
-        )
-        for pregrasp_height in pregrasp_heights:
-            pregrasp_tip = grasp_tip + [0.0, 0.0, pregrasp_height]
-            for inward_offset in offsets:
-                transit_tip = approach_tip.copy()
-                transit_tip[:2] -= inward_direction * inward_offset
-                try:
-                    q_transit = solve_waypoint(
-                        "pick transit",
-                        flange_for_tip(transit_tip, grasp_rotation),
-                        grasp_rotation,
-                        start_joints,
-                    )
-                    q_pregrasp = solve_waypoint(
-                        "pick approach",
-                        flange_for_tip(pregrasp_tip, grasp_rotation),
-                        grasp_rotation,
-                        q_transit,
-                    )
-                    q_grasp = solve_waypoint(
-                        "grasp",
-                        flange_for_tip(grasp_tip, grasp_rotation),
-                        grasp_rotation,
-                        q_pregrasp,
-                    )
-                    validate_joint_path_safety(
-                        "adaptive pick approach",
-                        [
-                            np.asarray(start_joints, dtype=np.float64),
-                            q_transit,
-                            q_pregrasp,
-                            q_grasp,
-                            q_pregrasp,
-                            q_transit,
-                            np.asarray(return_joints, dtype=np.float64),
-                        ],
-                    )
-                except DemoError as exc:
-                    last_error = exc
-                    continue
-                return [
-                    ("pick transit", q_transit),
-                    ("pick approach", q_pregrasp),
-                    ("grasp", q_grasp),
-                    ("lift", q_pregrasp.copy()),
-                    ("lift transit", q_transit.copy()),
-                    ("scan 1", np.asarray(return_joints, dtype=np.float64).copy()),
-                ]
-        raise DemoError(
-            f"{direct_error}; adaptive inward/pre-grasp search also failed: "
-            f"{last_error}"
-        )
-
-
 def align_grasp_rpy_to_axis(
     nominal_rpy_deg: np.ndarray,
     long_axis_base_unit_xy: np.ndarray,
@@ -797,32 +573,6 @@ def equivalent_grasp_rpys(
     flipped = primary.copy()
     flipped[2] = (float(primary[2]) + 360.0) % 360.0 - 180.0
     return [primary, flipped]
-
-
-def grasp_rpy_candidates(
-    nominal_rpy_deg: np.ndarray,
-    long_axis_base_unit_xy: np.ndarray,
-    maximum_yaw_offset_deg: float,
-    yaw_offset_step_deg: float,
-) -> list[np.ndarray]:
-    """Return exact then progressively offset candy-aligned grasp orientations."""
-    exact = equivalent_grasp_rpys(
-        nominal_rpy_deg,
-        long_axis_base_unit_xy,
-    )
-    candidates = [orientation.copy() for orientation in exact]
-    offsets = np.arange(
-        yaw_offset_step_deg,
-        maximum_yaw_offset_deg + yaw_offset_step_deg * 0.5,
-        yaw_offset_step_deg,
-    )
-    for offset in offsets:
-        for signed_offset in (-offset, offset):
-            for orientation in exact:
-                candidate = orientation.copy()
-                candidate[2] += signed_offset
-                candidates.append(candidate)
-    return candidates
 
 
 def parse_grasp_offset(text: str) -> np.ndarray | None:
@@ -878,184 +628,6 @@ def hold_for_operator_input(
     return answer["value"]
 
 
-def record_grasp_offset(
-    offset: np.ndarray, target: dict, jaw_point: np.ndarray, jaw_axis_xy: np.ndarray,
-    demo: dict, path: Path | None = None,
-) -> np.ndarray:
-    """Log one measured candy-minus-jaw offset and print the suggested XY correction.
-
-    The suggestion is the correction in effect plus the mean of this run's
-    offsets; it is appended to a JSON-lines file (GRASP_OFFSET_LOG by default).
-    """
-    path = GRASP_OFFSET_LOG if path is None else path
-    correction = np.asarray(demo["candy_xy_correction_mm"], dtype=np.float64)
-    across = float(offset @ jaw_axis_xy)
-    along = float(offset @ np.array([-jaw_axis_xy[1], jaw_axis_xy[0]]))
-    offsets = demo.setdefault("recorded_grasp_offsets_mm", [])
-    offsets.append(np.asarray(offset, dtype=np.float64))
-    suggested = correction + np.mean(offsets, axis=0)
-    print(
-        f"  Recorded candy offset {np.round(offset, 1).tolist()}mm: {across:+.1f}mm along the jaw "
-        f"closing direction, {along:+.1f}mm along the candy",
-        flush=True,
-    )
-    print(
-        f"  GRASP OFFSET SUMMARY: {len(offsets)} reading(s), mean "
-        f"{np.round(np.mean(offsets, axis=0), 1).tolist()}mm -> suggested "
-        f"\"candy_xy_correction_mm\": {np.round(suggested, 1).tolist()} "
-        f"(current {np.round(correction, 1).tolist()})",
-        flush=True,
-    )
-    record = {
-        "recorded_at": datetime.now(timezone.utc).isoformat(),
-        "detector": demo.get("detector"),
-        "candy_base_point_mm": target.get("base_point_mm"),
-        "uncorrected_base_point_mm": target.get("uncorrected_base_point_mm", target.get("base_point_mm")),
-        "candy_axis_yaw_deg": target.get("long_axis_base_yaw_deg"),
-        "score": target.get("score"),
-        "jaw_point_mm": np.round(jaw_point, 3).tolist(),
-        "jaw_axis_xy": np.round(jaw_axis_xy, 4).tolist(),
-        "offset_mm": np.round(offset, 3).tolist(),
-        "across_jaw_mm": round(across, 3),
-        "along_candy_mm": round(along, 3),
-        "correction_in_effect_mm": np.round(correction, 3).tolist(),
-    }
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-    except OSError as exc:
-        print(f"  WARNING: could not append grasp offset to {path}: {exc}", flush=True)
-    return suggested
-
-
-def pause_for_grasp_offset(
-    arm: Piper, grasp_joints: np.ndarray, open_mm: float, target: dict, demo: dict,
-) -> np.ndarray | None:
-    """Hold the open-jaw grasp pose and ask the operator where the candy really is."""
-    measured = finite_vector(arm.joints_deg(), 6, "measured grasp joints")
-    jaw_point = tip_position(measured)
-    jaw_axis = fk(grasp_joints)[:2, 1]
-    jaw_axis = jaw_axis / max(float(np.linalg.norm(jaw_axis)), 1e-9)
-    candy = target.get("base_point_mm")
-    print(
-        "\nPAUSED AT GRASP: jaws open and arm holding position (Ctrl+C stops the demo).\n"
-        f"  candy estimate {np.round(candy, 1).tolist() if candy is not None else '?'}mm, candy axis yaw "
-        f"{float(target.get('long_axis_base_yaw_deg', math.nan)):.1f}deg, "
-        f"jaw point {np.round(jaw_point[:2], 1).tolist()}mm\n"
-        "  Measure the candy centre relative to the midpoint between the open fingertips,\n"
-        "  in robot base directions:\n"
-        "    +X = straight out from the robot base (toward the far edge), -X = back toward the base\n"
-        "    +Y = to your left when standing behind the robot facing +X, -Y = to your right",
-        flush=True,
-    )
-    offset = hold_for_operator_input(
-        arm, grasp_joints, open_mm,
-        "  Candy offset 'dx dy' in mm (e.g. '0 -30'), or Enter to grip without recording: ",
-        parse_grasp_offset,
-    )
-    if offset is None:
-        print("  No offset recorded", flush=True)
-        return None
-    record_grasp_offset(offset, target, jaw_point, jaw_axis, demo)
-    return offset
-
-
-def execute_pickup(
-    arm: Piper,
-    plan: list[tuple[str, np.ndarray]],
-    demo: dict,
-    carry: CandyCarry | None = None,
-    target: dict | None = None,
-) -> float:
-    """Execute approach and grasp, then verify an object is held after lifting.
-
-    When a carry tracker is supplied, mark the candy as held once the gripper
-    closes and record each reached lift waypoint for recovery. With
-    pause_before_grip set, hold the open-jaw grasp pose for an operator offset
-    reading before closing.
-    """
-    waypoints = dict(plan)
-    timeout = float(demo["move_timeout_seconds"])
-    open_mm = float(demo["grip_open_mm"])
-    close_mm = float(demo["grip_close_mm"])
-    hold_seconds = float(demo["gripper_hold_seconds"])
-    speed = int(
-        demo.get("pick_motion_speed_percent", demo["motion_speed_percent"])
-    )
-    verbose = bool(demo.get("verbose", False))
-    if "pick transit" in waypoints:
-        move_robot(
-            arm,
-            "pick transit",
-            waypoints["pick transit"],
-            open_mm,
-            timeout,
-            speed,
-            verbose=verbose,
-        )
-    move_robot(
-        arm, "pick approach", waypoints["pick approach"], open_mm, timeout, speed,
-        verbose=verbose,
-    )
-    move_robot(arm, "grasp", waypoints["grasp"], open_mm, timeout, speed, verbose=verbose)
-    if verbose:
-        measured = finite_vector(arm.joints_deg(), 6, "measured grasp joints")
-        planned_tip, measured_tip = tip_position(waypoints["grasp"]), tip_position(measured)
-        print(
-            f"GRASP ARRIVAL: planned tip {np.round(planned_tip, 1).tolist()}mm, "
-            f"measured tip {np.round(measured_tip, 1).tolist()}mm "
-            f"(difference {np.round(measured_tip - planned_tip, 1).tolist()}mm, "
-            f"max joint error {np.max(np.abs(measured - waypoints['grasp'])):.2f}deg)",
-            flush=True,
-        )
-    if demo.get("pause_before_grip"):
-        pause_for_grasp_offset(arm, waypoints["grasp"], open_mm, target or {}, demo)
-    if verbose:
-        print("motion: close gripper")
-    hold_gripper(arm, waypoints["grasp"], close_mm, hold_seconds)
-    if carry is not None:
-        carry.gripped_at(waypoints["grasp"])
-    move_robot(arm, "lift", waypoints["lift"], close_mm, timeout, speed, verbose=verbose)
-    if carry is not None:
-        carry.reached("lift", waypoints["lift"])
-    if "lift transit" in waypoints:
-        move_robot(
-            arm,
-            "lift transit",
-            waypoints["lift transit"],
-            close_mm,
-            timeout,
-            speed,
-            verbose=verbose,
-        )
-        if carry is not None:
-            carry.reached("lift transit", waypoints["lift transit"])
-    held_width = float(arm.grip_mm())
-    minimum_held = float(demo["minimum_held_grip_mm"])
-    if not math.isfinite(held_width) or held_width < minimum_held:
-        if carry is not None:
-            carry.holding = False
-        print(
-            f"No candy in gripper: measured width {held_width:.1f}mm is below "
-            f"{minimum_held:.1f}mm; opening gripper and returning to scan",
-            flush=True,
-        )
-        missed_grasp_pose = waypoints.get("lift transit", waypoints["lift"])
-        hold_gripper(arm, missed_grasp_pose, open_mm, hold_seconds)
-        move_robot(
-            arm,
-            "return to scan pose after missed grasp",
-            waypoints["scan 1"],
-            open_mm,
-            timeout,
-            speed,
-            verbose=verbose,
-        )
-        raise GraspVerificationError(held_width, minimum_held)
-    return held_width
-
-
 def plan_hand_delivery(
     palm_base_mm: np.ndarray,
     start_joints: np.ndarray,
@@ -1089,706 +661,6 @@ def plan_hand_delivery(
         ("hand retreat", q_approach.copy()),
         ("scan 1", np.asarray(return_joints, dtype=np.float64).copy()),
     ]
-
-
-def transform_object_candidate(
-    candidate: dict[str, Any],
-    scan_index: int,
-    robot_transform: np.ndarray,
-    camera_to_gripper: np.ndarray,
-    demo: dict,
-) -> dict[str, Any]:
-    """Transform one localized candy point and long axis into the base frame."""
-    transformed = {**candidate, "slot": scan_index}
-    if candidate.get("status") != "detected":
-        return transformed
-    try:
-        camera_point = finite_vector(
-            candidate.get("camera_point_mm"),
-            3,
-            f"scan {scan_index} camera point",
-        )
-        base_point = transform_camera_point_to_base(
-            camera_point,
-            robot_transform,
-            camera_to_gripper,
-            verbose=demo.get("verbose", False),
-            label="candy scan",
-        )
-        camera_axis = finite_vector(
-            candidate.get("long_axis_camera_unit"),
-            3,
-            f"scan {scan_index} Starburst long axis",
-        )
-        base_axis = (
-            robot_transform[:3, :3]
-            @ camera_to_gripper[:3, :3]
-            @ camera_axis
-        )
-        base_axis_xy = base_axis[:2]
-        base_axis_xy_norm = float(np.linalg.norm(base_axis_xy))
-        if base_axis_xy_norm < 0.75:
-            raise DemoError(
-                "Starburst long axis is too steep to define a safe table yaw"
-            )
-        base_axis_xy /= base_axis_xy_norm
-        candy_z = float(base_point[2])
-        minimum_z, maximum_z = float(demo["candy_min_z_mm"]), float(demo["candy_max_z_mm"])
-        if not minimum_z <= candy_z <= maximum_z:
-            raise DemoError(
-                f"candy height Z {candy_z:.1f}mm is outside the plausible table range "
-                f"{minimum_z:.1f}..{maximum_z:.1f}mm (likely a bad depth reading)"
-            )
-        correction = np.asarray(demo["candy_xy_correction_mm"], dtype=np.float64)
-        if np.any(correction != 0):
-            transformed["uncorrected_base_point_mm"] = base_point.tolist()
-            base_point = base_point.copy()
-            base_point[:2] += correction
-            if demo.get("verbose"):
-                print(
-                    f"candy scan: applied candy XY correction "
-                    f"{np.round(correction, 3).tolist()}mm -> {np.round(base_point, 3).tolist()}mm",
-                    flush=True,
-                )
-        validate_target_workspace(
-            base_point,
-            demo["target_workspace_min_mm"],
-            demo["target_workspace_max_mm"],
-            check_z=False,
-        )
-        if demo.get("detector") == "opencv":
-            length_mm, width_mm = candy_size_mm(
-                candidate.get("long_axis_pixels"),
-                candidate.get("orientation_aspect_ratio", math.nan),
-                demo["camera_intrinsics"],
-                robot_transform @ camera_to_gripper,
-                float(base_point[2]),
-            )
-            transformed.update(length_mm=length_mm, width_mm=width_mm)
-            check_candy_size(length_mm, width_mm)
-        transformed.update(
-            {
-                "base_point_mm": base_point.tolist(),
-                "long_axis_base_unit_xy": base_axis_xy.tolist(),
-                "long_axis_base_yaw_deg": math.degrees(
-                    math.atan2(
-                        float(base_axis_xy[1]),
-                        float(base_axis_xy[0]),
-                    )
-                ),
-            }
-        )
-    except (DemoError, HandEyeError, ValueError) as exc:
-        transformed["status"] = "rejected"
-        transformed["error"] = str(exc)
-    return transformed
-
-
-def process_object_capture(
-    service_result: dict[str, Any],
-    index: int,
-    confidence: float,
-    client: VisionClient,
-    before_pose: np.ndarray,
-    after_pose: np.ndarray,
-    before_transform: np.ndarray,
-    after_transform: np.ndarray,
-    camera_to_gripper: np.ndarray,
-    demo: dict,
-) -> dict[str, Any]:
-    """Transform and report one object-service result using shared telemetry."""
-    position_deviation = float(
-        np.linalg.norm(after_pose[:3] - before_pose[:3])
-    )
-    rotation_deviation = rotation_error_degrees(
-        before_transform, after_transform
-    )
-    result = {
-        **service_result,
-        "robot_pose_before_mm_deg": before_pose.tolist(),
-        "robot_pose_after_mm_deg": after_pose.tolist(),
-        "robot_position_deviation_mm": position_deviation,
-        "robot_rotation_deviation_deg": rotation_deviation,
-    }
-    source_candidates = service_result.get("candidates")
-    if not isinstance(source_candidates, list):
-        source_candidates = [service_result]
-    robot_transform = average_transforms([before_transform, after_transform])
-    object_candidates = [
-        transform_object_candidate(
-            candidate,
-            index,
-            robot_transform,
-            camera_to_gripper,
-            demo,
-        )
-        for candidate in source_candidates
-    ]
-    valid_candidates = sorted(
-        (
-            candidate
-            for candidate in object_candidates
-            if candidate.get("status") == "detected"
-        ),
-        key=lambda candidate: float(candidate["score"]),
-        reverse=True,
-    )
-    result["object_candidates"] = object_candidates
-    result["candidate_count"] = len(valid_candidates)
-    if valid_candidates:
-        result.update(valid_candidates[0])
-        size = (
-            f", size={result['length_mm']:.0f}x{result['width_mm']:.0f}mm"
-            if "length_mm" in result else ""
-        )
-        print(
-            f"CANDY SCAN: detected {len(valid_candidates)} candy(ies), "
-            f"best score={float(result['score']):.3f}, "
-            f"camera={np.round(result['camera_point_mm'], 1).tolist()}mm{size}, "
-            f"snapshot={client.base_url}{result['snapshot_url']}"
-        )
-        if demo.get("verbose"):
-            for candidate in object_candidates:
-                if candidate.get("status") == "rejected":
-                    print(
-                        f"  rejected candy score={float(candidate.get('score', math.nan)):.3f}: "
-                        f"{candidate.get('error', 'candidate rejected')}",
-                        flush=True,
-                    )
-    else:
-        if object_candidates and service_result["status"] != "not_found":
-            result["status"] = "rejected"
-            result["error"] = "; ".join(
-                str(candidate.get("error", "candidate rejected"))
-                for candidate in object_candidates
-            )
-        reason = (
-            f": {result['error']}"
-            if result.get("error")
-            else ""
-        )
-        print(
-            f"CANDY SCAN: {result['status']} at "
-            f"confidence={confidence:.3f}{reason}, "
-            f"snapshot={client.base_url}{result['snapshot_url']}"
-        )
-    return result
-
-
-def capture_scan_pair(
-    arm: Piper,
-    object_client: VisionClient,
-    hand_client: HandClient | None,
-    scan: dict[str, Any],
-    hand_slot: int,
-    prompt: str,
-    confidence: float,
-    camera_to_gripper: np.ndarray,
-    demo: dict,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Capture candy and, when requested, a palm at one settled scan pose."""
-    pose_started_at = time.perf_counter()
-    scan_index = int(scan["index"])
-    move_started_at = time.perf_counter()
-    move_robot(
-        arm,
-        f"scan {scan_index}",
-        scan["joints_deg"],
-        float(demo["grip_open_mm"]),
-        float(demo["move_timeout_seconds"]),
-        int(demo["motion_speed_percent"]),
-        verbose=bool(demo.get("verbose", False)),
-    )
-    move_seconds = time.perf_counter() - move_started_at
-    settle_started_at = time.perf_counter()
-    time.sleep(float(demo["scan_settle_seconds"]))
-    settle_seconds = time.perf_counter() - settle_started_at
-    before_pose = arm.pose()
-    before_transform = piper_pose_to_transform(before_pose)
-    object_client.set_workspace_overlay(
-        before_transform @ camera_to_gripper,
-        demo["target_workspace_min_mm"],
-        demo["target_workspace_max_mm"],
-    )
-
-    def timed_call(call: Callable, *args: Any) -> tuple[Any, float]:
-        """Run one service request and return its result plus elapsed seconds."""
-        started_at = time.perf_counter()
-        result = call(*args)
-        return result, time.perf_counter() - started_at
-
-    inference_started_at = time.perf_counter()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        object_future = executor.submit(
-            timed_call,
-            object_client.capture,
-            scan_index,
-            prompt,
-            confidence,
-        )
-        hand_future = executor.submit(
-            timed_call,
-            hand_client.capture_hand,
-            hand_slot,
-        ) if hand_client is not None else None
-        object_service_result, object_seconds = object_future.result()
-        if hand_future is not None:
-            hand_service_result, hand_seconds = hand_future.result()
-        else:
-            hand_service_result, hand_seconds = None, 0.0
-    concurrent_inference_seconds = time.perf_counter() - inference_started_at
-    after_pose = arm.pose()
-    after_transform = piper_pose_to_transform(after_pose)
-    position_deviation = float(
-        np.linalg.norm(after_pose[:3] - before_pose[:3])
-    )
-    rotation_deviation = rotation_error_degrees(
-        before_transform,
-        after_transform,
-    )
-    if position_deviation > float(demo["maximum_scan_position_deviation_mm"]):
-        raise DemoError(
-            f"scan {scan_index} moved {position_deviation:.2f}mm "
-            "during concurrent inference"
-        )
-    if rotation_deviation > float(demo["maximum_scan_rotation_deviation_deg"]):
-        raise DemoError(
-            f"scan {scan_index} rotated {rotation_deviation:.2f}deg "
-            "during concurrent inference"
-        )
-
-    object_result = process_object_capture(
-        object_service_result,
-        scan_index,
-        confidence,
-        object_client,
-        before_pose,
-        after_pose,
-        before_transform,
-        after_transform,
-        camera_to_gripper,
-        demo,
-    )
-    hand_result = process_hand_capture(
-        hand_service_result,
-        scan_index,
-        hand_slot,
-        hand_client,
-        before_pose,
-        after_pose,
-        before_transform,
-        after_transform,
-        camera_to_gripper,
-        demo,
-    ) if hand_client is not None else {"status": "not_requested"}
-    timing = {
-        "move_seconds": move_seconds,
-        "settle_seconds": settle_seconds,
-        "object_inference_seconds": object_seconds,
-        "hand_inference_seconds": hand_seconds,
-        "concurrent_inference_seconds": concurrent_inference_seconds,
-        "total_pose_seconds": time.perf_counter() - pose_started_at,
-    }
-    object_result["scan_timing_seconds"] = timing
-    hand_result["scan_timing_seconds"] = timing
-    print(
-        f"SCAN TIMING: move={move_seconds:.2f}s, "
-        f"settle={settle_seconds:.2f}s, object={object_seconds:.2f}s, "
-        f"hand={hand_seconds:.2f}s, "
-        f"concurrent={concurrent_inference_seconds:.2f}s, "
-        f"total={timing['total_pose_seconds']:.2f}s"
-    )
-    return object_result, hand_result
-
-
-def capture_hand_at_current_pose(
-    arm: Piper,
-    client: HandClient,
-    overlay_client: VisionClient,
-    scan: dict[str, Any],
-    slot: int,
-    camera_to_gripper: np.ndarray,
-    demo: dict,
-) -> dict[str, Any]:
-    """Capture a palm at the current pose, rejecting arm movement during inference."""
-    scan_index = int(scan["index"])
-    require_healthy(arm, f"before open-palm scan {scan_index}")
-    before_pose = arm.pose()
-    before_transform = piper_pose_to_transform(before_pose)
-    overlay_client.set_workspace_overlay(
-        before_transform @ camera_to_gripper,
-        demo["target_workspace_min_mm"],
-        demo["target_workspace_max_mm"],
-    )
-    service_result = client.capture_hand(slot)
-    after_pose = arm.pose()
-    after_transform = piper_pose_to_transform(after_pose)
-    position_deviation = float(np.linalg.norm(after_pose[:3] - before_pose[:3]))
-    rotation_deviation = rotation_error_degrees(
-        before_transform,
-        after_transform,
-    )
-    if position_deviation > float(demo["maximum_scan_position_deviation_mm"]):
-        raise DemoError(
-            f"hand scan {scan_index} moved {position_deviation:.2f}mm "
-            "during inference"
-        )
-    if rotation_deviation > float(demo["maximum_scan_rotation_deviation_deg"]):
-        raise DemoError(
-            f"hand scan {scan_index} rotated {rotation_deviation:.2f}deg "
-            "during inference"
-        )
-    return process_hand_capture(
-        service_result,
-        scan_index,
-        slot,
-        client,
-        before_pose,
-        after_pose,
-        before_transform,
-        after_transform,
-        camera_to_gripper,
-        demo,
-    )
-
-
-def process_hand_capture(
-    service_result: dict[str, Any],
-    scan_index: int,
-    slot: int,
-    client: HandClient,
-    before_pose: np.ndarray,
-    after_pose: np.ndarray,
-    before_transform: np.ndarray,
-    after_transform: np.ndarray,
-    camera_to_gripper: np.ndarray,
-    demo: dict,
-) -> dict[str, Any]:
-    """Transform and report one hand-service result using shared telemetry."""
-    position_deviation = float(
-        np.linalg.norm(after_pose[:3] - before_pose[:3])
-    )
-    rotation_deviation = rotation_error_degrees(
-        before_transform, after_transform
-    )
-    result = {
-        **service_result,
-        "scan_pose_index": scan_index,
-        "robot_pose_before_mm_deg": before_pose.tolist(),
-        "robot_pose_after_mm_deg": after_pose.tolist(),
-        "robot_position_deviation_mm": position_deviation,
-        "robot_rotation_deviation_deg": rotation_deviation,
-    }
-    if service_result["status"] == "detected":
-        camera_point = finite_vector(
-            service_result.get("camera_point_mm"),
-            3,
-            f"hand scan {scan_index} camera point",
-        )
-        robot_transform = average_transforms(
-            [before_transform, after_transform]
-        )
-        base_point = transform_camera_point_to_base(
-            camera_point,
-            robot_transform,
-            camera_to_gripper,
-            verbose=demo.get("verbose", False),
-            label="palm scan",
-        )
-        result["base_point_mm"] = base_point.tolist()
-        try:
-            validate_target_workspace(
-                base_point,
-                demo["hand_workspace_min_mm"],
-                demo["hand_workspace_max_mm"],
-            )
-        except DemoError as exc:
-            result["status"] = "rejected"
-            result["error"] = str(exc)
-            print(
-                f"OPEN PALM SCAN: rejected "
-                f"base={np.round(base_point, 1).tolist()}mm: {exc}"
-            )
-            return result
-        print(
-            f"OPEN PALM SCAN: detected "
-            f"{service_result.get('handedness', 'unknown')} "
-            f"score={float(service_result['score']):.3f}, "
-            f"base={np.round(base_point, 1).tolist()}mm, "
-            f"snapshot={client.base_url}{service_result['snapshot_url']}"
-        )
-    else:
-        print(
-            f"OPEN PALM SCAN: {service_result['status']}, "
-            f"snapshot={client.base_url}{service_result.get('snapshot_url', '')}"
-        )
-    return result
-
-
-def choose_target(
-    captures: list[dict[str, Any]],
-    maximum_difference: float,
-    label: str = "requested object",
-    maximum_orientation_difference_deg: float = 180.0,
-    comparison_axes: tuple[int, ...] = (0, 1, 2),
-) -> dict:
-    """Select the best detection and report cross-view position/orientation agreement."""
-    detections = [item for item in captures if item["status"] == "detected"]
-    if not detections:
-        raise DemoError(f"no valid {label} detection was found in any scan")
-    detections.sort(key=lambda item: float(item["score"]), reverse=True)
-    points = np.asarray([item["base_point_mm"] for item in detections])
-    comparison_points = points[:, list(comparison_axes)]
-    if len(points) > 1:
-        maximum_pairwise = max(
-            float(
-                np.linalg.norm(
-                    comparison_points[left] - comparison_points[right]
-                )
-            )
-            for left in range(len(points))
-            for right in range(left + 1, len(points))
-        )
-        consensus = np.median(points, axis=0)
-    else:
-        maximum_pairwise = 0.0
-        consensus = points[0]
-    orientation_yaws = [
-        float(item["long_axis_base_yaw_deg"])
-        for item in detections
-        if "long_axis_base_yaw_deg" in item
-    ]
-    maximum_orientation_difference = 0.0
-    if len(orientation_yaws) > 1:
-        maximum_orientation_difference = max(
-            abs((orientation_yaws[left] - orientation_yaws[right] + 90.0) % 180.0 - 90.0)
-            for left in range(len(orientation_yaws))
-            for right in range(left + 1, len(orientation_yaws))
-        )
-    orientation_agreement = (
-        maximum_orientation_difference <= maximum_orientation_difference_deg
-    )
-    best = detections[0]
-    return {
-        **best,
-        "base_point_mm": list(best["base_point_mm"]),
-        "consensus_base_point_mm": consensus.tolist(),
-        "detected_view_count": len(detections),
-        "maximum_cross_view_difference_mm": maximum_pairwise,
-        "cross_view_agreement_limit_mm": maximum_difference,
-        "cross_view_comparison_axes": [
-            ("x", "y", "z")[axis] for axis in comparison_axes
-        ],
-        "maximum_cross_view_orientation_difference_deg": (
-            maximum_orientation_difference
-        ),
-        "cross_view_orientation_agreement_limit_deg": (
-            maximum_orientation_difference_deg
-        ),
-        "cross_view_orientation_agreement_passed": orientation_agreement,
-        "cross_view_agreement_passed": (
-            maximum_pairwise <= maximum_difference and orientation_agreement
-        ),
-        "selected_from_slot": int(best["slot"]),
-    }
-
-
-def distinct_object_targets(
-    captures: list[dict[str, Any]],
-    maximum_difference: float,
-    maximum_orientation_difference_deg: float,
-) -> list[dict[str, Any]]:
-    """Cluster multi-view detections into distinct candies, nearest base first."""
-    detections: list[dict[str, Any]] = []
-    for capture in captures:
-        candidates = capture.get("object_candidates")
-        if not isinstance(candidates, list):
-            candidates = [capture]
-        detections.extend(
-            candidate
-            for candidate in candidates
-            if candidate.get("status") == "detected"
-        )
-    clusters: list[list[dict[str, Any]]] = []
-    for detection in sorted(
-        detections,
-        key=lambda item: float(item["score"]),
-        reverse=True,
-    ):
-        point = np.asarray(detection["base_point_mm"], dtype=np.float64)
-        choices = []
-        for cluster in clusters:
-            if any(item["slot"] == detection["slot"] for item in cluster):
-                continue
-            consensus = np.median(
-                np.asarray([item["base_point_mm"] for item in cluster]),
-                axis=0,
-            )
-            distance = float(np.linalg.norm(point - consensus))
-            if distance <= maximum_difference:
-                choices.append((distance, cluster))
-        if choices:
-            min(choices, key=lambda item: item[0])[1].append(detection)
-        else:
-            clusters.append([detection])
-
-    targets = []
-    for cluster in clusters:
-        target = choose_target(
-            cluster,
-            maximum_difference,
-            "Starburst candy",
-            maximum_orientation_difference_deg,
-        )
-        target["base_distance_mm"] = float(
-            np.linalg.norm(
-                np.asarray(
-                    target["consensus_base_point_mm"][:2],
-                    dtype=np.float64,
-                )
-            )
-        )
-        targets.append(target)
-    return sorted(targets, key=lambda target: target["base_distance_mm"])
-
-
-def select_reachable_object_target(
-    targets: list[dict[str, Any]],
-    start_joints: np.ndarray,
-    return_joints: np.ndarray,
-    nominal_grasp_rpy: np.ndarray,
-    grasp_tip_z_mm: float,
-    approach_height_mm: float,
-    pregrasp_height_mm: float = 50.0,
-    minimum_pregrasp_height_mm: float = 30.0,
-    pregrasp_height_step_mm: float = 5.0,
-    maximum_inward_offset_mm: float = 120.0,
-    inward_step_mm: float = 20.0,
-    maximum_grasp_yaw_offset_deg: float = 20.0,
-    grasp_yaw_offset_step_deg: float = 5.0,
-) -> tuple[
-    dict[str, Any],
-    np.ndarray,
-    list[tuple[str, np.ndarray]],
-    list[dict[str, Any]],
-] | None:
-    """Choose the nearest cross-view-consistent candy with a safe IK plan."""
-    rejections: list[dict[str, Any]] = []
-    for target in targets:
-        if not target["cross_view_agreement_passed"]:
-            target["planning_rejection_reason"] = (
-                "cross-view position or orientation disagreement"
-            )
-            rejections.append(
-                {
-                    "base_point_mm": target["base_point_mm"],
-                    "base_distance_mm": target["base_distance_mm"],
-                    "reason": target["planning_rejection_reason"],
-                }
-            )
-            continue
-        try:
-            orientation_candidates = grasp_rpy_candidates(
-                nominal_grasp_rpy,
-                np.asarray(target["long_axis_base_unit_xy"]),
-                maximum_grasp_yaw_offset_deg,
-                grasp_yaw_offset_step_deg,
-            )
-        except DemoError as exc:
-            target["planning_rejection_reason"] = str(exc)
-            rejections.append(
-                {
-                    "base_point_mm": target["base_point_mm"],
-                    "base_distance_mm": target["base_distance_mm"],
-                    "reason": target["planning_rejection_reason"],
-                }
-            )
-            continue
-        orientation_errors: list[str] = []
-        for aligned_grasp_rpy in orientation_candidates:
-            try:
-                plan = plan_pickup(
-                    np.asarray(target["base_point_mm"]),
-                    start_joints,
-                    return_joints,
-                    aligned_grasp_rpy,
-                    grasp_tip_z_mm,
-                    approach_height_mm,
-                    pregrasp_height_mm,
-                    minimum_pregrasp_height_mm,
-                    pregrasp_height_step_mm,
-                    maximum_inward_offset_mm,
-                    inward_step_mm,
-                )
-            except DemoError as exc:
-                orientation_errors.append(
-                    f"yaw {float(aligned_grasp_rpy[2]):.1f}deg: {exc}"
-                )
-                continue
-            return target, aligned_grasp_rpy, plan, rejections
-        target["planning_rejection_reason"] = (
-            "all bounded candy-aligned grasp orientations failed: "
-            + " | ".join(orientation_errors)
-        )
-        rejections.append(
-            {
-                "base_point_mm": target["base_point_mm"],
-                "base_distance_mm": target["base_distance_mm"],
-                "reason": target["planning_rejection_reason"],
-            }
-        )
-    return None
-
-
-def parse_args() -> argparse.Namespace:
-    """Parse file/service locations, cycle limits, and explicit motion permissions."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--calibration-dir", type=Path, default=CALIBRATION_DIR / "calibration")
-    parser.add_argument("--scan-poses", type=Path, default=DEFAULT_SCAN_POSES)
-    parser.add_argument("--vision-url", default=DEFAULT_VISION_URL)
-    parser.add_argument("--detection-url", default=DEFAULT_DETECTION_URL)
-    parser.add_argument(
-        "--detector", choices=("yolo", "opencv"), default="yolo",
-        help="candy detector: YOLO detection service (default) or local CPU OpenCV colour detector",
-    )
-    parser.add_argument("--hand-url", default="http://127.0.0.1:8095")
-    parser.add_argument("--can-interface", default="can_piper")
-    parser.add_argument(
-        "--check-only", action="store_true",
-        help="preflight only (restarts k3s if its address is stale); never connect to CAN",
-    )
-    parser.add_argument(
-        "--verbose", action="store_true",
-        help="print camera, gripper, and robot-base XYZ and transformation matrices",
-    )
-    parser.add_argument(
-        "--pause-before-grip", action="store_true",
-        help="hold each grasp pose with the jaws open and ask for the measured candy offset "
-        "before closing; prints the suggested candy_xy_correction_mm",
-    )
-    parser.add_argument(
-        "--grasp-tilt-deg", type=float, default=None,
-        help="test override for the grasp tilt from vertical (0-30 degrees; 0 = vertical) "
-        "instead of DEMO_SETTINGS grasp_rpy_deg pitch",
-    )
-    parser.add_argument(
-        "--pick-candy-only", action="store_true",
-        help="pick and place at a random reachable tabletop location inside the workspace; "
-        "no hand service required; defaults to one cycle",
-    )
-    parser.add_argument(
-        "--allow-motion", action="store_true",
-        help="connect to the arm and run the pickup and hand-delivery loop; "
-        "without it only the preflight runs",
-    )
-    parser.add_argument(
-        "--max-cycles", type=int, default=None,
-        help="default: one for --pick-candy-only, otherwise continuous; zero loops until Ctrl+C",
-    )
-    args = parser.parse_args()
-    if args.max_cycles is None:
-        args.max_cycles = 1 if args.pick_candy_only else 0
-    return args
 
 
 def ensure_k3s_address() -> None:
@@ -1834,50 +706,6 @@ def ensure_k3s_address() -> None:
         print(f"[WARN] k3s address {status}", flush=True)
 
 
-def check_services(
-    camera: HttpClient, objects: VisionClient, hands: HandClient | None, camera_serial: str
-) -> None:
-    """Check all three services independently and report their availability.
-
-    Require calibrated camera capabilities and the calibration's camera serial,
-    the selected candy detector (loaded CUDA YOLO model or valid local OpenCV
-    settings), and a hand stream sourced from the same camera URL.
-    Raise after reporting failures; print overall success only if all checks pass.
-    """
-    failures = []
-    local_opencv = isinstance(objects.detector, OpenCVCandyDetector)
-    detector_label = "OpenCV candy detection" if local_opencv else "YOLO / Foundry detection"
-    detector_ready = " (local CPU colour detector)" if local_opencv else " (CUDA model loaded)"
-    checks = [
-        ("OpenCV camera", camera.health),
-        (detector_label, objects.detector.check),
-    ]
-    if hands is not None:
-        checks.append(("MediaPipe hand service", hands.health))
-    for label, check in checks:
-        try:
-            result = check()
-            if label == "OpenCV camera":
-                if (
-                    result.get("camera_serial") != camera_serial
-                    or result.get("service") != "camera"
-                    or result.get("preview_only") is not False
-                    or result.get("depth_calibrated") is not True
-                    or not {"localize", "deproject"}.issubset(result.get("capabilities") or [])
-                ):
-                    raise DemoError("requires matching D435 and calibrated depth; preview-only is not usable")
-            elif label == "MediaPipe hand service":
-                if result.get("source_url") != camera.base_url + "/stream.mjpg":
-                    raise DemoError("hand stream must come from the configured OpenCV camera URL")
-            print(f"[OK] {label}" + (f": {result}" if result else detector_ready), flush=True)
-        except RuntimeError as exc:
-            failures.append(f"{label}: {exc}")
-            print(f"[FAILED] {label}: {exc}", flush=True)
-    if failures:
-        raise DemoError("required services unavailable: " + "; ".join(failures))
-    print("[OK] All required services are running and available.", flush=True)
-
-
 def load_hand_eye(calibration_dir: Path) -> dict:
     """Load accepted hand-eye results with a nonempty serial for camera health checks."""
     path = calibration_dir / "hand_eye.json"
@@ -1889,65 +717,6 @@ def load_hand_eye(calibration_dir: Path) -> dict:
     return document
 
 
-def load_setup(
-    args: argparse.Namespace, hand_eye: dict | None = None
-) -> tuple[dict, np.ndarray, list[dict]]:
-    """Validate motion settings, calibration acceptance, and taught scan poses.
-
-    Reuse the preloaded hand-eye result when supplied and require the depth
-    verification serial to match. Return settings, the camera-to-gripper
-    transform, and scan poses without connecting to or moving the arm.
-    """
-    settings = validate_demo_settings(DEMO_SETTINGS)
-    settings["verbose"] = args.verbose
-    settings["pause_before_grip"] = bool(getattr(args, "pause_before_grip", False))
-    settings["pick_candy_only"] = bool(getattr(args, "pick_candy_only", False))
-    for key in ("grasp_rpy_deg", "hand_delivery_rpy_deg"):
-        settings[key] = finite_vector(settings[key], 3, key)
-    tilt_override = getattr(args, "grasp_tilt_deg", None)
-    if tilt_override is not None:
-        tilt_override = float(tilt_override)
-        if not math.isfinite(tilt_override) or not 0.0 <= tilt_override <= MAXIMUM_GRASP_TILT_OVERRIDE_DEG:
-            raise DemoError(
-                f"--grasp-tilt-deg must be between 0 and {MAXIMUM_GRASP_TILT_OVERRIDE_DEG:.0f} degrees"
-            )
-        settings["grasp_rpy_deg"] = settings["grasp_rpy_deg"].copy()
-        settings["grasp_rpy_deg"][1] = tilt_override
-        print(
-            f"[TEST] Grasp tilt overridden to {tilt_override:.1f}deg from vertical "
-            f"(DEMO_SETTINGS uses {float(DEMO_SETTINGS['grasp_rpy_deg'][1]):.1f}deg)",
-            flush=True,
-        )
-    for key in ("grasp_tip_z_mm", "grip_open_mm", "grip_close_mm"):
-        if not math.isfinite(float(settings[key])):
-            raise DemoError(f"demo.{key} must be finite")
-    if not 0 <= float(settings["grip_close_mm"]) < float(settings["grip_open_mm"]) <= PIPER_C.GRIP_OPEN_MM:
-        raise DemoError("gripper commands must be ordered within the physical gripper range")
-    if hand_eye is None:
-        hand_eye = load_hand_eye(args.calibration_dir)
-    camera_serial = hand_eye["camera"]["serial"]
-    for name in ("validation.json", "depth_correction.json", "depth_verification.json"):
-        path = args.calibration_dir / name
-        document = load_json(path)
-        require_quality(document, name, path)
-        if name == "depth_verification.json" and document.get("camera", {}).get("serial") != camera_serial:
-            raise DemoError("depth verification belongs to a different camera")
-    camera_to_gripper = rigid_transform(hand_eye, "camera_to_gripper")
-    settings["camera_serial"] = camera_serial
-    settings["detector"] = getattr(args, "detector", "yolo")
-    settings["camera_intrinsics"] = hand_eye["camera"].get("intrinsics")
-    if settings["detector"] == "opencv":
-        intrinsics = settings["camera_intrinsics"]
-        try:
-            values = [float(intrinsics[key]) for key in ("fx", "fy", "ppx", "ppy")]
-        except (KeyError, TypeError, ValueError) as exc:
-            raise DemoError(f"OpenCV candy size check requires camera intrinsics in hand_eye.json: {exc}") from exc
-        if not all(math.isfinite(value) for value in values) or values[0] <= 0 or values[1] <= 0:
-            raise DemoError("OpenCV candy size check requires finite intrinsics with positive focal lengths")
-    scans = load_scan_poses(args.scan_poses)
-    return settings, camera_to_gripper, scans
-
-
 def checked_move(arm: Any, name: str, target: np.ndarray, grip: float, settings: dict) -> None:
     """Sample the path from measured joints before executing a health-checked move."""
     validate_joint_path_safety(name, [measured_start_joints(arm, name), target])
@@ -1955,442 +724,6 @@ def checked_move(arm: Any, name: str, target: np.ndarray, grip: float, settings:
         arm, name, target, grip,
         float(settings["move_timeout_seconds"]), int(settings["motion_speed_percent"]),
     )
-
-
-def verify_palm(palm: dict, maximum_age: float) -> np.ndarray:
-    """Return finite base-frame coordinates for a fresh detected open palm.
-
-    Handedness and temporal stability metadata are not checked by the demo.
-    """
-    if palm.get("status") != "detected":
-        raise DemoError(f"no visible palm: {palm.get('status')}: {palm.get('error', '')}")
-    if palm.get("gesture") != "open_palm":
-        raise DemoError("detected hand is not an open palm")
-    try:
-        timestamp = datetime.fromisoformat(palm["captured_at"])
-        if timestamp.tzinfo is None:
-            raise ValueError("palm timestamp must include a timezone")
-        age = (datetime.now(timezone.utc) - timestamp).total_seconds()
-    except (KeyError, TypeError, ValueError) as exc:
-        raise DemoError(f"invalid palm capture timestamp: {exc}") from exc
-    if not -1.0 <= age <= maximum_age:
-        raise DemoError(f"palm capture is stale or future-dated ({age:.2f}s)")
-    return finite_vector(palm.get("base_point_mm"), 3, "palm center")
-
-
-def plan_delivery(palm: dict, arm: Any, scan: dict, settings: dict, maximum_age: float):
-    """Plan and path-check release at palm Z + 35 mm, retreat, and return to scan.
-
-    Validate palm freshness and workspace bounds before IK; no motion is sent.
-    """
-    point = verify_palm(palm, maximum_age)
-    validate_target_workspace(
-        point, settings["hand_workspace_min_mm"], settings["hand_workspace_max_mm"]
-    )
-    release_z = float(point[2]) + RELEASE_CLEARANCE_MM
-    plan = plan_hand_delivery(
-        point, arm.joints_deg(), scan["joints_deg"],
-        settings["hand_delivery_rpy_deg"], release_z,
-        float(settings["hand_approach_height_mm"]),
-    )
-    validate_joint_path_safety(
-        "palm delivery and retreat",
-        [measured_start_joints(arm, "palm delivery and retreat"), *[joints for _, joints in plan]],
-    )
-    return plan
-
-
-def reacquire_palm(
-    arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    camera_to_gripper: np.ndarray, settings: dict,
-) -> dict:
-    """Capture a new palm at the current arm pose for delivery-plan validation."""
-    return capture_hand_at_current_pose(
-        arm, hands, objects, scan, int(scan["index"]) + 3, camera_to_gripper, settings,
-    )
-
-
-def wait_for_deliverable_palm(
-    arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
-) -> tuple[dict, np.ndarray, dict]:
-    """Hold the scan pose with the candy, capturing until a palm has an accepted delivery plan.
-
-    Missing, invalid, stale, out-of-workspace, unreachable (IK), and path-rejected
-    palms are retried every retry_delay_seconds without commanding motion. Arm
-    health is checked before every attempt, so faults stop waiting; so does Ctrl+C.
-    Return the palm, its base-frame center, and the delivery waypoints.
-    """
-    attempt = 0
-    while True:
-        require_healthy(arm, "waiting at scan pose with candy")
-        attempt += 1
-        try:
-            palm = reacquire_palm(arm, objects, hands, scan, camera_to_gripper, settings)
-            center = finite_vector(palm.get("base_point_mm"), 3, "reacquired palm center")
-            plan = dict(plan_delivery(palm, arm, scan, settings, maximum_age))
-            verify_palm(palm, maximum_age)
-            return palm, center, plan
-        except DemoError as exc:
-            print(
-                f"Waiting at scan pose with candy for a reachable open palm "
-                f"(attempt {attempt}): {exc}",
-                flush=True,
-            )
-        time.sleep(float(settings["retry_delay_seconds"]))
-
-
-def deliver_to_palm(
-    arm: Any, objects: VisionClient, hands: HandClient, scan: dict,
-    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
-    carry: CandyCarry | None = None,
-) -> None:
-    """Wait at the scan pose for a deliverable palm, then approach and release above it.
-
-    Palm detection and reachability failures do not stop or return the candy:
-    the arm holds the scan pose and retries until a fresh palm has an accepted
-    plan. The approach then uses that single detection without capturing again,
-    so the palm must remain still. Reached waypoints are recorded in the carry
-    tracker until the gripper starts opening at the palm, so the caller can
-    retrace them after any later failure.
-    """
-    carry = CandyCarry() if carry is None else carry
-    closed, opened = float(settings["grip_close_mm"]), float(settings["grip_open_mm"])
-    checked_move(arm, "return to scan for palm reacquisition", scan["joints_deg"], closed, settings)
-    carry.reached("scan pose", scan["joints_deg"])
-    time.sleep(float(settings["scan_settle_seconds"]))
-    palm, current, plan = wait_for_deliverable_palm(
-        arm, objects, hands, scan, camera_to_gripper, settings, maximum_age,
-    )
-    print(f"Palm detected after pickup: {np.round(current, 3).tolist()}mm")
-    checked_move(arm, "hand approach", plan["hand approach"], closed, settings)
-    carry.reached("hand approach", plan["hand approach"])
-    verify_palm(palm, maximum_age)
-    checked_move(arm, "hand release height (palm Z + 35mm)", plan["hand release"], closed, settings)
-    carry.reached("hand release height", plan["hand release"])
-    verify_palm(palm, maximum_age)
-    # Once opening starts at the palm, never carry anything back to the pickup location.
-    carry.holding = False
-    hold_gripper(
-        arm, plan["hand release"], opened, float(settings["gripper_hold_seconds"])
-    )
-    checked_move(arm, "hand retreat", plan["hand retreat"], opened, settings)
-    checked_move(arm, "return to scan", scan["joints_deg"], opened, settings)
-
-
-def return_candy_to_pickup(
-    arm: Any, pickup_plan: list[tuple[str, np.ndarray]], carry: CandyCarry, settings: dict,
-) -> None:
-    """Retrace the carried route to the grasp pose, release the candy, and retreat to scan.
-
-    The carried path holds each waypoint reached since the gripper closed, so
-    reversing it only crosses segments already traversed and path-checked. The
-    whole route is sampled from the measured joints before the first move and
-    each segment is rechecked before it is commanded. Waypoints already within
-    the 2-degree arrival tolerance are skipped. The gripper stays closed until
-    the grasp pose and opens only there.
-    """
-    if not carry.holding or not carry.path or carry.path[0][0] != "grasp":
-        raise DemoError("no tracked held candy to return")
-    waypoints = dict(pickup_plan)
-    closed, opened = float(settings["grip_close_mm"]), float(settings["grip_open_mm"])
-    timeout = float(settings["move_timeout_seconds"])
-    speed = int(settings.get("pick_motion_speed_percent", settings["motion_speed_percent"]))
-    grasp = carry.path[0][1]
-    back = [
-        (f"return candy: retrace {name}", joints) for name, joints in reversed(carry.path[1:])
-    ] + [("return candy: pickup location", grasp)]
-    retreat = [
-        (label, waypoints[name]) for name, label in (
-            ("lift", "return candy: retreat above pickup"),
-            ("lift transit", "return candy: retreat transit"),
-            ("scan 1", "return candy: back to scan"),
-        ) if name in waypoints
-    ]
-    validate_joint_path_safety(
-        "candy return to pickup location",
-        [
-            measured_start_joints(arm, "candy return to pickup location"),
-            *[joints for _, joints in back + retreat],
-        ],
-    )
-    for name, joints in back:
-        current = finite_vector(arm.joints_deg(), 6, "current joints")
-        if np.max(np.abs(current - joints)) < ARRIVAL_TOLERANCE_DEG:
-            continue
-        validate_joint_path_safety(name, [measured_start_joints(arm, name), joints])
-        move_robot(arm, name, joints, closed, timeout, speed)
-    print("motion: open gripper to release candy at its pickup location")
-    carry.holding = False
-    hold_gripper(arm, grasp, opened, float(settings["gripper_hold_seconds"]))
-    for name, joints in retreat:
-        validate_joint_path_safety(name, [measured_start_joints(arm, name), joints])
-        move_robot(arm, name, joints, opened, timeout, speed)
-
-
-def forward_lean_x(grasp_joints: np.ndarray) -> float:
-    """Return the +X share of the horizontal direction the fingertips point (0 when vertical)."""
-    tool_axis = fk(np.asarray(grasp_joints, dtype=np.float64))[:3, 2]
-    horizontal = float(np.linalg.norm(tool_axis[:2]))
-    if horizontal < math.sin(math.radians(1.0)):
-        return 0.0
-    return float(tool_axis[0]) / horizontal
-
-
-def prefer_vertical_for_forward_lean(
-    target: dict, plan: list[tuple[str, np.ndarray]], start: np.ndarray, scan: dict, settings: dict,
-) -> list[tuple[str, np.ndarray]]:
-    """Replace a tilted grasp whose fingertips point away from the base with a vertical one.
-
-    Forward-leaning grasps (candies lying along X) clipped or toppled candies on
-    the way down and picked 2/18 times; vertical grasps of the same candies
-    picked 3/3. Keep the tilted plan when the vertical grasp is unreachable.
-    """
-    lean_x = forward_lean_x(dict(plan)["grasp"])
-    if lean_x < float(settings["forward_lean_vertical_threshold"]):
-        return plan
-    vertical_rpy = np.asarray(settings["grasp_rpy_deg"], dtype=np.float64).copy()
-    vertical_rpy[1] = 0.0
-    vertical = select_reachable_object_target(
-        [{**target, "cross_view_agreement_passed": True}], start, scan["joints_deg"], vertical_rpy,
-        float(settings["grasp_tip_z_mm"]), float(settings["approach_height_mm"]),
-        float(settings["pregrasp_height_mm"]), float(settings["minimum_pregrasp_height_mm"]),
-        float(settings["pregrasp_height_step_mm"]), float(settings["maximum_approach_inward_offset_mm"]),
-        float(settings["approach_inward_step_mm"]), float(settings["maximum_grasp_yaw_offset_deg"]),
-        float(settings["grasp_yaw_offset_step_deg"]),
-    )
-    if vertical is None:
-        if settings.get("verbose"):
-            print(
-                f"Grasp leans forward (lean X {lean_x:.2f}) but no vertical grasp is reachable; "
-                "keeping the tilted grasp",
-                flush=True,
-            )
-        return plan
-    if settings.get("verbose"):
-        print(f"Grasp leans forward (lean X {lean_x:.2f}); using a vertical grasp instead", flush=True)
-    return vertical[2]
-
-
-def pick_plan(arm: Any, captures: list[dict], scan: dict, settings: dict):
-    """Select the nearest candy with a reachable, fully path-checked pickup plan.
-
-    Cluster detections and try each candy nearest first, with candy-aligned
-    grasp orientations and approach alternatives; a candy whose IK or route
-    checks fail is skipped in favour of the next one. Raise
-    NoReachableCandyError when none can be planned. No motion is sent.
-    """
-    targets = distinct_object_targets(
-        captures, float(settings["maximum_cross_view_target_difference_mm"]),
-        float(settings["maximum_cross_view_orientation_difference_deg"]),
-    )
-    start = measured_start_joints(arm, "pickup planning")
-    selected = select_reachable_object_target(
-        targets, start, scan["joints_deg"], settings["grasp_rpy_deg"],
-        float(settings["grasp_tip_z_mm"]), float(settings["approach_height_mm"]),
-        float(settings["pregrasp_height_mm"]), float(settings["minimum_pregrasp_height_mm"]),
-        float(settings["pregrasp_height_step_mm"]), float(settings["maximum_approach_inward_offset_mm"]),
-        float(settings["approach_inward_step_mm"]), float(settings["maximum_grasp_yaw_offset_deg"]),
-        float(settings["grasp_yaw_offset_step_deg"]),
-    )
-    if selected is None:
-        reasons = [
-            f"target {index} at {np.round(target['base_point_mm'], 3).tolist()}mm: "
-            f"{target['planning_rejection_reason']}"
-            for index, target in enumerate(targets, start=1)
-        ]
-        detail = "; ".join(reasons) if reasons else "no detected candy targets were available"
-        raise NoReachableCandyError(
-            f"detected candy has no accepted reachable pickup plan: {detail}", targets,
-        )
-    target, _, plan, rejections = selected
-    plan = prefer_vertical_for_forward_lean(target, plan, start, scan, settings)
-    for rejection in rejections:
-        print(
-            f"Skipping unreachable candy at {np.round(rejection['base_point_mm'], 1).tolist()}mm: "
-            f"{summarize_rejection(rejection['reason'])}",
-            flush=True,
-        )
-    waypoints = dict(plan)
-    ordered = [start]
-    for name in ("pick transit", "pick approach", "grasp", "lift", "lift transit", "scan 1"):
-        if name in waypoints:
-            ordered.append(waypoints[name])
-    validate_joint_path_safety("pickup and return to scan", ordered)
-    return target, plan
-
-
-def pick_diagnostic(capture: dict, target: dict, plan: list[tuple[str, np.ndarray]]) -> str:
-    """Describe the selected pickup for log review: source frame, candy, and grasp geometry."""
-    waypoints = dict(plan)
-    grasp_frame = fk(waypoints["grasp"])
-    rotation = grasp_frame[:3, :3]
-    tilt = math.degrees(math.acos(float(np.clip(-rotation[2, 2], -1.0, 1.0))))
-    axis = np.asarray(target.get("long_axis_base_unit_xy", [math.nan, math.nan]), dtype=np.float64)
-    jaw = rotation[:2, 1] / max(float(np.linalg.norm(rotation[:2, 1])), 1e-9)
-    jaw_angle = math.degrees(math.acos(float(np.clip(abs(jaw @ axis), 0.0, 1.0)))) if np.all(np.isfinite(axis)) else math.nan
-    size = (
-        f", size {target['length_mm']:.0f}x{target['width_mm']:.0f}mm" if "length_mm" in target else ""
-    )
-    # Horizontal direction the fingertips point; forward (+X) leans correlated with missed grasps.
-    lean_xy = rotation[:2, 2]
-    lean = (
-        f" leaning {np.round(lean_xy / np.linalg.norm(lean_xy), 2).tolist()}"
-        if tilt >= 1.0 else " (vertical)"
-    )
-    return (
-        f"PICK PLAN: frame={capture.get('dataset_image', '?')} captured_at={capture.get('captured_at', '?')} "
-        f"score={float(target.get('score', math.nan)):.2f}{size}, candy axis yaw "
-        f"{float(target.get('long_axis_base_yaw_deg', math.nan)):.1f}deg, jaws at {jaw_angle:.1f}deg "
-        f"to candy axis (90=across), tool tilt {tilt:.1f}deg{lean}, route={[name for name, _ in plan]}"
-    )
-
-
-def plan_random_placement(
-    capture: dict, pickup_plan: list[tuple[str, np.ndarray]], scan: dict, settings: dict,
-) -> tuple[np.ndarray, list[tuple[str, np.ndarray]]]:
-    """Find a bounded, path-checked placement before picking anything up."""
-    clearance = float(settings["grip_open_mm"])
-    lower = np.asarray(settings["target_workspace_min_mm"][:2]) + clearance
-    upper = np.asarray(settings["target_workspace_max_mm"][:2]) - clearance
-    if np.any(lower >= upper):
-        raise DemoError("workspace is too small for random placement clearance")
-    candidates = capture.get("object_candidates", [capture])
-    occupied = [
-        finite_vector(candidate["base_point_mm"], 3, "occupied candy position")[:2]
-        for candidate in candidates if candidate.get("status") == "detected"
-    ]
-    grasp_frame = fk(dict(pickup_plan)["grasp"])
-    rpy = Rot.from_matrix(grasp_frame[:3, :3]).as_euler("xyz", degrees=True)
-    rng = np.random.default_rng()
-    last_reason = "sampled locations overlap detected candies"
-    for _ in range(MAXIMUM_RANDOM_PLACEMENT_ATTEMPTS):
-        point = np.append(rng.uniform(lower, upper), float(settings["grasp_tip_z_mm"]))
-        if any(np.linalg.norm(point[:2] - other) < clearance for other in occupied):
-            continue
-        validate_target_workspace(
-            point, settings["target_workspace_min_mm"], settings["target_workspace_max_mm"],
-            check_z=False,
-        )
-        try:
-            plan = plan_pickup(
-                point, scan["joints_deg"], scan["joints_deg"], rpy,
-                float(settings["grasp_tip_z_mm"]), float(settings["approach_height_mm"]),
-                float(settings["pregrasp_height_mm"]), float(settings["minimum_pregrasp_height_mm"]),
-                float(settings["pregrasp_height_step_mm"]),
-                float(settings["maximum_approach_inward_offset_mm"]),
-                float(settings["approach_inward_step_mm"]),
-            )
-        except DemoError as exc:
-            last_reason = str(exc)
-            continue
-        return point, plan
-    raise DemoError(
-        f"no accepted random placement after {MAXIMUM_RANDOM_PLACEMENT_ATTEMPTS} attempts: "
-        f"{last_reason}; no pickup attempted"
-    )
-
-
-def place_candy(
-    arm: Any, plan: list[tuple[str, np.ndarray]], scan: dict, settings: dict, carry: CandyCarry,
-) -> None:
-    """Carry through scan, descend, release at grasp height, and retreat."""
-    validate_joint_path_safety(
-        "random placement and retreat",
-        [measured_start_joints(arm, "random placement"), scan["joints_deg"],
-         *[joints for _, joints in plan]],
-    )
-    closed, opened = float(settings["grip_close_mm"]), float(settings["grip_open_mm"])
-    checked_move(arm, "placement: return to scan", scan["joints_deg"], closed, settings)
-    carry.reached("placement scan", scan["joints_deg"])
-    for name, joints in plan:
-        checked_move(
-            arm, f"placement: {name}", joints, closed if carry.holding else opened, settings,
-        )
-        if carry.holding:
-            carry.reached(f"placement {name}", joints)
-        if name == "grasp":
-            carry.holding = False
-            hold_gripper(arm, joints, opened, float(settings["gripper_hold_seconds"]))
-
-
-def run_cycle(
-    arm: Any, objects: VisionClient, hands: HandClient, scans: list[dict],
-    camera_to_gripper: np.ndarray, settings: dict, maximum_age: float,
-) -> bool:
-    """Scan taught poses, pick one accepted candy, then deliver to a freshly checked palm.
-
-    Return True after delivery, or False when no candy/palm pair is accepted,
-    no detected candy can be planned (unreachable candies are skipped in favour
-    of reachable ones, and the scan repeats when none are), grasp verification
-    fails, or a demo error occurs while a candy may be
-    gripped (the carried route is then retraced and the candy put back at its
-    pickup location). A missing or unreachable palm after pickup is not an
-    error: delivery waits at the scan pose until one is deliverable. Ctrl+C,
-    errors with nothing gripped, and failed returns stop the outer loop.
-    """
-    pick_only = bool(settings.get("pick_candy_only", False))
-    for scan in scans:
-        validate_joint_path_safety(
-            "scan approach", [measured_start_joints(arm, "scan approach"), scan["joints_deg"]],
-        )
-        candy, palm = capture_scan_pair(
-            arm, objects, None if pick_only else hands, scan, int(scan["index"]) + 3,
-            PROMPT, float(settings["detection_confidence_threshold"]), camera_to_gripper, settings,
-        )
-        if candy.get("status") != "detected" or (not pick_only and palm.get("status") != "detected"):
-            print(
-                "No accepted candy; continuing scan without pickup" if pick_only else
-                "No accepted candy/palm pair; continuing scan without pickup", flush=True,
-            )
-            continue
-        if not pick_only:
-            verify_palm(palm, maximum_age)
-        try:
-            target, plan = pick_plan(arm, [candy], scan, settings)
-        except NoReachableCandyError as exc:
-            print("No reachable candy in this scan; scanning again:", flush=True)
-            for target in exc.targets or []:
-                print(
-                    f"  candy at {np.round(target['base_point_mm'], 1).tolist()}mm: "
-                    f"{summarize_rejection(target.get('planning_rejection_reason', 'rejected'))}",
-                    flush=True,
-                )
-            if settings.get("verbose"):
-                print(f"  details: {exc}", flush=True)
-            continue
-        if pick_only:
-            placement_point, placement_plan = plan_random_placement(candy, plan, scan, settings)
-            print(f"PLACE PLAN: tip at {np.round(placement_point, 3).tolist()}mm", flush=True)
-        print(f"Picking Starburst at {np.round(target['base_point_mm'], 3).tolist()}mm", flush=True)
-        if settings.get("verbose"):
-            print(pick_diagnostic(candy, target, plan), flush=True)
-        carry = CandyCarry()
-        try:
-            held_width = execute_pickup(arm, plan, settings, carry, target)
-            print(f"Pickup confirmed: gripper width={held_width:.2f}mm", flush=True)
-            if pick_only:
-                place_candy(arm, placement_plan, scan, settings, carry)
-            else:
-                deliver_to_palm(arm, objects, hands, scan, camera_to_gripper, settings, maximum_age, carry)
-        except GraspVerificationError as exc:
-            print(f"Pickup missed: {exc}; scanning again", flush=True)
-            return False
-        except (RuntimeError, OSError, KeyError, TypeError, ValueError) as exc:
-            if not carry.holding:
-                raise
-            print(f"ERROR while holding candy: {exc}", flush=True)
-            print("Returning candy to its pickup location", flush=True)
-            try:
-                return_candy_to_pickup(arm, plan, carry, settings)
-            except (RuntimeError, OSError, KeyError, TypeError, ValueError) as return_exc:
-                raise DemoError(f"candy return failed after '{exc}': {return_exc}") from return_exc
-            if pick_only:
-                raise
-            print("Candy returned; continuing scan loop", flush=True)
-            return False
-        return True
-    return False
 
 
 def return_to_zero(
@@ -2461,10 +794,720 @@ def prepare_robot_for_scan(arm: Piper, scan: dict, settings: dict) -> None:
     )
 
 
-def main() -> int:
-    """Preflight k3s, services, and setup, enforce motion gates, and run the supervised loop.
+def validate_demo_settings(settings: dict) -> dict:
+    """Validate code-defined runtime settings and return them with workspace bounds."""
+    try:
+        demo = dict(settings)
+        target_min = finite_vector(WORKSPACE_MIN_MM, 3, "code-defined workspace minimum").copy()
+        target_max = finite_vector(WORKSPACE_MAX_MM, 3, "code-defined workspace maximum").copy()
+        for key in ("grasp_rpy_deg", "hand_delivery_rpy_deg"):
+            demo[key] = finite_vector(demo[key], 3, f"demo.{key}")
+        correction = finite_vector(demo["candy_xy_correction_mm"], 2, "demo.candy_xy_correction_mm").copy()
+        for key in ("grasp_tip_above_candy_top_mm", "minimum_grasp_tip_z_mm", "grip_close_mm"):
+            if not math.isfinite(float(demo[key])):
+                raise ValueError(f"demo.{key} must be finite")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DemoError(f"invalid demo configuration: {exc}") from exc
+    if np.any(target_min >= target_max):
+        raise DemoError("demo target workspace minimum must be below maximum")
+    if np.any(np.abs(correction) > MAXIMUM_CANDY_XY_CORRECTION_MM):
+        raise DemoError(
+            f"demo.candy_xy_correction_mm components must be within +/-{MAXIMUM_CANDY_XY_CORRECTION_MM:.0f}mm"
+        )
+    demo["candy_xy_correction_mm"] = correction
+    for key in (
+        "grip_open_mm", "minimum_held_grip_mm", "rim_clearance_mm", "vertical_step_mm",
+        "maximum_vertical_deviation_mm", "grasp_yaw_offset_step_deg", "maximum_grasp_yaw_offset_deg",
+        "motion_speed_percent", "pick_motion_speed_percent", "hand_approach_height_mm",
+        "gripper_hold_seconds", "maximum_scan_position_deviation_mm", "maximum_scan_rotation_deviation_deg",
+        "move_timeout_seconds", "retry_delay_seconds", "scan_settle_seconds",
+    ):
+        value = float(demo[key])
+        if not math.isfinite(value) or value <= 0:
+            raise DemoError(f"demo.{key} must be positive")
+    if not 0 <= float(demo["grip_close_mm"]) < float(demo["minimum_held_grip_mm"]) < float(demo["grip_open_mm"]) <= PIPER_C.GRIP_OPEN_MM:
+        raise DemoError("gripper settings must satisfy 0 <= close < minimum held < open <= the gripper's range")
+    if float(demo["grasp_yaw_offset_step_deg"]) > float(demo["maximum_grasp_yaw_offset_deg"]):
+        raise DemoError("demo.grasp_yaw_offset_step_deg must not exceed demo.maximum_grasp_yaw_offset_deg")
+    for key in ("motion_speed_percent", "pick_motion_speed_percent"):
+        speed = int(demo[key])
+        if speed != float(demo[key]) or speed > 100:
+            raise DemoError(f"demo.{key} must be an integer from 1 to 100")
+        demo[key] = speed
+    demo["target_workspace_min_mm"], demo["target_workspace_max_mm"] = target_min, target_max
+    demo["hand_workspace_min_mm"], demo["hand_workspace_max_mm"] = target_min.copy(), target_max.copy()
+    # One gripper width for planning and the bowl-wall check.
+    demo["bowl"] = {**bowl_vision.BOWL_SETTINGS, "grip_open_mm": float(demo["grip_open_mm"])}
+    return demo
 
-    A stale k3s address is fixed by restarting k3s, also in check-only mode.
+
+def load_setup(args: argparse.Namespace, hand_eye: dict | None = None) -> tuple[dict, np.ndarray, list[dict]]:
+    """Validate settings, calibration acceptance, and taught scan poses without moving the arm.
+
+    Return settings, the camera-to-gripper transform, and the scan poses.
+    """
+    settings = validate_demo_settings(DEMO_SETTINGS)
+    settings["verbose"] = bool(getattr(args, "verbose", False))
+    settings["pause_before_grip"] = bool(getattr(args, "pause_before_grip", False))
+    if hand_eye is None:
+        hand_eye = load_hand_eye(args.calibration_dir)
+    camera_serial = hand_eye["camera"]["serial"]
+    for name in ("validation.json", "depth_correction.json", "depth_verification.json"):
+        path = args.calibration_dir / name
+        document = load_json(path)
+        require_quality(document, name, path)
+        if name == "depth_verification.json" and document.get("camera", {}).get("serial") != camera_serial:
+            raise DemoError("depth verification belongs to a different camera")
+    intrinsics = hand_eye["camera"].get("intrinsics")
+    try:
+        bowl_vision.camera_matrix(intrinsics)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DemoError(f"bowl detection requires camera intrinsics in hand_eye.json: {exc}") from exc
+    settings["camera_serial"] = camera_serial
+    settings["camera_intrinsics"] = intrinsics
+    return settings, rigid_transform(hand_eye, "camera_to_gripper"), load_scan_poses(args.scan_poses)
+
+
+def check_services(camera: CameraClient, hands: HandClient | None, camera_serial: str) -> None:
+    """Check the camera and, when needed, the hand service; raise after reporting all failures."""
+    checks = [("OpenCV camera", camera.health)]
+    if hands is not None:
+        checks.append(("MediaPipe hand service", hands.health))
+    failures = []
+    for label, check in checks:
+        try:
+            result = check()
+            if label == "OpenCV camera" and (
+                result.get("camera_serial") != camera_serial
+                or result.get("preview_only") is not False
+                or result.get("depth_calibrated") is not True
+            ):
+                raise DemoError("requires matching D435 and calibrated depth; preview-only is not usable")
+            if label == "MediaPipe hand service" and result.get("source_url") != camera.base_url + "/stream.mjpg":
+                raise DemoError("hand stream must come from the configured OpenCV camera URL")
+            print(f"[OK] {label}: {result}", flush=True)
+        except RuntimeError as exc:
+            failures.append(f"{label}: {exc}")
+            print(f"[FAILED] {label}: {exc}", flush=True)
+    if failures:
+        raise DemoError("required services unavailable: " + "; ".join(failures))
+    print("[OK] All required services are running and available.", flush=True)
+
+
+def record_grasp_offset(
+    offset: np.ndarray, target: dict, jaw_point: np.ndarray, jaw_axis_xy: np.ndarray,
+    demo: dict, path: Path | None = None,
+) -> np.ndarray:
+    """Log one measured candy-minus-jaw offset and print the suggested XY correction.
+
+    The suggestion is the correction in effect plus the mean of this run's
+    offsets; it is appended to a JSON-lines file (GRASP_OFFSET_LOG by default).
+    """
+    path = GRASP_OFFSET_LOG if path is None else path
+    correction = np.asarray(demo["candy_xy_correction_mm"], dtype=np.float64)
+    across = float(offset @ jaw_axis_xy)
+    along = float(offset @ np.array([-jaw_axis_xy[1], jaw_axis_xy[0]]))
+    offsets = demo.setdefault("recorded_grasp_offsets_mm", [])
+    offsets.append(np.asarray(offset, dtype=np.float64))
+    suggested = correction + np.mean(offsets, axis=0)
+    print(
+        f"  Recorded candy offset {np.round(offset, 1).tolist()}mm: {across:+.1f}mm along the jaw "
+        f"closing direction, {along:+.1f}mm along the jaws",
+        flush=True,
+    )
+    print(
+        f"  GRASP OFFSET SUMMARY: {len(offsets)} reading(s), mean "
+        f"{np.round(np.mean(offsets, axis=0), 1).tolist()}mm -> suggested "
+        f"\"candy_xy_correction_mm\": {np.round(suggested, 1).tolist()} "
+        f"(current {np.round(correction, 1).tolist()})",
+        flush=True,
+    )
+    record = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "candy_base_point_mm": target.get("base_point_mm"),
+        "uncorrected_base_point_mm": target.get("uncorrected_base_point_mm", target.get("base_point_mm")),
+        "candy_edge_yaw_deg": target.get("edge_yaw_deg"),
+        "jaw_point_mm": np.round(jaw_point, 3).tolist(),
+        "jaw_axis_xy": np.round(jaw_axis_xy, 4).tolist(),
+        "offset_mm": np.round(offset, 3).tolist(),
+        "across_jaw_mm": round(across, 3),
+        "along_jaw_mm": round(along, 3),
+        "correction_in_effect_mm": np.round(correction, 3).tolist(),
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except OSError as exc:
+        print(f"  WARNING: could not append grasp offset to {path}: {exc}", flush=True)
+    return suggested
+
+
+def pause_for_grasp_offset(
+    arm: Piper, grasp_joints: np.ndarray, open_mm: float, target: dict, demo: dict,
+) -> np.ndarray | None:
+    """Hold the open-jaw grasp pose and ask the operator where the candy really is."""
+    measured = finite_vector(arm.joints_deg(), 6, "measured grasp joints")
+    jaw_point = tip_position(measured)
+    jaw_axis = fk(grasp_joints)[:2, 1]
+    jaw_axis = jaw_axis / max(float(np.linalg.norm(jaw_axis)), 1e-9)
+    candy = target.get("base_point_mm")
+    print(
+        "\nPAUSED AT GRASP: jaws open and arm holding position (Ctrl+C stops the demo).\n"
+        f"  candy estimate {np.round(candy, 1).tolist() if candy is not None else '?'}mm, candy edge yaw "
+        f"{float(target.get('edge_yaw_deg', math.nan)):.1f}deg, "
+        f"jaw point {np.round(jaw_point, 1).tolist()}mm\n"
+        "  Measure the candy centre relative to the midpoint between the open fingertips,\n"
+        "  in robot base directions:\n"
+        "    +X = straight out from the robot base (toward the far edge), -X = back toward the base\n"
+        "    +Y = to your left when standing behind the robot facing +X, -Y = to your right",
+        flush=True,
+    )
+    offset = hold_for_operator_input(
+        arm, grasp_joints, open_mm,
+        "  Candy offset 'dx dy' in mm (e.g. '0 -3'), or Enter to grip without recording: ",
+        parse_grasp_offset,
+    )
+    if offset is None:
+        print("  No offset recorded", flush=True)
+        return None
+    record_grasp_offset(offset, target, jaw_point, jaw_axis, demo)
+    return offset
+
+
+def stationary_camera_to_base(
+    before_pose: np.ndarray, after_pose: np.ndarray, camera_to_gripper: np.ndarray, settings: dict, label: str,
+) -> np.ndarray:
+    """Camera-to-base transform for a capture, rejecting arm movement during it."""
+    before, after = piper_pose_to_transform(before_pose), piper_pose_to_transform(after_pose)
+    moved = float(np.linalg.norm(np.asarray(after_pose)[:3] - np.asarray(before_pose)[:3]))
+    rotated = rotation_error_degrees(before, after)
+    if moved > float(settings["maximum_scan_position_deviation_mm"]):
+        raise DemoError(f"{label}: arm moved {moved:.2f}mm during capture")
+    if rotated > float(settings["maximum_scan_rotation_deviation_deg"]):
+        raise DemoError(f"{label}: arm rotated {rotated:.2f}deg during capture")
+    return average_transforms([before, after]) @ camera_to_gripper
+
+
+def to_base_point(camera_to_base: np.ndarray, camera_point: np.ndarray) -> np.ndarray:
+    return (camera_to_base @ np.append(np.asarray(camera_point, dtype=np.float64), 1.0))[:3]
+
+
+def measure_candies(
+    result: dict, camera: CameraClient, token: str, camera_to_base: np.ndarray, settings: dict,
+) -> list[dict]:
+    """Add each candy's top-centre base point from depth and its true size at that height."""
+    bowl_settings = settings["bowl"]
+    view = bowl_vision.bowl_view(settings["camera_intrinsics"], camera_to_base, bowl_settings)
+    measured = []
+    for candy in result["candies"]:
+        try:
+            point = to_base_point(camera_to_base, camera.deproject(token, candy["pixel"]))
+        except DemoError as exc:
+            result["rejected_candies"].append({**candy, "reasons": [f"no depth: {exc}"]})
+            continue
+        corrected = point.copy()
+        corrected[:2] += settings["candy_xy_correction_mm"]
+        try:
+            validate_target_workspace(
+                corrected, settings["target_workspace_min_mm"], settings["target_workspace_max_mm"], check_z=False,
+            )
+        except DemoError as exc:
+            result["rejected_candies"].append({**candy, "reasons": [str(exc)]})
+            continue
+        measured.append({
+            **candy,
+            "uncorrected_base_point_mm": point.tolist(),
+            "base_point_mm": corrected.tolist(),
+            "true_long_mm": bowl_vision.true_size(view, candy["long_mm"], point[2]),
+            "true_short_mm": bowl_vision.true_size(view, candy["short_mm"], point[2]),
+        })
+    return measured
+
+
+def scan_bowl(
+    arm: Piper, camera: CameraClient, camera_to_gripper: np.ndarray, settings: dict,
+) -> dict[str, Any]:
+    """Photograph the bowl from the current (scan) pose; find, confirm, and rank its candies.
+
+    status: "detected" (pickable candies listed best first), "no_pickable",
+    "empty", "flat_circle" (a circle whose rim depth reads the table), or
+    "not_found". Writes the annotated photo to logs/latest_bowl_scan.jpg.
+    """
+    require_healthy(arm, "before bowl scan")
+    before = np.asarray(arm.pose(), dtype=np.float64)
+    captured, png = camera.capture_png()
+    after = np.asarray(arm.pose(), dtype=np.float64)
+    camera_to_base = stationary_camera_to_base(before, after, camera_to_gripper, settings, "bowl scan")
+    frame = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise DemoError("could not decode the bowl scan photo")
+    bowl_settings = settings["bowl"]
+    intrinsics = settings["camera_intrinsics"]
+    result = bowl_vision.find_bowl(frame, intrinsics, camera_to_base, bowl_settings)
+    result.update(pickable=[], unpickable=[], captured_at=captured.get("captured_at"))
+    bowl = result.get("bowl")
+    if bowl is not None:
+        height, width = frame.shape[:2]
+        rim_z = []
+        for pixel in bowl["rim_depth_pixels"]:
+            if not (0 <= pixel[0] < width and 0 <= pixel[1] < height):
+                continue
+            try:
+                rim_z.append(float(to_base_point(camera_to_base, camera.deproject(captured["token"], pixel))[2]))
+            except DemoError:
+                rim_z.append(None)
+        raised, reason = bowl_vision.check_rim_height(rim_z, bowl_settings)
+        bowl["rim_check"] = reason
+        if not raised:
+            result["status"] = "flat_circle"
+    if result["status"] == "detected":
+        candies = measure_candies(result, camera, captured["token"], camera_to_base, settings)
+        rim_height = bowl_settings["table_z_mm"] + bowl_settings["bowl_height_mm"]
+        result["pickable"], result["unpickable"] = bowl_vision.grasp_options(
+            candies, bowl["plane_center_mm"], rim_height, bowl_settings,
+        )
+        if not result["pickable"]:
+            result["status"] = "no_pickable"
+    report_bowl_scan(result, settings)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        annotated = bowl_vision.annotate(
+            frame, bowl_vision.with_rim_outline(result, intrinsics, camera_to_base, bowl_settings),
+            result["pickable"][0] if result["pickable"] else None,
+        )
+        cv2.imwrite(str(BOWL_SCAN_IMAGE), annotated)
+    except (OSError, cv2.error) as exc:
+        print(f"WARNING: could not save {BOWL_SCAN_IMAGE.name}: {exc}", flush=True)
+    return result
+
+
+def report_bowl_scan(result: dict, settings: dict) -> None:
+    bowl = result.get("bowl")
+    where = (
+        f" bowl at {np.round(bowl['plane_center_mm'], 0).tolist()}mm r={bowl['radius_mm']:.0f}mm "
+        f"({bowl.get('rim_check', '')})" if bowl else ""
+    )
+    counts = f", {len(result['candies'])} candies, {len(result['pickable'])} pickable" if bowl else ""
+    print(f"BOWL SCAN: {result['status']}{where}{counts}", flush=True)
+    if settings.get("verbose"):
+        for item in result["unpickable"] + result["rejected_candies"]:
+            location = item.get("base_point_mm", item.get("plane_center_mm"))
+            print(f"  skipped candy at {np.round(location, 1).tolist()}mm: {'; '.join(item['reasons'])}", flush=True)
+
+
+def closing_yaw_candidates(candy: dict, bowl_center_xy: Any, settings: dict) -> list[float]:
+    """Closing directions to try, exact first, then small yaw offsets still clear of the wall."""
+    step, maximum = float(settings["grasp_yaw_offset_step_deg"]), float(settings["maximum_grasp_yaw_offset_deg"])
+    offsets = [0.0] + [sign * value for value in np.arange(step, maximum + step * 0.5, step) for sign in (-1.0, 1.0)]
+    point = candy["base_point_mm"]
+    return [
+        (yaw + offset) % 180.0
+        for offset in offsets for yaw in candy["closing_yaw_deg"]
+        if bowl_vision.jaw_clear_of_wall(point, (yaw + offset) % 180.0, bowl_center_xy, settings["bowl"])
+    ]
+
+
+def validate_vertical_descent(
+    plan: list[tuple[str, np.ndarray]], target_xy: Any, below_z_mm: float, maximum_deviation_mm: float,
+    samples_per_segment: int = 20,
+) -> None:
+    """Require the sampled tool tip to stay on the vertical line through the candy below a height.
+
+    Checks the joint-space segments from "above bowl" to "grasp"; the lift
+    retraces the same segments.
+    """
+    names = [name for name, _ in plan]
+    joints = [value for _, value in plan]
+    route = joints[names.index("above bowl"):names.index("grasp") + 1]
+    target = np.asarray(target_xy, dtype=np.float64)[:2]
+    for start, end in zip(route, route[1:]):
+        for fraction in np.linspace(0.0, 1.0, samples_per_segment + 1):
+            tip = tip_position((1.0 - fraction) * start + fraction * end)
+            if tip[2] < below_z_mm and float(np.linalg.norm(tip[:2] - target)) > maximum_deviation_mm:
+                raise DemoError(
+                    f"descent into the bowl strays {np.linalg.norm(tip[:2] - target):.1f}mm from vertical "
+                    f"at tip Z {tip[2]:.0f}mm"
+                )
+
+
+def plan_bowl_pick(
+    candy: dict, bowl: dict, start_joints: np.ndarray, scan_joints: np.ndarray, settings: dict,
+) -> list[tuple[str, np.ndarray]]:
+    """Plan a vertical pick: above the candy clear of the rim, straight down, grip, straight up, scan.
+
+    Waypoints: "above bowl", "descend N", "grasp", "lift N", "lift above bowl",
+    "scan". Closing directions keep the open jaws clear of the bowl wall; the
+    whole route is path-checked and the descent must stay vertical below the rim.
+    """
+    bowl_settings = settings["bowl"]
+    point = finite_vector(candy["base_point_mm"], 3, "candy top point")
+    rim_z = bowl_settings["table_z_mm"] + bowl_settings["bowl_height_mm"]
+    grasp_z = max(point[2] + float(settings["grasp_tip_above_candy_top_mm"]), float(settings["minimum_grasp_tip_z_mm"]))
+    above_z = max(rim_z, grasp_z) + float(settings["rim_clearance_mm"])
+    heights = np.arange(above_z, grasp_z, -float(settings["vertical_step_mm"]))[1:]
+    errors = []
+    for closing in closing_yaw_candidates(candy, bowl["plane_center_mm"], settings):
+        # align_grasp_rpy_to_axis points the gripper along an axis and closes the jaws across it.
+        axis_yaw = math.radians(closing + 90.0)
+        for rpy in equivalent_grasp_rpys(settings["grasp_rpy_deg"], np.array([math.cos(axis_yaw), math.sin(axis_yaw)])):
+            rotation = euler_to_rot(rpy)
+            try:
+                above = solve_waypoint(
+                    "above bowl", flange_for_tip([point[0], point[1], above_z], rotation), rotation, start_joints,
+                )
+                descents, seed = [], above
+                for index, height in enumerate(heights, start=1):
+                    seed = solve_waypoint(
+                        f"descend {index}", flange_for_tip([point[0], point[1], height], rotation), rotation, seed,
+                    )
+                    descents.append((f"descend {index}", seed))
+                grasp = solve_waypoint("grasp", flange_for_tip([point[0], point[1], grasp_z], rotation), rotation, seed)
+                lifts = [(f"lift {index}", joints.copy()) for index, (_, joints) in enumerate(reversed(descents), start=1)]
+                plan = [
+                    ("above bowl", above), *descents, ("grasp", grasp), *lifts,
+                    ("lift above bowl", above.copy()), ("scan", np.asarray(scan_joints, dtype=np.float64).copy()),
+                ]
+                validate_joint_path_safety(
+                    "bowl pickup and return to scan", [np.asarray(start_joints, dtype=np.float64), *[q for _, q in plan]],
+                )
+                validate_vertical_descent(
+                    plan, point[:2], rim_z + FINGER_EXTENSION_BELOW_TIP_MM,
+                    float(settings["maximum_vertical_deviation_mm"]),
+                )
+                return plan
+            except DemoError as exc:
+                errors.append(f"closing {closing:.0f}deg yaw {float(rpy[2]):.0f}deg: {exc}")
+    if not errors:
+        raise DemoError("no closing direction keeps the open jaws clear of the bowl wall")
+    raise DemoError("no reachable vertical grasp: " + " | ".join(errors[:3]))
+
+
+def pick_first_reachable(
+    arm: Piper, scan_result: dict, scan: dict, settings: dict,
+) -> tuple[dict, list[tuple[str, np.ndarray]]]:
+    """Plan the first pickable candy (highest first) that has a reachable vertical grasp."""
+    start = measured_start_joints(arm, "bowl pickup planning")
+    rejections = []
+    for candy in scan_result["pickable"]:
+        try:
+            return candy, plan_bowl_pick(candy, scan_result["bowl"], start, scan["joints_deg"], settings)
+        except DemoError as exc:
+            rejections.append({"base_point_mm": candy["base_point_mm"], "reason": str(exc)})
+            print(
+                f"Skipping unreachable candy at {np.round(candy['base_point_mm'], 1).tolist()}mm: "
+                f"{summarize_rejection(str(exc))}",
+                flush=True,
+            )
+    raise NoReachableCandyError("no candy in the bowl has a reachable vertical grasp", rejections)
+
+
+def execute_bowl_pickup(
+    arm: Piper, plan: list[tuple[str, np.ndarray]], settings: dict, carry: CandyCarry, candy: dict,
+) -> float:
+    """Descend, grip, lift clear of the rim, verify the candy is held, and return to the scan pose.
+
+    The carry tracker marks the candy held when the gripper closes and records
+    each reached waypoint. On a missed grasp the jaws open above the bowl and
+    the arm returns to the scan pose before GraspVerificationError is raised.
+    """
+    timeout = float(settings["move_timeout_seconds"])
+    open_mm, close_mm = float(settings["grip_open_mm"]), float(settings["grip_close_mm"])
+    hold_seconds = float(settings["gripper_hold_seconds"])
+    speed = int(settings["pick_motion_speed_percent"])
+    verbose = bool(settings.get("verbose", False))
+    waypoints = dict(plan)
+    names = [name for name, _ in plan]
+    grasp_index = names.index("grasp")
+    for name, joints in plan[:grasp_index + 1]:
+        move_robot(arm, name, joints, open_mm, timeout, speed, verbose=verbose)
+    if settings.get("pause_before_grip"):
+        pause_for_grasp_offset(arm, waypoints["grasp"], open_mm, candy, settings)
+    if verbose:
+        print("motion: close gripper", flush=True)
+    hold_gripper(arm, waypoints["grasp"], close_mm, hold_seconds)
+    carry.gripped_at(waypoints["grasp"])
+    for name, joints in plan[grasp_index + 1:names.index("lift above bowl") + 1]:
+        move_robot(arm, name, joints, close_mm, timeout, speed, verbose=verbose)
+        carry.reached(name, joints)
+    held_width = float(arm.grip_mm())
+    minimum_held = float(settings["minimum_held_grip_mm"])
+    if not math.isfinite(held_width) or held_width < minimum_held:
+        carry.holding = False
+        print(
+            f"No candy in gripper: measured width {held_width:.1f}mm is below {minimum_held:.1f}mm; "
+            "opening above the bowl and returning to scan",
+            flush=True,
+        )
+        hold_gripper(arm, waypoints["lift above bowl"], open_mm, hold_seconds)
+        move_robot(arm, "return to scan pose after missed grasp", waypoints["scan"], open_mm, timeout, speed, verbose=verbose)
+        raise GraspVerificationError(held_width, minimum_held)
+    move_robot(arm, "scan", waypoints["scan"], close_mm, timeout, speed, verbose=verbose)
+    carry.reached("scan", waypoints["scan"])
+    return held_width
+
+
+def return_candy_to_bowl(
+    arm: Piper, pickup_plan: list[tuple[str, np.ndarray]], carry: CandyCarry, settings: dict,
+) -> None:
+    """Carry a held candy back above the bowl along reached waypoints, drop it, and return to scan.
+
+    Retraces the carried path in reverse to the "lift above bowl" pose (or, if
+    the error came before it was reached, finishes the planned lift up to it),
+    opens the gripper there, and moves to the scan pose. The whole route is
+    path-checked from the measured joints before the first move.
+    """
+    if not carry.holding or not carry.path or carry.path[0][0] != "grasp":
+        raise DemoError("no tracked held candy to return")
+    names = [name for name, _ in pickup_plan]
+    waypoints = dict(pickup_plan)
+    reached = [name for name, _ in carry.path]
+    if "lift above bowl" in reached:
+        last = len(reached) - 1 - reached[::-1].index("lift above bowl")
+        back = [(f"return candy: retrace {name}", joints) for name, joints in reversed(carry.path[last + 1:])]
+    else:
+        remaining = names[names.index("grasp") + 1:names.index("lift above bowl")]
+        back = [(f"return candy: {name}", waypoints[name]) for name in remaining if name not in reached]
+    back.append(("return candy: above bowl", waypoints["lift above bowl"]))
+    validate_joint_path_safety(
+        "candy return to bowl",
+        [measured_start_joints(arm, "candy return to bowl"), *[joints for _, joints in back], waypoints["scan"]],
+    )
+    closed, opened = float(settings["grip_close_mm"]), float(settings["grip_open_mm"])
+    timeout, speed = float(settings["move_timeout_seconds"]), int(settings["pick_motion_speed_percent"])
+    for name, joints in back:
+        if np.max(np.abs(finite_vector(arm.joints_deg(), 6, "current joints") - joints)) < ARRIVAL_TOLERANCE_DEG:
+            continue
+        validate_joint_path_safety(name, [measured_start_joints(arm, name), joints])
+        move_robot(arm, name, joints, closed, timeout, speed)
+    print("motion: open gripper to drop the candy back into the bowl", flush=True)
+    carry.holding = False
+    hold_gripper(arm, waypoints["lift above bowl"], opened, float(settings["gripper_hold_seconds"]))
+    validate_joint_path_safety("return candy: back to scan", [measured_start_joints(arm, "back to scan"), waypoints["scan"]])
+    move_robot(arm, "return candy: back to scan", waypoints["scan"], opened, timeout, speed)
+
+
+def capture_age_seconds(capture: dict) -> float:
+    try:
+        timestamp = datetime.fromisoformat(capture["captured_at"])
+        if timestamp.tzinfo is None:
+            raise ValueError("timestamp must include a timezone")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise DemoError(f"invalid hand capture timestamp: {exc}") from exc
+    return (datetime.now(timezone.utc) - timestamp).total_seconds()
+
+
+def verify_fresh(capture: dict, maximum_age: float) -> None:
+    age = capture_age_seconds(capture)
+    if not -1.0 <= age <= maximum_age:
+        raise DemoError(f"hand capture is stale or future-dated ({age:.2f}s)")
+
+
+def capture_hand_target(
+    arm: Piper, hands: HandClient, camera_to_gripper: np.ndarray, settings: dict,
+) -> tuple[dict, dict]:
+    """Capture the hand from the current pose and decide where to drop (hand_target.py)."""
+    require_healthy(arm, "before hand scan")
+    before = np.asarray(arm.pose(), dtype=np.float64)
+    capture = hands.capture_hand(HAND_SLOT)
+    after = np.asarray(arm.pose(), dtype=np.float64)
+    camera_to_base = stationary_camera_to_base(before, after, camera_to_gripper, settings, "hand scan")
+    decision = choose_drop_target(
+        capture, lambda point: to_base_point(camera_to_base, point),
+        settings["hand_workspace_min_mm"], settings["hand_workspace_max_mm"],
+    )
+    return capture, decision
+
+
+def report_hand(capture: dict, decision: dict) -> str:
+    if decision["status"] == "ready":
+        target = "palm centre" if decision["target"] == "palm_center" else "finger base"
+        note = f" ({decision['palm_note']})" if decision.get("palm_note") else ""
+        return f"open palm: drop on the {target} at {np.round(decision['base_point_mm'], 1).tolist()}mm{note}"
+    return f"{decision['reason']} (hand service: {capture.get('status')})"
+
+
+def plan_drop(decision: dict, arm: Piper, scan: dict, settings: dict) -> dict[str, np.ndarray]:
+    """Plan and path-check the approach, release 35 mm above the target, retreat, and scan."""
+    point = finite_vector(decision["base_point_mm"], 3, "drop target")
+    validate_target_workspace(point, settings["hand_workspace_min_mm"], settings["hand_workspace_max_mm"])
+    plan = plan_hand_delivery(
+        point, arm.joints_deg(), scan["joints_deg"], settings["hand_delivery_rpy_deg"],
+        float(point[2]) + RELEASE_CLEARANCE_MM, float(settings["hand_approach_height_mm"]),
+    )
+    validate_joint_path_safety(
+        "hand drop and retreat",
+        [measured_start_joints(arm, "hand drop and retreat"), *[joints for _, joints in plan]],
+    )
+    return dict(plan)
+
+
+def wait_for_hand(
+    arm: Piper, hands: HandClient, scan: dict, camera_to_gripper: np.ndarray, settings: dict,
+) -> tuple[dict, dict, dict[str, np.ndarray]]:
+    """Hold the scan pose with the candy until an open hand has a reachable drop plan.
+
+    Retries every retry_delay_seconds, with no timeout and no motion. Prints the
+    reason only when it changes. Arm health is checked every attempt, so faults
+    stop waiting; so does Ctrl+C.
+    """
+    last_message = None
+    while True:
+        require_healthy(arm, "waiting at scan pose with candy")
+        try:
+            capture, decision = capture_hand_target(arm, hands, camera_to_gripper, settings)
+            message = report_hand(capture, decision)
+            if decision["status"] == "ready":
+                plan = plan_drop(decision, arm, scan, settings)
+                verify_fresh(capture, MAXIMUM_HAND_AGE_SECONDS)
+                print(f"HAND SCAN: {message}", flush=True)
+                return capture, decision, plan
+        except DemoError as exc:
+            message = str(exc)
+        if message != last_message:
+            print(f"Waiting at scan pose with candy: {message}", flush=True)
+            last_message = message
+        time.sleep(float(settings["retry_delay_seconds"]))
+
+
+def deliver_to_hand(
+    arm: Piper, hands: HandClient, scan: dict, camera_to_gripper: np.ndarray, settings: dict, carry: CandyCarry,
+) -> None:
+    """Wait for an open hand, then approach and release 35 mm above the chosen point.
+
+    The approach uses the single accepted capture, so the hand must stay still;
+    the capture must still be fresh before the approach and before release.
+    Reached waypoints are recorded until the gripper starts opening.
+    """
+    closed, opened = float(settings["grip_close_mm"]), float(settings["grip_open_mm"])
+    capture, _, plan = wait_for_hand(arm, hands, scan, camera_to_gripper, settings)
+    checked_move(arm, "hand approach", plan["hand approach"], closed, settings)
+    carry.reached("hand approach", plan["hand approach"])
+    verify_fresh(capture, MAXIMUM_HAND_AGE_SECONDS)
+    checked_move(arm, f"hand release height (+{RELEASE_CLEARANCE_MM:.0f}mm)", plan["hand release"], closed, settings)
+    carry.reached("hand release height", plan["hand release"])
+    verify_fresh(capture, MAXIMUM_HAND_AGE_SECONDS)
+    # Once opening starts above the hand, never carry anything back to the bowl.
+    carry.holding = False
+    hold_gripper(arm, plan["hand release"], opened, float(settings["gripper_hold_seconds"]))
+    checked_move(arm, "hand retreat", plan["hand retreat"], opened, settings)
+    checked_move(arm, "return to scan", scan["joints_deg"], opened, settings)
+
+
+def go_to_scan(arm: Piper, scan: dict, settings: dict) -> None:
+    """Move to the scan pose with the gripper open (if not already there) and let it settle."""
+    current = finite_vector(arm.joints_deg(), 6, "current joints")
+    if np.max(np.abs(current - scan["joints_deg"])) >= ARRIVAL_TOLERANCE_DEG:
+        checked_move(arm, "scan", scan["joints_deg"], float(settings["grip_open_mm"]), settings)
+    time.sleep(float(settings["scan_settle_seconds"]))
+
+
+def run_cycle(
+    arm: Piper, camera: CameraClient, hands: HandClient | None, scan: dict,
+    camera_to_gripper: np.ndarray, settings: dict, pick_only: bool = False,
+) -> bool:
+    """Pick one candy from the bowl, then drop it on a hand (or back in the bowl with pick_only).
+
+    Return True after a drop, False when nothing was picked (no bowl or
+    pickable candy, no reachable grasp, missed grasp) or a held candy had to be
+    returned to the bowl after an error. Errors with nothing held, failed
+    returns, and Ctrl+C propagate and stop the loop.
+    """
+    go_to_scan(arm, scan, settings)
+    result = scan_bowl(arm, camera, camera_to_gripper, settings)
+    if result["status"] != "detected":
+        return False
+    try:
+        candy, plan = pick_first_reachable(arm, result, scan, settings)
+    except NoReachableCandyError as exc:
+        print(f"{exc}; scanning again", flush=True)
+        return False
+    print(f"Picking candy at {np.round(candy['base_point_mm'], 1).tolist()}mm", flush=True)
+    carry = CandyCarry()
+    try:
+        width = execute_bowl_pickup(arm, plan, settings, carry, candy)
+        print(f"Pickup confirmed: gripper width={width:.1f}mm", flush=True)
+        if pick_only:
+            return_candy_to_bowl(arm, plan, carry, settings)
+            return True
+        deliver_to_hand(arm, hands, scan, camera_to_gripper, settings, carry)
+        print("Candy dropped on the hand", flush=True)
+    except GraspVerificationError as exc:
+        print(f"Pickup missed: {exc}; scanning again", flush=True)
+        return False
+    except (RuntimeError, OSError, KeyError, TypeError, ValueError) as exc:
+        if not carry.holding:
+            raise
+        print(f"ERROR while holding candy: {exc}", flush=True)
+        print("Returning the candy to the bowl", flush=True)
+        try:
+            return_candy_to_bowl(arm, plan, carry, settings)
+        except (RuntimeError, OSError, KeyError, TypeError, ValueError) as return_exc:
+            raise DemoError(f"candy return failed after '{exc}': {return_exc}") from return_exc
+        print("Candy returned; continuing", flush=True)
+        return False
+    return True
+
+
+def run_scan_only(
+    arm: Piper, camera: CameraClient, hands: HandClient, scan: dict,
+    camera_to_gripper: np.ndarray, settings: dict,
+) -> None:
+    """One no-pick report at the scan pose: bowl, candies, and hand."""
+    go_to_scan(arm, scan, settings)
+    result = scan_bowl(arm, camera, camera_to_gripper, settings)
+    if result["pickable"]:
+        try:
+            candy, _ = pick_first_reachable(arm, result, scan, settings)
+            print(f"  would pick the candy at {np.round(candy['base_point_mm'], 1).tolist()}mm", flush=True)
+        except NoReachableCandyError as exc:
+            print(f"  {exc}", flush=True)
+    print(f"  annotated photo: {BOWL_SCAN_IMAGE}", flush=True)
+    try:
+        capture, decision = capture_hand_target(arm, hands, camera_to_gripper, settings)
+        print(f"HAND SCAN: {report_hand(capture, decision)}", flush=True)
+    except DemoError as exc:
+        print(f"HAND SCAN: {exc}", flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse file/service locations, mode, cycle limit, and the explicit motion permission."""
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--calibration-dir", type=Path, default=CALIBRATION_DIR / "calibration")
+    parser.add_argument("--scan-poses", type=Path, default=DEFAULT_SCAN_POSES)
+    parser.add_argument("--vision-url", default=DEFAULT_VISION_URL)
+    parser.add_argument("--hand-url", default="http://127.0.0.1:8095")
+    parser.add_argument("--can-interface", default="can_piper")
+    parser.add_argument(
+        "--check-only", action="store_true",
+        help="preflight only (restarts k3s if its address is stale); never connect to CAN",
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--scan-only", action="store_true",
+        help="move to the scan pose and report bowl, candies, and hand each cycle; never picks",
+    )
+    mode.add_argument(
+        "--pick-only", action="store_true",
+        help="pick a candy from the bowl and drop it back in; no hand service needed",
+    )
+    parser.add_argument("--verbose", action="store_true", help="print each motion and skipped-candy reasons")
+    parser.add_argument(
+        "--pause-before-grip", action="store_true",
+        help="hold each grasp pose with the jaws open and ask for the measured candy offset "
+        "before closing; prints the suggested candy_xy_correction_mm",
+    )
+    parser.add_argument(
+        "--allow-motion", action="store_true",
+        help="connect to the arm and run; without it only the preflight runs",
+    )
+    parser.add_argument("--max-cycles", type=int, default=0, help="zero (default) loops until Ctrl+C")
+    return parser.parse_args()
+
+
+def main() -> int:
+    """Preflight k3s, services, and setup, enforce the motion gate, and run the supervised loop.
+
     Check-only never connects to CAN. Every connected exit attempts a checked
     SDK-zero return, opens the gripper once zero is reached, then disconnects.
     """
@@ -2474,21 +1517,16 @@ def main() -> int:
         return 2
     arm = None
     exit_code = 0
+    settings: dict = {}
     try:
         hand_eye = load_hand_eye(args.calibration_dir)
-        camera_serial = hand_eye["camera"]["serial"]
-        objects = VisionClient(
-            args.vision_url, detection_url=args.detection_url,
-            detector=OpenCVCandyDetector() if args.detector == "opencv" else None,
-        )
-        hands = HandClient(args.hand_url)
+        camera = CameraClient(args.vision_url)
+        hands = None if args.pick_only else HandClient(args.hand_url)
         ensure_k3s_address()
-        check_services(
-            HttpClient(args.vision_url), objects,
-            None if getattr(args, "pick_candy_only", False) else hands, camera_serial,
-        )
+        check_services(camera, hands, hand_eye["camera"]["serial"])
         settings, camera_to_gripper, scans = load_setup(args, hand_eye)
-        print(f"[OK] Accepted D435 calibration and {len(scans)} taught scan pose(s)", flush=True)
+        scan = scans[0]
+        print(f"[OK] Accepted D435 calibration and scan pose {int(scan['index'])}", flush=True)
         if args.check_only:
             print("Preflight passed; no CAN connection or arm motion", flush=True)
             return 0
@@ -2496,26 +1534,26 @@ def main() -> int:
             raise DemoError("motion requires --allow-motion")
         if settings.get("pause_before_grip") and not sys.stdin.isatty():
             raise DemoError("--pause-before-grip needs an interactive terminal to type candy offsets")
-        print(
-            "Will begin robot movement shortly, keep emergency stop accessible. "
-            "Connecting in 5 seconds.", flush=True,
-        )
+        print("Will begin robot movement shortly, keep emergency stop accessible. Connecting in 5 seconds.", flush=True)
         for _ in range(5):
             time.sleep(1)
         arm = connect_robot(iface=args.can_interface, verbose=args.verbose)
-        prepare_robot_for_scan(arm, scans[0], settings)
+        prepare_robot_for_scan(arm, scan, settings)
         cycle = 0
         while args.max_cycles == 0 or cycle < args.max_cycles:
             cycle += 1
-            print(f"\nIGNITE CYCLE {cycle}", flush=True)
-            run_cycle(arm, objects, hands, scans, camera_to_gripper, settings, MAXIMUM_HAND_AGE_SECONDS)
+            print(f"\nGTC CYCLE {cycle}", flush=True)
+            if args.scan_only:
+                run_scan_only(arm, camera, hands, scan, camera_to_gripper, settings)
+            else:
+                run_cycle(arm, camera, hands, scan, camera_to_gripper, settings, pick_only=args.pick_only)
             time.sleep(float(settings["retry_delay_seconds"]))
     except KeyboardInterrupt:
         if arm is None:
             print("Interrupted before arm connection; no zero-return motion.", file=sys.stderr)
         exit_code = 130
     except (RuntimeError, CalibrationError, HandEyeError, OSError, KeyError, TypeError, ValueError) as exc:
-        print(f"ERROR: Ignite demo stopped: {exc}", file=sys.stderr)
+        print(f"ERROR: GTC demo stopped: {exc}", file=sys.stderr)
         exit_code = 2
     finally:
         if arm is not None:

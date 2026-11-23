@@ -156,7 +156,7 @@ def capture_frame(
             "corners_mm": [list(corner) for corner in WORKSPACE_CORNERS_MM],
             "minimum_z_mm": WORKSPACE_MIN_Z_MM,
             "maximum_z_mm": WORKSPACE_MAX_Z_MM,
-            "grasp_tip_z_mm": float(settings["grasp_tip_z_mm"]),
+            "grasp_tip_z_mm": settings.get("grasp_tip_z_mm"),
         },
         "yolo_reference": reference,
     }
