@@ -42,6 +42,9 @@ BOWL_SETTINGS = {
     # Wide enough for the inner edge of the bowl's red rim band (r ~66 mm in the
     # 2026-11-23 photos) as well as the outer rim (r 76 mm).
     "bowl_radius_tolerance": 0.15,
+    # Nothing on the bowl is wider than its outer rim. A short visible arc also fits
+    # larger circles centred off the bowl (r 87 mm, 13 mm off, at 23% in view).
+    "maximum_rim_radius_fraction": 1.05,
     # Top-down view covers the demo workspace plus room for a rim past its edge.
     "view_x_mm": [50.0, 690.0],
     "view_y_mm": [-260.0, 300.0],
@@ -257,6 +260,7 @@ def find_rim_circles(top: np.ndarray, valid: np.ndarray, settings: dict) -> list
         param1=settings["canny_high"], param2=settings["hough_accumulator"],
         minRadius=int(radius_px * (1 - spread)), maxRadius=int(math.ceil(radius_px * (1 + spread))),
     )
+    largest_px = radius_px * settings["maximum_rim_radius_fraction"]
     circles = []
     for column, row, radius in ([] if found is None else found[0][: settings["maximum_circle_candidates"]]):
         support, visible = rim_support(edges, valid, (column, row), radius)
@@ -264,7 +268,7 @@ def find_rim_circles(top: np.ndarray, valid: np.ndarray, settings: dict) -> list
             "raster_center": [float(column), float(row)], "radius_px": float(radius),
             "rim_support": support, "visible_fraction": visible,
             "accepted": support >= settings["minimum_rim_support"]
-            and visible >= settings["minimum_rim_visible_fraction"],
+            and visible >= settings["minimum_rim_visible_fraction"] and radius <= largest_px,
         })
     return sorted(circles, key=lambda circle: circle["rim_support"], reverse=True)
 

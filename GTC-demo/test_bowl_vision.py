@@ -143,6 +143,14 @@ class BowlDetectionTests(unittest.TestCase):
         self.assertGreater(result["bowl"]["rim_support"], 0.97)  # 0.93 if the finger counted as missing rim
         self.assertLess(result["bowl"]["visible_fraction"], 1.0)
 
+    def test_circle_wider_than_the_bowl_is_not_accepted(self):
+        top = np.full((400, 400, 3), 200, np.uint8)
+        cv2.circle(top, (200, 200), 86, (60, 60, 60), 3)
+        valid = np.full((400, 400), 255, np.uint8)
+        self.assertFalse(any(c["accepted"] for c in bv.find_rim_circles(top, valid, bv.BOWL_SETTINGS)))
+        uncapped = {**bv.BOWL_SETTINGS, "maximum_rim_radius_fraction": 1.2}
+        self.assertTrue(any(c["accepted"] for c in bv.find_rim_circles(top, valid, uncapped)))
+
     def test_packed_same_colour_block_is_not_guessed_at_its_centre(self):
         block = [(345 + dx, 15 + dy, 0, RED) for dx in (0, 25.4) for dy in (0, 25.4)]
         frame, c2b = render(candies=block)
