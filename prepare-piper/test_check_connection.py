@@ -2,7 +2,10 @@ import contextlib
 from enum import Enum
 import importlib.util
 import io
+import itertools
+import json
 from pathlib import Path
+import subprocess
 import sys
 from types import SimpleNamespace
 import unittest
@@ -47,9 +50,10 @@ class ConnectionWarningTests(unittest.TestCase):
         piper.GetArmJointMsgs.return_value = None
         output, errors = io.StringIO(), io.StringIO()
         with patch.object(check_connection, "C_PiperInterface_V2", return_value=piper, create=True), \
+                patch.object(check_connection, "can_link_problem", return_value=None), \
                 patch.object(check_connection.time, "sleep"), \
                 contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
-            check_connection.main()
+            self.assertEqual(check_connection.main(), 0)
         self.assertIn("WARNING:", errors.getvalue())
         self.assertIn("MasterSlaveConfig(0xFC, 0, 0, 0)", output.getvalue())
         self.assertIn("sudo systemctl restart piper-can.service", output.getvalue())
@@ -86,6 +90,94 @@ class ConnectionWarningTests(unittest.TestCase):
                 with contextlib.redirect_stderr(errors):
                     check_connection.print_standby_warning(status)
                 self.assertEqual(errors.getvalue(), "")
+
+    @staticmethod
+    def ip_link(returncode=0, flags=("NOARP", "UP", "LOWER_UP"), state="ERROR-ACTIVE", bitrate=1000000):
+        link = [{"flags": list(flags), "linkinfo": {"info_kind": "can", "info_data": {
+            "state": state, "bittiming": {"bitrate": bitrate}}}}]
+        return subprocess.CompletedProcess([], returncode, stdout=json.dumps(link), stderr="")
+
+    def test_can_link_problem_reports_missing_down_passive_or_wrong_bitrate(self):
+        cases = (
+            (self.ip_link(), None),
+            (self.ip_link(returncode=1), "does not exist"),
+            (self.ip_link(flags=("NOARP",), state="STOPPED"), "link is DOWN"),
+            (self.ip_link(state="ERROR-PASSIVE"), "can state ERROR-PASSIVE"),
+            (self.ip_link(bitrate=500000), "bitrate 500000"),
+        )
+        for result, expected in cases:
+            with self.subTest(expected=expected), \
+                    patch.object(check_connection.subprocess, "run", return_value=result):
+                problem = check_connection.can_link_problem("can_piper")
+            if expected is None:
+                self.assertIsNone(problem)
+            else:
+                self.assertIn(expected, problem)
+
+    def test_unusable_can_link_stops_before_contacting_the_arm(self):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(check_connection, "can_link_problem", return_value="CAN interface can_piper does not exist"), \
+                patch.object(check_connection, "C_PiperInterface_V2", create=True) as interface, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            self.assertEqual(check_connection.main(), 1)
+        interface.assert_not_called()
+        self.assertIn("does not exist", errors.getvalue())
+        self.assertIn("sudo systemctl restart piper-can.service", output.getvalue())
+
+    def arm(self, mode, enabled=False, switch_works=True):
+        """Mock arm whose ModeCtrl/EnablePiper take effect only if switch_works."""
+        state = {"mode": mode, "enabled": enabled}
+        piper = Mock()
+        piper.GetArmStatus.side_effect = lambda: SimpleNamespace(
+            Hz=200, arm_status=SimpleNamespace(ctrl_mode=state["mode"]))
+        piper.GetArmJointMsgs.return_value = self.joints()
+        piper.GetArmEnableStatus.side_effect = lambda: [state["enabled"]] * 6
+        if switch_works:
+            piper.ModeCtrl.side_effect = lambda *args: state.update(mode=check_connection.CAN_CTRL)
+            piper.EnablePiper.side_effect = lambda: state.update(enabled=True)
+        return piper
+
+    def run_main(self, piper):
+        output, errors = io.StringIO(), io.StringIO()
+        with patch.object(check_connection, "C_PiperInterface_V2", return_value=piper, create=True), \
+                patch.object(check_connection, "can_link_problem", return_value=None), \
+                patch.object(check_connection.time, "sleep"), \
+                patch.object(check_connection.time, "monotonic", side_effect=itertools.count(0, 1)), \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = check_connection.main()
+        return code, output.getvalue(), errors.getvalue()
+
+    def test_live_standby_enables_then_switches_to_can_ctrl_and_prints_new_status(self):
+        piper = self.arm(check_connection.STANDBY)
+        code, output, _ = self.run_main(piper)
+        self.assertEqual(code, 0)
+        piper.ModeCtrl.assert_called_with(0x01, 0x01, 30, 0x00)
+        piper.EnablePiper.assert_called()
+        calls = [name for name, *_ in piper.mock_calls]
+        self.assertLess(calls.index("ModeCtrl"), calls.index("EnablePiper"))
+        after = output.split("Arm status after switching (piper.GetArmStatus()):", 1)[1]
+        self.assertIn("ctrl_mode=1", after)
+        self.assertIn("EnableStatus: [True, True, True, True, True, True]", after)
+        self.assertIn("OK: Control Mode CAN_CTRL", after)
+
+    def test_failed_switch_reports_and_returns_error(self):
+        piper = self.arm(check_connection.STANDBY, switch_works=False)
+        code, output, errors = self.run_main(piper)
+        self.assertEqual(code, 1)
+        self.assertIn("FAILED: not in CAN_CTRL", errors)
+        self.assertIn("Arm status after switching", output)
+
+    def test_can_ctrl_teaching_and_other_modes_are_left_unchanged(self):
+        for mode, message in ((check_connection.CAN_CTRL, "already CAN_CTRL"),
+                              (check_connection.TEACHING_MODE, "TEACHING_MODE"),
+                              (0x07, "only STANDBY is switched")):
+            with self.subTest(mode=mode):
+                piper = self.arm(mode, enabled=True)
+                code, output, _ = self.run_main(piper)
+                self.assertEqual(code, 0)
+                self.assertIn(message, output)
+                piper.ModeCtrl.assert_not_called()
+                piper.EnablePiper.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -134,6 +134,9 @@ piper.ModeCtrl(0x01, 0x01, 30, 0x00)   # ctrl_mode=CAN_CTRL, move_mode=MOVE_J, s
 Re-check `piper.GetArmStatus()` - `Control Mode` should now read `CAN_CTRL(0x1)`.
 The arm is ready for scripted motion commands at this point.
 
+`check_connection.py` (step 4) does this step itself when the arm reports
+`STANDBY`, then prints `piper.GetArmStatus()` again.
+
 ## Notes
 
 - If the CAN adapter re-enumerates (e.g. after any arm power cycle), repeat

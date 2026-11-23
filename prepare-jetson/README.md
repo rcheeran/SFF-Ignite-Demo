@@ -44,9 +44,10 @@ source ~/venv/bin/activate
 python3 prepare-piper/check_connection.py can_piper
 ```
 
-Read-only: connects with both `pyAgxArm` and `piper_sdk`, prints firmware
-info, CAN fps, joint enable status, arm status, and joint angles. Sends no
-motion commands.
+Connects with `piper_sdk` after checking that the CAN interface is up, and
+prints CAN fps, arm status, joint angles, and joint enable status. If the arm
+reports `Control Mode` `STANDBY`, it enables the motors and switches to
+`CAN_CTRL`, then prints the status again. Sends no motion commands.
 
 ## Wrist-mounted D405 calibration
 
@@ -242,7 +243,7 @@ service UI and API.
 
 - `useful-piper-scripts/find_all_can_port.sh` - lists connected CAN adapters and their USB bus addresses (from AgileX's `pyAgxArm` repo, `pyAgxArm/scripts/ubuntu/`).
 - `prepare-piper/can_activate.sh` - brings up a CAN adapter with a given name/bitrate (same source).
-- `prepare-piper/check_connection.py` - read-only SDK connectivity/status check.
+- `prepare-piper/check_connection.py` - SDK connectivity/status check; switches a STANDBY arm to CAN_CTRL.
 
 ## Known issue: arm status / joint angle frames not received
 

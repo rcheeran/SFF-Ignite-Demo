@@ -86,23 +86,29 @@ re-plugged). Reset the bus with:
 bash prepare-jetson/can_up.sh
 ```
 
-Then run the read-only arm check (no motion is sent):
+Then run the arm check:
 
 ```bash
 python prepare-piper/check_connection.py can_piper
 ```
+
+It first checks the CAN link and stops with the fix if it is not usable. If the
+arm reports `Control Mode` `STANDBY` (for example after a fresh power-on), it
+enables all six motors and switches to `CAN_CTRL`, then prints the status again.
+The joints stiffen where they are; no motion is sent. Other modes are left
+unchanged.
 
 Healthy output includes:
 
 | Line | Expected |
 |---|---|
 | `ArmStatus.Hz` / `JointMsgs.Hz` | about `200.0` (`0.0` means the arm is in Master mode or needs a power cycle; see [SETUP.md](../prepare-jetson/SETUP.md)) |
-| `Control Mode` | `CAN_CTRL` |
+| `Control Mode` | `CAN_CTRL` (after the switch, if it started in `STANDBY`) |
 | `Arm Status` | `NORMAL` |
 | `Teach Status` | `STOP_RECORDING` |
 | `Error Code` | `0` |
 | `Joint N Angle Limit Status` / `Communication Status` | all `False` (no fault) |
-| `EnableStatus` | six `True` values (may be `False` after a fresh power-on; the demo enables the arm) |
+| `EnableStatus` | six `True` values |
 
 Only one program can use the CAN bus safely at a time: do not run this check
 while `demo.py` is running.
