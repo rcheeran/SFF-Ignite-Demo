@@ -1,0 +1,20 @@
+[Unit]
+Description=Ignite candy demo (Piper arm moves automatically)
+Documentation=file:///home/clouduser/SFF-Ignite-Demo/Demo-Ignite/EVENT_DAY.md
+RequiresMountsFor=/home/clouduser/SFF-Ignite-Demo
+Wants=network-online.target k3s.service piper-can.service
+After=network-online.target k3s.service piper-can.service
+
+[Service]
+Type=simple
+User=clouduser
+Group=clouduser
+WorkingDirectory=/home/clouduser/SFF-Ignite-Demo
+ExecStart=/home/clouduser/SFF-Ignite-Demo/Demo-Ignite/run_demo_at_boot.sh
+# Stop like Ctrl+C so the demo returns the arm to zero and opens the gripper.
+KillSignal=SIGINT
+TimeoutStopSec=120
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
