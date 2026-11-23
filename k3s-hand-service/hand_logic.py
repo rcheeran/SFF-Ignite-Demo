@@ -60,6 +60,22 @@ def extended_finger_count(landmarks: list[dict[str, float]]) -> int:
     return count
 
 
+def palm_to_finger_base_mm(world_landmarks: Any) -> float | None:
+    """Metric palm-centre to finger-base distance from MediaPipe world landmarks (metres).
+
+    The palm centre is midway between the wrist and the knuckle centre, so this
+    is half the wrist-to-knuckle distance. None without a full landmark set.
+    """
+    points = [[point.x, point.y, point.z] for point in world_landmarks]
+    if len(points) != 21:
+        return None
+    points = np.asarray(points, dtype=np.float64)
+    if not np.all(np.isfinite(points)):
+        return None
+    knuckles = points[list(PALM_KNUCKLE_LANDMARKS)].mean(axis=0)
+    return float(np.linalg.norm(knuckles - points[0]) / 2.0 * 1000.0)
+
+
 def serialize_result(result: Any, width: int, height: int) -> list[dict[str, Any]]:
     hands = []
     handedness = list(getattr(result, "handedness", []))
@@ -102,6 +118,13 @@ def serialize_result(result: Any, width: int, height: int) -> list[dict[str, Any
                     int(round(float(palm[0]) * width)),
                     int(round(float(palm[1]) * height)),
                 ],
+                # Base of the fingers: the centre of the four knuckles.
+                "finger_base_normalized": knuckle_center.tolist(),
+                "finger_base_pixel": [
+                    int(round(float(knuckle_center[0]) * width)),
+                    int(round(float(knuckle_center[1]) * height)),
+                ],
+                "palm_to_finger_base_world_mm": palm_to_finger_base_mm(world),
                 "extended_finger_count": finger_count,
                 "is_open_palm": finger_count == len(FINGER_LANDMARKS),
                 "landmarks": normalized,
@@ -138,6 +161,15 @@ def annotate_frame(frame: np.ndarray, hands: list[dict[str, Any]]) -> np.ndarray
             22,
             2,
         )
+        if hand.get("finger_base_pixel") is not None:
+            cv2.drawMarker(
+                annotated,
+                tuple(hand["finger_base_pixel"]),
+                (255, 128, 0),
+                cv2.MARKER_DIAMOND,
+                14,
+                2,
+            )
         gesture = "open palm" if hand.get("is_open_palm") else "hand"
         label = (
             f"{hand['handedness']} {gesture} "

@@ -24,7 +24,7 @@ http://10.0.0.19:8095/
 |---|---|---|
 | `GET` | `/` | Annotated stream and latest JSON |
 | `GET` | `/healthz` | Source/model/service health |
-| `GET` | `/api/hands` | Latest handedness, 21 landmarks, and palm center |
+| `GET` | `/api/hands` | Latest handedness, 21 landmarks, palm centre, and finger base |
 | `GET` | `/api/snapshots` | Hand scan metadata for slots 4-6 |
 | `POST` | `/api/capture` | Stable synchronized RGB-D hand capture for slot 4-6 |
 | `GET` | `/snapshots/{4,5,6}.jpg` | Annotated hand scan image |
@@ -59,6 +59,20 @@ sample rather than aborting the slot; at least three samples must still have
 valid depth. The capture response reports visible-hand samples, open-palm
 detections, valid depth samples, stable and outlier counts, stable and raw
 spread, and exact depth-rejection reasons.
+
+The response also has a `points` block (added for the GTC demo; `status` and
+the palm fields above are unchanged). It reports the palm centre and the
+finger base (the centroid of the four knuckles) separately, each with its
+pixel and, when visible, D435 camera-frame XYZ:
+
+| `points.*.status` | Meaning |
+|---|---|
+| `visible` | At least three samples had valid depth within 50 mm of their median |
+| `no_depth` / `unstable` | Too few valid depth samples / no stable cluster |
+| `inconsistent` | Both points had depth, but their 3D separation differs from the hand size MediaPipe measured (`palm_to_finger_base_world_mm`) by more than `MAXIMUM_POINT_SEPARATION_ERROR_MM` (25 mm): one is occluded or its depth comes from behind the hand |
+
+The live stream marks the finger base with an orange diamond next to the
+magenta palm cross.
 
 ## Operations
 

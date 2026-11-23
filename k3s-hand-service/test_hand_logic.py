@@ -38,6 +38,22 @@ class HandLogicTests(unittest.TestCase):
             hands[0]["palm_center_pixel"],
             [round(expected_x * 640), round(expected_y * 480)],
         )
+        knuckle = np.mean([5, 9, 13, 17])
+        self.assertEqual(
+            hands[0]["finger_base_pixel"],
+            [round(knuckle / 20 * 640), round(knuckle / 40 * 480)],
+        )
+        # World landmarks equal the image ones here: half the wrist-to-knuckle distance, in mm.
+        expected_mm = np.linalg.norm([knuckle / 20, knuckle / 40, -knuckle / 100]) / 2 * 1000
+        self.assertAlmostEqual(hands[0]["palm_to_finger_base_world_mm"], expected_mm)
+
+    def test_world_distance_needs_a_full_landmark_set(self) -> None:
+        result = SimpleNamespace(
+            hand_landmarks=[[SimpleNamespace(x=0.5, y=0.5, z=0.0)] * 21],
+            hand_world_landmarks=[],
+            handedness=[],
+        )
+        self.assertIsNone(serialize_result(result, 640, 480)[0]["palm_to_finger_base_world_mm"])
 
     def test_annotation_preserves_shape(self) -> None:
         points = [

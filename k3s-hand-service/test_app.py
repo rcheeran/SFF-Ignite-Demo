@@ -213,6 +213,67 @@ class HandCaptureTests(unittest.TestCase):
         self.assertEqual(result["visible_hand_sample_count"], 1)
         self.assertEqual(result["detected_sample_count"], 0)
         stream._json_request.assert_not_called()
+        self.assertNotIn("points", result)
+
+
+class FingerBasePointTests(unittest.TestCase):
+    """Palm centre and finger base are reported separately with depth visibility."""
+
+    def capture(self, depth_by_pixel: dict) -> dict:
+        stream = HandLandmarkerStream.__new__(HandLandmarkerStream)
+        stream.stability_samples = 3
+        stream.minimum_stable_samples = 3
+        stream.maximum_palm_spread_mm = 50.0
+        stream.maximum_point_separation_error_mm = 25.0
+        stream.model_path = Path("hand_landmarker.task")
+        stream.snapshots = {}
+        stream.snapshot_jpegs = {}
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        stream._synchronized_frame = mock.Mock(
+            side_effect=[
+                (frame, {"token": f"token-{index}", "frame_sequence": index})
+                for index in range(3)
+            ]
+        )
+        hand = detected_hand()
+        hand.update(finger_base_pixel=[320, 200], palm_to_finger_base_world_mm=45.0)
+        stream._detect_frame = mock.Mock(return_value=[hand])
+
+        def deproject(path: str, payload: dict) -> dict:
+            value = depth_by_pixel[tuple(payload["pixel_uv"])]
+            if isinstance(value, Exception):
+                raise value
+            return {"camera_point_mm": value}
+
+        stream._json_request = mock.Mock(side_effect=deproject)
+        with mock.patch("time.sleep"):
+            return stream.capture_slot(4)
+
+    def test_both_points_visible_when_depth_matches_hand_size(self) -> None:
+        result = self.capture({(320, 240): [0.0, 0.0, 300.0], (320, 200): [0.0, -44.0, 305.0]})
+        self.assertEqual(result["status"], "detected")
+        points = result["points"]
+        self.assertEqual(points["palm_center"]["status"], "visible")
+        self.assertEqual(points["finger_base"]["status"], "visible")
+        self.assertEqual(points["finger_base"]["camera_point_mm"], [0.0, -44.0, 305.0])
+        self.assertEqual(points["finger_base"]["pixel"], [320, 200])
+        self.assertAlmostEqual(points["finger_base"]["measured_separation_mm"], 44.28, places=2)
+
+    def test_finger_base_visible_without_palm_depth(self) -> None:
+        result = self.capture({
+            (320, 240): VisionServiceRejected("no usable depth"),
+            (320, 200): [0.0, -44.0, 305.0],
+        })
+        self.assertEqual(result["status"], "rejected")  # palm-based status is unchanged
+        self.assertEqual(result["points"]["palm_center"]["status"], "no_depth")
+        self.assertEqual(result["points"]["palm_center"]["pixel"], [320, 240])
+        self.assertEqual(result["points"]["finger_base"]["status"], "visible")
+
+    def test_depth_that_disagrees_with_hand_size_is_inconsistent(self) -> None:
+        # Finger-base depth 100 mm nearer the camera: something is in front of the hand.
+        result = self.capture({(320, 240): [0.0, 0.0, 300.0], (320, 200): [0.0, -44.0, 200.0]})
+        self.assertEqual(result["points"]["palm_center"]["status"], "inconsistent")
+        self.assertEqual(result["points"]["finger_base"]["status"], "inconsistent")
 
 
 if __name__ == "__main__":

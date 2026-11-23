@@ -73,6 +73,12 @@ class HandLandmarkerStream:
         self.maximum_palm_spread_mm = env_float(
             "MAXIMUM_PALM_SPREAD_MM", 50.0
         )
+        # Palm centre and finger base whose depth disagrees with the hand's
+        # measured size by more than this are marked inconsistent (occluded or
+        # depth from behind the hand).
+        self.maximum_point_separation_error_mm = env_float(
+            "MAXIMUM_POINT_SEPARATION_ERROR_MM", 25.0
+        )
         if self.inference_fps <= 0:
             raise HandServiceError("INFERENCE_FPS must be positive")
         for name, value in (
@@ -261,11 +267,13 @@ class HandLandmarkerStream:
         if slot not in (4, 5, 6):
             raise HandServiceError("hand slot must be 4, 5, or 6")
         samples = []
+        finger_base_samples = []
         detected_sample_count = 0
         visible_hand_sample_count = 0
         depth_rejections: list[str] = []
         best_frame = None
         best_hands = []
+        best_open_hand: dict[str, Any] | None = None
         best_score = -1.0
         for _ in range(self.stability_samples):
             frame, synchronized = self._synchronized_frame()
@@ -284,6 +292,7 @@ class HandLandmarkerStream:
                     best_score = score
                     best_frame = frame
                     best_hands = hands
+                    best_open_hand = hand
                 try:
                     depth = self._json_request(
                         "/api/deproject",
@@ -294,16 +303,33 @@ class HandLandmarkerStream:
                     )
                 except VisionServiceRejected as exc:
                     depth_rejections.append(str(exc))
-                    time.sleep(0.08)
-                    continue
-                sample = {
-                    "score": score,
-                    "hand": hand,
-                    "camera_point_mm": depth["camera_point_mm"],
-                    "depth": depth,
-                    "frame_sequence": synchronized["frame_sequence"],
-                }
-                samples.append(sample)
+                else:
+                    sample = {
+                        "score": score,
+                        "hand": hand,
+                        "pixel": hand["palm_center_pixel"],
+                        "camera_point_mm": depth["camera_point_mm"],
+                        "depth": depth,
+                        "frame_sequence": synchronized["frame_sequence"],
+                    }
+                    samples.append(sample)
+                if hand.get("finger_base_pixel") is not None:
+                    try:
+                        finger_depth = self._json_request(
+                            "/api/deproject",
+                            {
+                                "token": synchronized["token"],
+                                "pixel_uv": hand["finger_base_pixel"],
+                            },
+                        )
+                    except VisionServiceRejected:
+                        pass
+                    else:
+                        finger_base_samples.append({
+                            "score": score,
+                            "pixel": hand["finger_base_pixel"],
+                            "camera_point_mm": finger_depth["camera_point_mm"],
+                        })
             elif best_frame is None:
                 best_frame = frame
             time.sleep(0.08)
@@ -391,6 +417,10 @@ class HandLandmarkerStream:
                     ),
                 }
             )
+        if detected_sample_count and best_open_hand is not None:
+            result["points"] = self._point_report(
+                samples, finger_base_samples, best_open_hand
+            )
         annotated = annotate_frame(best_frame, best_hands)
         ok, encoded = cv2.imencode(".jpg", annotated)
         if not ok:
@@ -399,6 +429,70 @@ class HandLandmarkerStream:
         self.snapshots[slot] = result
         self.snapshot_jpegs[slot] = encoded.tobytes()
         return result
+
+    def _point_consensus(
+        self, samples: list[dict[str, Any]], fallback_pixel: Any
+    ) -> dict[str, Any]:
+        """Depth consensus for one hand point across samples, like the palm's."""
+        report: dict[str, Any] = {
+            "status": "no_depth",
+            "pixel": fallback_pixel,
+            "depth_sample_count": len(samples),
+        }
+        if len(samples) < self.minimum_stable_samples:
+            return report
+        points = np.asarray(
+            [sample["camera_point_mm"] for sample in samples], dtype=np.float64
+        )
+        inliers = (
+            np.linalg.norm(points - np.median(points, axis=0), axis=1)
+            <= self.maximum_palm_spread_mm
+        )
+        report["stable_sample_count"] = int(inliers.sum())
+        if inliers.sum() < self.minimum_stable_samples:
+            report["status"] = "unstable"
+            return report
+        best = max(
+            (sample for sample, keep in zip(samples, inliers) if keep),
+            key=lambda value: value["score"],
+        )
+        report.update(
+            status="visible",
+            pixel=best["pixel"],
+            camera_point_mm=np.median(points[inliers], axis=0).tolist(),
+        )
+        return report
+
+    def _point_report(
+        self,
+        palm_samples: list[dict[str, Any]],
+        finger_base_samples: list[dict[str, Any]],
+        hand: dict[str, Any],
+    ) -> dict[str, dict[str, Any]]:
+        """Report the palm centre and finger base separately.
+
+        A point is "visible" when its depth is stable across samples. When both
+        are, their 3D separation must match the hand size MediaPipe measured;
+        otherwise both are "inconsistent", because one of them is occluded or
+        its depth comes from behind the hand.
+        """
+        palm = self._point_consensus(palm_samples, hand.get("palm_center_pixel"))
+        finger_base = self._point_consensus(
+            finger_base_samples, hand.get("finger_base_pixel")
+        )
+        expected = hand.get("palm_to_finger_base_world_mm")
+        if palm["status"] == finger_base["status"] == "visible" and expected:
+            measured = float(
+                np.linalg.norm(
+                    np.subtract(palm["camera_point_mm"], finger_base["camera_point_mm"])
+                )
+            )
+            for report in (palm, finger_base):
+                report["measured_separation_mm"] = measured
+                report["expected_separation_mm"] = float(expected)
+            if abs(measured - float(expected)) > self.maximum_point_separation_error_mm:
+                palm["status"] = finger_base["status"] = "inconsistent"
+        return {"palm_center": palm, "finger_base": finger_base}
 
     def close(self) -> None:
         self.stop_event.set()
