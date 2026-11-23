@@ -60,10 +60,12 @@ rim in view, so a conservative map: many `v` cells are still detected):
 | 520 | v | 20 | 20 | 20 | 20 | 20 | 20 | 20 | 20 | v |
 | 560-600 | v | v | v | v | v | v | v | v | v | v |
 
-Closer than about X 240 mm or beyond about X 540 mm the bowl is out of view
-and is reported as `not_found`; the annotated photo shows what the camera saw.
-Candies near the wall are harder to reach at a tilt, so far bowls work best
-with candy heaped in the middle.
+Closer than about X 240 mm or beyond about X 540 mm only part of the bowl is
+in view. It is still found if enough rim shows, but only the visible candies
+can be picked, and those are often too close to the wall for the open jaws;
+the annotated photo shows what the camera saw. Candies near the wall are
+harder to reach at a tilt, so far bowls work best with candy heaped in the
+middle.
 
 ## Run
 
