@@ -177,10 +177,33 @@ class BowlPickPlanTests(unittest.TestCase):
     def test_candies_at_the_wall_or_out_of_reach_have_no_plan(self):
         with self.assertRaisesRegex(demo.DemoError, "clear of the bowl wall"):
             self.plan(self.candy(xy=(BOWL_XY[0] + 60.0, BOWL_XY[1])))
-        with self.assertRaisesRegex(demo.DemoError, "no reachable vertical grasp"):
-            self.plan(self.candy(xy=(480.0, 0.0)), bowl_xy=(480.0, 0.0))
+        with self.assertRaisesRegex(demo.DemoError, "no reachable bowl grasp at any allowed tilt"):
+            self.plan(self.candy(xy=(640.0, 0.0)), bowl_xy=(640.0, 0.0))
 
-    def test_descent_that_strays_from_vertical_is_rejected(self):
+    def test_far_bowl_uses_the_smallest_tilt_and_descends_along_the_tool_axis(self):
+        far = (420.0, 0.0)
+        vertical_only = settings(grasp_tilt_options_deg=[0.0])
+        with self.assertRaisesRegex(demo.DemoError, "no reachable bowl grasp"):
+            self.plan(self.candy(xy=far), bowl_xy=far, values=vertical_only)
+        plan = dict(self.plan(self.candy(xy=far), bowl_xy=far))
+        self.assertAlmostEqual(demo.grasp_tilt_deg(plan["grasp"]), 10.0, delta=0.5)
+        grasp_tip = np.array([*far, 45.0])
+        np.testing.assert_allclose(tip_position(plan["grasp"]), grasp_tip, atol=0.5)
+        frame = fk(plan["grasp"])
+        up = -frame[:3, 2]
+        self.assertLess(abs(frame[2, 1]), 0.01)  # the jaws still close level
+        for name, joints in plan.items():
+            if name.startswith("descend") or name == "above bowl":
+                offset = np.cross(tip_position(joints) - grasp_tip, up)
+                self.assertLess(np.linalg.norm(offset), 0.5, name)
+        self.assertAlmostEqual(tip_position(plan["above bowl"])[2], RIM_Z + 30.0, delta=0.5)
+        self.assertTrue(bv.gripper_clear_of_bowl(
+            grasp_tip, frame[:3, 2], 0.0, far, RIM_Z, demo.FINGER_EXTENSION_BELOW_TIP_MM, settings()["bowl"],
+        ) or bv.gripper_clear_of_bowl(
+            grasp_tip, frame[:3, 2], 90.0, far, RIM_Z, demo.FINGER_EXTENSION_BELOW_TIP_MM, settings()["bowl"],
+        ))
+
+    def test_descent_that_strays_from_its_line_is_rejected(self):
         plan = dict(self.plan(self.candy()))
         stray = demo.plan_bowl_pick(
             self.candy(xy=(BOWL_XY[0] + 12.0, BOWL_XY[1])), {"plane_center_mm": list(BOWL_XY)},
@@ -188,7 +211,7 @@ class BowlPickPlanTests(unittest.TestCase):
         )
         mixed = [("above bowl", plan["above bowl"]), ("grasp", dict(stray)["grasp"])]
         with self.assertRaisesRegex(demo.DemoError, "strays"):
-            demo.validate_vertical_descent(mixed, BOWL_XY, RIM_Z + 15.0, 3.0)
+            demo.validate_descent_line(mixed, [*BOWL_XY, 45.0], [0.0, 0.0, 1.0], RIM_Z + 15.0, 3.0)
 
 
 class PickupExecutionTests(unittest.TestCase):

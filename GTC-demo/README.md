@@ -17,9 +17,13 @@ Each cycle starts at the taught scan pose:
    candy-sized rectangles (touching candies are split). Each candy's top
    centre comes from depth.
 2. **Pick** ([demo.py](demo.py)). The highest candy whose open jaws stay clear
-   of the bowl wall is picked straight down: above the candy 30 mm over the
-   rim, vertical descent, grip, vertical lift, back to the scan pose. A width
-   check confirms the candy is held; a miss opens above the bowl and rescans.
+   of the bowl wall is picked along a straight line: above the candy 30 mm
+   over the rim, in along the tool axis, grip, back out, back to the scan pose.
+   The gripper is vertical when that reaches; far bowls use the smallest tilt
+   (10, 20, or 30 degrees, about the jaws' closing axis so they still close
+   level) whose gripper, from fingertips to rim, stays inside the bowl opening.
+   A width check confirms the candy is held; a miss opens above the bowl and
+   rescans.
 3. **Wait for a hand** ([hand_target.py](hand_target.py)). Holding the candy at
    the scan pose, the demo waits (no timeout) for an open palm whose finger
    base (centre of the four knuckles) is visible by depth and inside the hand
@@ -33,15 +37,27 @@ zero and opens the gripper there.
 
 ## Bowl placement
 
-With the current scan pose (shared with Ignite), the whole rim is in the photo
-only when the bowl centre is beyond about X 280 mm, and straight-down grasps
-reach only to about X 300-350 mm (wrist pitch J5 limit). The usable band is:
+The bowl may be anywhere in the workspace that the scan pose (shared with
+Ignite) can see. Bowl detection needs at least 60% of the rim in the photo;
+reach comes from tilted grasps. Smallest gripper tilt that reaches a candy at
+the bowl centre, by bowl-centre position (`v` = not enough rim in view, so the
+bowl is not detected there):
 
-| Bowl centre X | Bowl centre Y |
-|---|---|
-| 280-300 mm | about -80 to +100 mm |
+| X \ Y (mm) | -160 | -120 | -80 | -40 | 0 | 40 | 80 | 120 | 160 | 200 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 160-200 | v | v | v | v | v | v | v | v | v | v |
+| 240 | v | v | 0 | 0 | 0 | 0 | 0 | 0 | v | v |
+| 280 | v | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | v |
+| 320 | v | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 10 | 10 |
+| 360-440 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10-20 |
+| 480 | 20 | 20 | 20 | 10 | 10 | 10 | 20 | 20 | 20 | 20 |
+| 520 | v | 20 | 20 | 20 | 20 | 20 | 20 | 20 | 20 | v |
+| 560-600 | v | v | v | v | v | v | v | v | v | v |
 
-A dedicated scan pose that looks closer to the robot would allow X 220-280 mm.
+Closer than about X 240 mm or beyond about X 540 mm the bowl is out of view
+and is reported as `not_found`; the annotated photo shows what the camera saw.
+Candies near the wall are harder to reach at a tilt, so far bowls work best
+with candy heaped in the middle.
 
 ## Run
 

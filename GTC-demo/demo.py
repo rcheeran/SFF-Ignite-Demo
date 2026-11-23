@@ -3,7 +3,8 @@
 
 Each cycle, at the taught scan pose:
   1. Find the bowl and the candies in it with OpenCV (bowl_vision.py), confirm
-     the rim with depth, and pick the highest reachable candy straight down.
+     the rim with depth, and pick the highest reachable candy: straight down,
+     or tilted up to 30 degrees for far bowls, always clear of the bowl wall.
   2. Hold the candy at the scan pose until an open palm's finger base is
      visible inside the hand workspace (hand_target.py).
   3. Release 35 mm above the palm centre, or above the finger base when the
@@ -96,6 +97,11 @@ DEMO_SETTINGS = {
     "minimum_held_grip_mm": 12.000,
     # Vertical grasp; yaw is set per candy so the jaws close across one of its edges.
     "grasp_rpy_deg": [180.000, 0.000, 0.000],
+    # Tilts tried in order when a vertical grasp cannot reach the candy (far
+    # bowls). The tilt pivots about the jaws' closing axis, so they still close
+    # level across the candy; the gripper descends along its own axis and must
+    # stay inside the bowl opening from the fingertips up to the rim.
+    "grasp_tilt_options_deg": [0.000, 10.000, 20.000, 30.000],
     # The tool tip is the middle of the finger pads, which reach ~15 mm below it.
     # At the candy's top surface the fingertips are ~15 mm down its side.
     # Confirm with --pause-before-grip.
@@ -103,11 +109,11 @@ DEMO_SETTINGS = {
     # Fingertips 15 mm below the tool tip stay above the bowl floor (table -3 mm,
     # floor ~6 mm thick) with margin.
     "minimum_grasp_tip_z_mm": 20.000,
-    # Approach and lift this far above the rim, then move straight down/up.
+    # Approach and lift this far above the rim, then move straight in/out along the tool axis.
     "rim_clearance_mm": 30.000,
-    # Waypoints along the vertical descent keep the joint-space path straight; any
-    # sampled tip position below the rim (plus finger length) must stay within
-    # this distance of the vertical line through the candy.
+    # Waypoints along the descent keep the joint-space path straight; any sampled
+    # tip position below the rim (plus finger length) must stay within this
+    # distance of the planned line into the candy.
     "vertical_step_mm": 15.000,
     "maximum_vertical_deviation_mm": 3.000,
     "grasp_yaw_offset_step_deg": 5.000,
@@ -802,6 +808,10 @@ def validate_demo_settings(settings: dict) -> dict:
         target_max = finite_vector(WORKSPACE_MAX_MM, 3, "code-defined workspace maximum").copy()
         for key in ("grasp_rpy_deg", "hand_delivery_rpy_deg"):
             demo[key] = finite_vector(demo[key], 3, f"demo.{key}")
+        tilts = [float(value) for value in demo["grasp_tilt_options_deg"]]
+        if not tilts or not all(math.isfinite(value) and 0.0 <= value <= 35.0 for value in tilts):
+            raise ValueError("demo.grasp_tilt_options_deg must list tilts from 0 to 35 degrees")
+        demo["grasp_tilt_options_deg"] = tilts
         correction = finite_vector(demo["candy_xy_correction_mm"], 2, "demo.candy_xy_correction_mm").copy()
         for key in ("grasp_tip_above_candy_top_mm", "minimum_grasp_tip_z_mm", "grip_close_mm"):
             if not math.isfinite(float(demo[key])):
@@ -1108,79 +1118,108 @@ def closing_yaw_candidates(candy: dict, bowl_center_xy: Any, settings: dict) -> 
     ]
 
 
-def validate_vertical_descent(
-    plan: list[tuple[str, np.ndarray]], target_xy: Any, below_z_mm: float, maximum_deviation_mm: float,
-    samples_per_segment: int = 20,
+def validate_descent_line(
+    plan: list[tuple[str, np.ndarray]], grasp_tip_mm: Any, up_axis: Any, below_z_mm: float,
+    maximum_deviation_mm: float, samples_per_segment: int = 20,
 ) -> None:
-    """Require the sampled tool tip to stay on the vertical line through the candy below a height.
+    """Require the sampled tool tip to stay on the straight line into the candy below a height.
 
-    Checks the joint-space segments from "above bowl" to "grasp"; the lift
-    retraces the same segments.
+    The line runs from the grasp tip back along the tool axis (up_axis points
+    from the tip toward the flange). Checks the joint-space segments from
+    "above bowl" to "grasp"; the lift retraces the same segments.
     """
     names = [name for name, _ in plan]
     joints = [value for _, value in plan]
     route = joints[names.index("above bowl"):names.index("grasp") + 1]
-    target = np.asarray(target_xy, dtype=np.float64)[:2]
+    origin = np.asarray(grasp_tip_mm, dtype=np.float64)
+    direction = np.asarray(up_axis, dtype=np.float64) / np.linalg.norm(up_axis)
     for start, end in zip(route, route[1:]):
         for fraction in np.linspace(0.0, 1.0, samples_per_segment + 1):
             tip = tip_position((1.0 - fraction) * start + fraction * end)
-            if tip[2] < below_z_mm and float(np.linalg.norm(tip[:2] - target)) > maximum_deviation_mm:
+            offset = float(np.linalg.norm(np.cross(tip - origin, direction)))
+            if tip[2] < below_z_mm and offset > maximum_deviation_mm:
                 raise DemoError(
-                    f"descent into the bowl strays {np.linalg.norm(tip[:2] - target):.1f}mm from vertical "
-                    f"at tip Z {tip[2]:.0f}mm"
+                    f"descent into the bowl strays {offset:.1f}mm from its straight line at tip Z {tip[2]:.0f}mm"
                 )
+
+
+def bowl_grasp_rotations(closing_yaw_deg: float, tilt_deg: float, settings: dict) -> list[Rot]:
+    """Grasp orientations whose jaws close along closing_yaw_deg, tilted about that closing axis."""
+    closing = np.array([math.cos(math.radians(closing_yaw_deg)), math.sin(math.radians(closing_yaw_deg)), 0.0])
+    # align_grasp_rpy_to_axis points the gripper along an axis and closes the jaws across it.
+    axis_yaw = math.radians(closing_yaw_deg + 90.0)
+    bases = [
+        euler_to_rot(rpy)
+        for rpy in equivalent_grasp_rpys(settings["grasp_rpy_deg"], np.array([math.cos(axis_yaw), math.sin(axis_yaw)]))
+    ]
+    signs = (1.0,) if tilt_deg == 0.0 else (1.0, -1.0)
+    return [Rot.from_rotvec(math.radians(sign * tilt_deg) * closing) * base for base in bases for sign in signs]
+
+
+def grasp_tilt_deg(grasp_joints: np.ndarray) -> float:
+    """Angle of the tool axis from straight down."""
+    return math.degrees(math.acos(float(np.clip(-fk(np.asarray(grasp_joints, dtype=np.float64))[2, 2], -1.0, 1.0))))
 
 
 def plan_bowl_pick(
     candy: dict, bowl: dict, start_joints: np.ndarray, scan_joints: np.ndarray, settings: dict,
 ) -> list[tuple[str, np.ndarray]]:
-    """Plan a vertical pick: above the candy clear of the rim, straight down, grip, straight up, scan.
+    """Plan a bowl pick: above the candy clear of the rim, straight in along the tool axis, grip, back out.
 
     Waypoints: "above bowl", "descend N", "grasp", "lift N", "lift above bowl",
-    "scan". Closing directions keep the open jaws clear of the bowl wall; the
-    whole route is path-checked and the descent must stay vertical below the rim.
+    "scan". Tilts from grasp_tilt_options_deg are tried smallest first; a tilt is
+    used only if the open gripper, from fingertips to rim, stays inside the bowl
+    opening. The whole route is path-checked and the descent must follow its
+    straight line below the rim.
     """
     bowl_settings = settings["bowl"]
     point = finite_vector(candy["base_point_mm"], 3, "candy top point")
+    center = bowl["plane_center_mm"]
     rim_z = bowl_settings["table_z_mm"] + bowl_settings["bowl_height_mm"]
-    grasp_z = max(point[2] + float(settings["grasp_tip_above_candy_top_mm"]), float(settings["minimum_grasp_tip_z_mm"]))
-    above_z = max(rim_z, grasp_z) + float(settings["rim_clearance_mm"])
-    heights = np.arange(above_z, grasp_z, -float(settings["vertical_step_mm"]))[1:]
-    errors = []
-    for closing in closing_yaw_candidates(candy, bowl["plane_center_mm"], settings):
-        # align_grasp_rpy_to_axis points the gripper along an axis and closes the jaws across it.
-        axis_yaw = math.radians(closing + 90.0)
-        for rpy in equivalent_grasp_rpys(settings["grasp_rpy_deg"], np.array([math.cos(axis_yaw), math.sin(axis_yaw)])):
-            rotation = euler_to_rot(rpy)
-            try:
-                above = solve_waypoint(
-                    "above bowl", flange_for_tip([point[0], point[1], above_z], rotation), rotation, start_joints,
-                )
-                descents, seed = [], above
-                for index, height in enumerate(heights, start=1):
-                    seed = solve_waypoint(
-                        f"descend {index}", flange_for_tip([point[0], point[1], height], rotation), rotation, seed,
-                    )
-                    descents.append((f"descend {index}", seed))
-                grasp = solve_waypoint("grasp", flange_for_tip([point[0], point[1], grasp_z], rotation), rotation, seed)
-                lifts = [(f"lift {index}", joints.copy()) for index, (_, joints) in enumerate(reversed(descents), start=1)]
-                plan = [
-                    ("above bowl", above), *descents, ("grasp", grasp), *lifts,
-                    ("lift above bowl", above.copy()), ("scan", np.asarray(scan_joints, dtype=np.float64).copy()),
-                ]
-                validate_joint_path_safety(
-                    "bowl pickup and return to scan", [np.asarray(start_joints, dtype=np.float64), *[q for _, q in plan]],
-                )
-                validate_vertical_descent(
-                    plan, point[:2], rim_z + FINGER_EXTENSION_BELOW_TIP_MM,
-                    float(settings["maximum_vertical_deviation_mm"]),
-                )
-                return plan
-            except DemoError as exc:
-                errors.append(f"closing {closing:.0f}deg yaw {float(rpy[2]):.0f}deg: {exc}")
-    if not errors:
+    grasp_tip = np.array([
+        point[0], point[1],
+        max(point[2] + float(settings["grasp_tip_above_candy_top_mm"]), float(settings["minimum_grasp_tip_z_mm"])),
+    ])
+    above_z = max(rim_z, grasp_tip[2]) + float(settings["rim_clearance_mm"])
+    closings = closing_yaw_candidates(candy, center, settings)
+    if not closings:
         raise DemoError("no closing direction keeps the open jaws clear of the bowl wall")
-    raise DemoError("no reachable vertical grasp: " + " | ".join(errors[:3]))
+    errors = []
+    for tilt in settings["grasp_tilt_options_deg"]:
+        for closing in closings:
+            for rotation in bowl_grasp_rotations(closing, tilt, settings):
+                up = -rotation.apply([0.0, 0.0, 1.0])
+                label = f"tilt {tilt:.0f}deg closing {closing:.0f}deg"
+                if not bowl_vision.gripper_clear_of_bowl(
+                    grasp_tip, -up, closing, center, rim_z, FINGER_EXTENSION_BELOW_TIP_MM, bowl_settings,
+                ):
+                    errors.append(f"{label}: the tilted gripper would touch the bowl wall")
+                    continue
+                distances = np.arange((above_z - grasp_tip[2]) / up[2], 0.0, -float(settings["vertical_step_mm"]))
+                tips = [grasp_tip + up * distance for distance in distances]
+                try:
+                    above = solve_waypoint("above bowl", flange_for_tip(tips[0], rotation), rotation, start_joints)
+                    descents, seed = [], above
+                    for index, tip in enumerate(tips[1:], start=1):
+                        seed = solve_waypoint(f"descend {index}", flange_for_tip(tip, rotation), rotation, seed)
+                        descents.append((f"descend {index}", seed))
+                    grasp = solve_waypoint("grasp", flange_for_tip(grasp_tip, rotation), rotation, seed)
+                    lifts = [(f"lift {index}", joints.copy()) for index, (_, joints) in enumerate(reversed(descents), start=1)]
+                    plan = [
+                        ("above bowl", above), *descents, ("grasp", grasp), *lifts,
+                        ("lift above bowl", above.copy()), ("scan", np.asarray(scan_joints, dtype=np.float64).copy()),
+                    ]
+                    validate_joint_path_safety(
+                        "bowl pickup and return to scan", [np.asarray(start_joints, dtype=np.float64), *[q for _, q in plan]],
+                    )
+                    validate_descent_line(
+                        plan, grasp_tip, up, rim_z + FINGER_EXTENSION_BELOW_TIP_MM,
+                        float(settings["maximum_vertical_deviation_mm"]),
+                    )
+                    return plan
+                except DemoError as exc:
+                    errors.append(f"{label}: {exc}")
+    raise DemoError("no reachable bowl grasp at any allowed tilt: " + " | ".join(errors[:3]))
 
 
 def pick_first_reachable(
@@ -1199,7 +1238,7 @@ def pick_first_reachable(
                 f"{summarize_rejection(str(exc))}",
                 flush=True,
             )
-    raise NoReachableCandyError("no candy in the bowl has a reachable vertical grasp", rejections)
+    raise NoReachableCandyError("no candy in the bowl has a reachable grasp; move the bowl closer to the robot", rejections)
 
 
 def execute_bowl_pickup(
@@ -1422,7 +1461,11 @@ def run_cycle(
     except NoReachableCandyError as exc:
         print(f"{exc}; scanning again", flush=True)
         return False
-    print(f"Picking candy at {np.round(candy['base_point_mm'], 1).tolist()}mm", flush=True)
+    print(
+        f"Picking candy at {np.round(candy['base_point_mm'], 1).tolist()}mm "
+        f"(gripper tilt {grasp_tilt_deg(dict(plan)['grasp']):.0f}deg)",
+        flush=True,
+    )
     carry = CandyCarry()
     try:
         width = execute_bowl_pickup(arm, plan, settings, carry, candy)
@@ -1458,8 +1501,12 @@ def run_scan_only(
     result = scan_bowl(arm, camera, camera_to_gripper, settings)
     if result["pickable"]:
         try:
-            candy, _ = pick_first_reachable(arm, result, scan, settings)
-            print(f"  would pick the candy at {np.round(candy['base_point_mm'], 1).tolist()}mm", flush=True)
+            candy, plan = pick_first_reachable(arm, result, scan, settings)
+            print(
+                f"  would pick the candy at {np.round(candy['base_point_mm'], 1).tolist()}mm "
+                f"(gripper tilt {grasp_tilt_deg(dict(plan)['grasp']):.0f}deg)",
+                flush=True,
+            )
         except NoReachableCandyError as exc:
             print(f"  {exc}", flush=True)
     print(f"  annotated photo: {BOWL_SCAN_IMAGE}", flush=True)

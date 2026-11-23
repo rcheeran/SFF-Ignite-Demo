@@ -495,6 +495,29 @@ def jaw_clear_of_wall(center_xy: Any, closing_yaw_deg: float, bowl_center_xy: An
     return bool(np.all(np.linalg.norm(footprint - center, axis=1) <= clear_radius))
 
 
+def gripper_clear_of_bowl(
+    grasp_tip_mm: Any, tool_axis: Any, closing_yaw_deg: float, bowl_center_xy: Any,
+    rim_z_mm: float, finger_extension_mm: float, settings: dict, step_mm: float = 2.0,
+) -> bool:
+    """True if a (possibly tilted) open gripper at the grasp pose stays inside the bowl opening.
+
+    The gripper is modelled as the open-jaw footprint swept along the tool axis
+    from the fingertips (finger_extension_mm past the tool tip) up to the rim.
+    A descent along the tool axis only occupies part of that same sweep.
+    """
+    tip = np.asarray(grasp_tip_mm, dtype=np.float64)
+    axis = np.asarray(tool_axis, dtype=np.float64)
+    axis = axis / np.linalg.norm(axis)
+    if axis[2] >= -1e-6:
+        return False
+    fingertip_z = float((tip + axis * finger_extension_mm)[2])
+    for height in np.arange(fingertip_z, float(rim_z_mm) + step_mm, step_mm):
+        point = tip + axis * ((height - tip[2]) / axis[2])
+        if not jaw_clear_of_wall(point[:2], closing_yaw_deg, bowl_center_xy, settings):
+            return False
+    return True
+
+
 def grasp_options(
     candies: list[dict[str, Any]], bowl_center_xy: Any, rim_z_mm: float, settings: dict = BOWL_SETTINGS,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

@@ -186,6 +186,21 @@ class GraspSelectionTests(unittest.TestCase):
         )
         self.assertEqual(candy["closing_yaw_deg"][0], 120.0)  # across the long edge: squeezes the 19 mm side
 
+    def test_tilted_gripper_must_stay_inside_the_bowl_opening_down_to_the_fingertips(self):
+        tip = [BOWL_CENTER[0] + 45.0, BOWL_CENTER[1], 30.0]
+        down = [0.0, 0.0, -1.0]
+        lean = np.radians(25.0)
+        toward_wall = [np.sin(lean), 0.0, -np.cos(lean)]   # fingertips lean toward the +X wall
+        away_from_wall = [-np.sin(lean), 0.0, -np.cos(lean)]
+        # Closing along Y keeps the jaws' long side across X small; the tilt moves the sweep along X.
+        self.assertTrue(bv.gripper_clear_of_bowl(tip, down, 90.0, BOWL_CENTER, self.RIM_Z, 15.0, bv.BOWL_SETTINGS))
+        self.assertFalse(bv.gripper_clear_of_bowl(tip, toward_wall, 90.0, BOWL_CENTER, self.RIM_Z, 15.0, bv.BOWL_SETTINGS))
+        self.assertFalse(bv.gripper_clear_of_bowl(tip, away_from_wall, 90.0, BOWL_CENTER, self.RIM_Z, 15.0, bv.BOWL_SETTINGS))
+        self.assertTrue(bv.gripper_clear_of_bowl(
+            [BOWL_CENTER[0] - 10.0, BOWL_CENTER[1], 30.0], away_from_wall, 90.0, BOWL_CENTER, self.RIM_Z, 15.0,
+            bv.BOWL_SETTINGS,
+        ))
+
 
 class EvaluateCapturesTests(unittest.TestCase):
     def test_writes_annotated_images_for_captures_with_metadata(self):
