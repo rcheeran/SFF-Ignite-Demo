@@ -127,6 +127,22 @@ class BowlDetectionTests(unittest.TestCase):
         self.assertLess(np.linalg.norm(np.subtract(result["candies"][0]["plane_center_mm"], (340, 60))), 2.0)
         self.assertTrue(any("width" in item["reasons"] for item in result["rejected_candies"]))
 
+    def test_gripper_in_the_photo_counts_as_out_of_view_not_as_missing_rim(self):
+        frame, c2b = render(candies=[(350, 10, 0, RED)])
+        view = bv.bowl_view(INTRINSICS, c2b)
+        rim = view.plane_to_image(bv.circle_points(BOWL_CENTER, 76.2, 36))
+        lowest = rim[np.argmax(rim[:, 1])]
+        # A black finger rising from the bottom edge over the near side of the rim.
+        finger = np.int32([[lowest[0] - 40, 479], [lowest[0] - 30, lowest[1] - 60], [lowest[0] + 30, lowest[1] - 60], [lowest[0] + 40, 479]])
+        cv2.fillPoly(frame, [finger], (20, 20, 20))
+        mask = bv.gripper_mask(frame, bv.BOWL_SETTINGS)
+        self.assertTrue(mask[int(lowest[1]) - 30, int(lowest[0])])
+        self.assertFalse(mask[240, 100])
+        result = bv.find_bowl(frame, INTRINSICS, c2b)
+        self.assertEqual(result["status"], "detected")
+        self.assertGreater(result["bowl"]["rim_support"], 0.97)  # 0.93 if the finger counted as missing rim
+        self.assertLess(result["bowl"]["visible_fraction"], 1.0)
+
     def test_packed_same_colour_block_is_not_guessed_at_its_centre(self):
         block = [(345 + dx, 15 + dy, 0, RED) for dx in (0, 25.4) for dy in (0, 25.4)]
         frame, c2b = render(candies=block)

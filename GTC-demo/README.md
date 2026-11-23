@@ -42,11 +42,12 @@ zero and opens the gripper there.
 ## Bowl placement
 
 The bowl may be anywhere in the workspace that the scan pose (shared with
-Ignite) can see. Bowl detection needs at least 45% of the rim in the photo
-(bowls beside the hand board, partly past the photo edge, were found at
-46-83%); reach comes from tilted grasps. Smallest gripper tilt that reaches a
+Ignite) can see. Bowl detection needs at least 20% of the rim in the photo and
+not behind the gripper fingers, which the wrist camera always sees at the
+bottom of the photo (bowls beside the hand board and near the robot were found
+at 25-83%); reach comes from tilted grasps. Smallest gripper tilt that reaches a
 candy at the bowl centre, by bowl-centre position (`v` = less than 60% of the
-rim in view, so a conservative map: some `v` cells are still detected):
+rim in view, so a conservative map: many `v` cells are still detected):
 
 | X \ Y (mm) | -160 | -120 | -80 | -40 | 0 | 40 | 80 | 120 | 160 | 200 |
 |---|---|---|---|---|---|---|---|---|---|---|

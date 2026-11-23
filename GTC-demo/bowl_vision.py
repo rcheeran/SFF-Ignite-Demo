@@ -53,10 +53,12 @@ BOWL_SETTINGS = {
     "hough_accumulator": 15,
     "maximum_circle_candidates": 25,
     "edge_tolerance_px": 2,
-    # Real rims had edge support 0.84-0.99; rings printed on the hand board 0.57 or less.
-    "minimum_rim_support": 0.75,
-    # Fraction of the rim inside the photo; bowls at the workspace edge were 46-83% visible.
-    "minimum_rim_visible_fraction": 0.45,
+    # With the gripper excluded, real rims had edge support 0.95-1.0 even when only
+    # 25% was in view; rings printed on the hand board 0.57 or less.
+    "minimum_rim_support": 0.85,
+    # Fraction of the rim inside the photo and not behind the gripper; bowls near
+    # the robot or the workspace edge showed 25-83%.
+    "minimum_rim_visible_fraction": 0.2,
     # Candy search skips this ring inside the detected rim (rim band, highlights).
     "rim_margin_mm": 12.0,
     # Candies are the foil colours (OpenCV HSV, hue 0-179): red, green, and gold.
@@ -80,6 +82,12 @@ BOWL_SETTINGS = {
     "heap_peak_fraction": 0.8,
     "maximum_heap_candidates": 12,
     "minimum_candies": 1,
+    # The wrist camera always sees the gripper fingers at the bottom of the photo:
+    # dark regions touching the bottom edge are ignored, so a rim behind a
+    # finger counts as out of view rather than as a missing edge.
+    "gripper_max_value": 70,
+    "gripper_min_area_px": 1500,
+    "gripper_dilate_px": 15,
     # Live checks (demo.py): depth just inside the rim on the side away from the
     # camera reads the top of the bowl's inner wall; a flat circle reads the table.
     "rim_depth_samples": 8,
@@ -172,14 +180,19 @@ class PlaneView:
         column, row = (float(value) for value in direction)
         return np.array([-row, -column]) * self.mm_per_px
 
-    def warp(self, frame_bgr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return the top-down raster and a mask of raster pixels the photo actually covers."""
+    def warp(self, frame_bgr: np.ndarray, ignore: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Return the top-down raster and a mask of raster pixels the photo actually covers.
+
+        Photo pixels set in `ignore` (e.g. the gripper) count as not covered.
+        """
         flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
         size = (self.width, self.height)
         top = cv2.warpPerspective(frame_bgr, self.raster_to_image_h, size, flags=flags)
+        covered = np.full(frame_bgr.shape[:2], 255, np.uint8)
+        if ignore is not None:
+            covered[ignore > 0] = 0
         coverage = cv2.warpPerspective(
-            np.full(frame_bgr.shape[:2], 255, np.uint8), self.raster_to_image_h, size,
-            flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+            covered, self.raster_to_image_h, size, flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
         )
         valid = (coverage > 0) & (self._raster_depth_mm > 50.0)
         return top, valid.astype(np.uint8) * 255
@@ -502,6 +515,21 @@ def to_base(view: PlaneView, item: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def gripper_mask(frame_bgr: np.ndarray, settings: dict) -> np.ndarray:
+    """Photo pixels showing the gripper: large dark regions touching the bottom edge, dilated."""
+    height, width = frame_bgr.shape[:2]
+    dark = (cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)[..., 2] < settings["gripper_max_value"]).astype(np.uint8) * 255
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
+    mask = np.zeros((height, width), np.uint8)
+    for label in range(1, count):
+        top, rows, area = stats[label, cv2.CC_STAT_TOP], stats[label, cv2.CC_STAT_HEIGHT], stats[label, cv2.CC_STAT_AREA]
+        if top + rows >= height and area >= settings["gripper_min_area_px"]:
+            mask[labels == label] = 255
+    size = int(settings["gripper_dilate_px"]) | 1
+    return cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)))
+
+
 def find_bowl(
     frame_bgr: np.ndarray, intrinsics: dict, camera_to_base: Any, settings: dict = BOWL_SETTINGS,
 ) -> dict[str, Any]:
@@ -514,7 +542,7 @@ def find_bowl(
     if frame_bgr is None or frame_bgr.ndim != 3 or frame_bgr.shape[2] != 3:
         raise BowlVisionError("bowl detection requires a 3-channel BGR image")
     view = bowl_view(intrinsics, camera_to_base, settings)
-    top, valid = view.warp(frame_bgr)
+    top, valid = view.warp(frame_bgr, gripper_mask(frame_bgr, settings))
     circles = find_rim_circles(top, valid, settings)
     result: dict[str, Any] = {"status": "not_found", "circles_considered": len(circles), "candies": [], "rejected_candies": []}
     empty = None
