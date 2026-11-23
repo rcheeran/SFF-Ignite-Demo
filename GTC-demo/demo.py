@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""GTC candy demo: pick a candy from a bowl and drop it on an open hand.
+"""GTC candy demo: pick a candy from the table and drop it on an open hand.
 
 Each cycle, at the taught scan pose:
-  1. Find the bowl and the candies in it with OpenCV (bowl_vision.py), confirm
-     the rim with depth, and pick the highest reachable candy: straight down,
-     or tilted up to 30 degrees for far bowls, always clear of the bowl wall.
+  1. Find the candies lying on the table with OpenCV (table_vision.py), confirm
+     each with depth, and pick the one nearest the robot: straight down, or
+     tilted up to 30 degrees for candies beyond straight-down reach. No pick
+     starts while the hand service sees any hand.
   2. Hold the candy at the scan pose until an open palm's finger base is
      visible inside the hand workspace (hand_target.py).
   3. Release 35 mm above the palm centre, or above the finger base when the
      palm centre is not visible, then repeat.
 
   --check-only   preflight only; never connects to CAN
-  --scan-only    move to the scan pose and report the bowl, candies, and hand; no pick
-  --pick-only    pick from the bowl and drop the candy back in; no hand needed
+  --scan-only    move to the scan pose and report the candies and hand; no pick
+  --pick-only    pick a candy and drop it back where it was; no open palm needed
 """
 
 from __future__ import annotations
@@ -43,6 +44,7 @@ from vision_client import (  # noqa: E402
 )
 import bowl_vision  # noqa: E402
 from hand_target import choose_drop_target  # noqa: E402
+import table_vision  # noqa: E402
 
 from piper import config as PIPER_C  # noqa: E402
 from piper.kinematics import MARGINED_LIMITS, fk, ik  # noqa: E402
@@ -66,7 +68,7 @@ HAND_SLOT = 4
 FINGER_EXTENSION_BELOW_TIP_MM = 15.0
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 GRASP_OFFSET_LOG = LOG_DIR / "grasp_offsets.jsonl"
-BOWL_SCAN_IMAGE = LOG_DIR / "latest_bowl_scan.jpg"
+CANDY_SCAN_IMAGE = LOG_DIR / "latest_candy_scan.jpg"
 PROMPT = "christmas candy"  # label for capture_scan_images.py reference detections
 DEFAULT_SCAN_POSES = ROOT / "prepare-piper/scan-poses/scan_poses.json"
 WORKSPACE_CORNERS_MM = (
@@ -88,38 +90,40 @@ WORKSPACE_MAX_MM = np.array([
     WORKSPACE_MAX_Z_MM,
 ])
 DEMO_SETTINGS = {
-    # 40 mm clears the 25.4 mm candy and keeps the open jaws away from the bowl wall
-    # (bowl_vision checks the jaw footprint against the wall at this width).
+    # The candy tops measure ~21-23 mm across in scan photos, leaving ~9 mm either
+    # side for the open fingers to come down.
     "grip_open_mm": 40.000,
     "grip_close_mm": 1.000,
-    # The candy is 19-25 mm across and an empty close reads about 1 mm.
+    # The candy is ~20-25 mm across and an empty close reads about 1 mm.
     # Not yet measured with the new candy.
     "minimum_held_grip_mm": 12.000,
     # Vertical grasp; yaw is set per candy so the jaws close across one of its edges.
     "grasp_rpy_deg": [180.000, 0.000, 0.000],
-    # Tilts tried in order when a vertical grasp cannot reach the candy (far
-    # bowls). The tilt pivots about the jaws' closing axis, so they still close
-    # level across the candy; the gripper descends along its own axis and must
-    # stay inside the bowl opening from the fingertips up to the rim.
+    # Tilts tried in order when a vertical grasp cannot reach the candy: straight
+    # down reaches X ~375 mm; 10-30 degrees reach most closing directions out to
+    # X ~550 mm. The tilt pivots about the jaws' closing axis, so they still close
+    # level across the candy, and the gripper moves in and out along its own axis.
     "grasp_tilt_options_deg": [0.000, 10.000, 20.000, 30.000],
     # The tool tip is the middle of the finger pads, which reach ~15 mm below it.
-    # 5 mm above the candy's top surface puts the fingertips ~10 mm down its
-    # side, which needs less room between neighbouring candies in a full bowl.
-    # Confirm with --pause-before-grip.
+    # 5 mm above the candy's top surface puts the fingertips ~10 mm down its 19 mm
+    # side. Confirm with --pause-before-grip.
     "grasp_tip_above_candy_top_mm": 5.000,
     # Depth under each finger's landing spot must be at least this far below the
     # fingertips at the grasp pose, so the fingers do not come down on a neighbour.
     "finger_landing_clearance_mm": 2.000,
+    # Open finger thickness along the closing direction, for the landing check.
+    # Placeholder until measured.
+    "finger_thickness_mm": 10.000,
     # Depth reads are limited to this many of the best candidates per scan.
     "maximum_candies_depth_checked": 8,
-    # Fingertips 15 mm below the tool tip stay above the bowl floor (table -3 mm,
-    # floor ~6 mm thick) with margin.
+    # Keeps the fingertips (15 mm below the tool tip, 20 mm wide) at least 5 mm
+    # above the table (Z -3 mm) even at a 30-degree tilt.
     "minimum_grasp_tip_z_mm": 20.000,
-    # Approach and lift this far above the rim, then move straight in/out along the tool axis.
-    "rim_clearance_mm": 30.000,
-    # Waypoints along the descent keep the joint-space path straight; any sampled
-    # tip position below the rim (plus finger length) must stay within this
-    # distance of the planned line into the candy.
+    # Approach and lift this far above the grasp, moving straight in and out along the tool axis.
+    "pick_approach_height_mm": 60.000,
+    # Waypoints along the descent keep the joint-space path straight; every sampled
+    # tip position on the descent must stay within this distance of the planned
+    # line into the candy.
     "vertical_step_mm": 15.000,
     "maximum_vertical_deviation_mm": 3.000,
     "grasp_yaw_offset_step_deg": 5.000,
@@ -143,7 +147,7 @@ DEMO_SETTINGS = {
 
 
 class NoReachableCandyError(DemoError):
-    """No pickable candy in the bowl has an accepted, path-checked vertical grasp."""
+    """No pickable candy on the table has an accepted, path-checked grasp."""
 
     def __init__(self, message: str, rejections: list[dict] | None = None) -> None:
         super().__init__(message)
@@ -832,7 +836,8 @@ def validate_demo_settings(settings: dict) -> dict:
         )
     demo["candy_xy_correction_mm"] = correction
     for key in (
-        "grip_open_mm", "minimum_held_grip_mm", "rim_clearance_mm", "vertical_step_mm",
+        "grip_open_mm", "minimum_held_grip_mm", "pick_approach_height_mm", "vertical_step_mm",
+        "finger_thickness_mm",
         "maximum_vertical_deviation_mm", "grasp_yaw_offset_step_deg", "maximum_grasp_yaw_offset_deg",
         "motion_speed_percent", "pick_motion_speed_percent", "hand_approach_height_mm",
         "gripper_hold_seconds", "maximum_scan_position_deviation_mm", "maximum_scan_rotation_deviation_deg",
@@ -852,8 +857,12 @@ def validate_demo_settings(settings: dict) -> dict:
         demo[key] = speed
     demo["target_workspace_min_mm"], demo["target_workspace_max_mm"] = target_min, target_max
     demo["hand_workspace_min_mm"], demo["hand_workspace_max_mm"] = target_min.copy(), target_max.copy()
-    # One gripper width for planning and the bowl-wall check.
-    demo["bowl"] = {**bowl_vision.BOWL_SETTINGS, "grip_open_mm": float(demo["grip_open_mm"])}
+    # Candies are looked for only inside the target workspace.
+    demo["table"] = {
+        **table_vision.TABLE_SETTINGS,
+        "view_x_mm": [float(target_min[0]), float(target_max[0])],
+        "view_y_mm": [float(target_min[1]), float(target_max[1])],
+    }
     return demo
 
 
@@ -878,7 +887,7 @@ def load_setup(args: argparse.Namespace, hand_eye: dict | None = None) -> tuple[
     try:
         bowl_vision.camera_matrix(intrinsics)
     except (KeyError, TypeError, ValueError) as exc:
-        raise DemoError(f"bowl detection requires camera intrinsics in hand_eye.json: {exc}") from exc
+        raise DemoError(f"candy detection requires camera intrinsics in hand_eye.json: {exc}") from exc
     settings["camera_serial"] = camera_serial
     settings["camera_intrinsics"] = intrinsics
     return settings, rigid_transform(hand_eye, "camera_to_gripper"), load_scan_poses(args.scan_poses)
@@ -1035,7 +1044,7 @@ def finger_landing_problem(
     limit = fingertip_z - float(settings["finger_landing_clearance_mm"])
     yaw = math.radians(closing_yaw_deg)
     direction = np.array([math.cos(yaw), math.sin(yaw), 0.0])
-    offset = settings["bowl"]["grip_open_mm"] / 2.0 + settings["bowl"]["finger_thickness_mm"] / 2.0
+    offset = float(settings["grip_open_mm"]) / 2.0 + float(settings["finger_thickness_mm"]) / 2.0
     intrinsics = settings["camera_intrinsics"]
     for sign in (-1.0, 1.0):
         pixel = base_to_pixel(camera_to_base, intrinsics, top + sign * offset * direction)
@@ -1054,8 +1063,7 @@ def measure_candies(
     result: dict, camera: CameraClient, token: str, camera_to_base: np.ndarray, settings: dict,
 ) -> list[dict]:
     """Add each candy's top-centre base point from depth and its true size at that height."""
-    bowl_settings = settings["bowl"]
-    view = bowl_vision.bowl_view(settings["camera_intrinsics"], camera_to_base, bowl_settings)
+    view = table_vision.table_view(settings["camera_intrinsics"], camera_to_base, settings["table"])
     measured = []
     for candy in result["candies"]:
         try:
@@ -1082,48 +1090,28 @@ def measure_candies(
     return measured
 
 
-def scan_bowl(
+def scan_table(
     arm: Piper, camera: CameraClient, camera_to_gripper: np.ndarray, settings: dict,
 ) -> dict[str, Any]:
-    """Photograph the bowl from the current (scan) pose; find, confirm, and rank its candies.
+    """Photograph the table from the current (scan) pose; find, confirm, and rank its candies.
 
-    status: "detected" (pickable candies listed best first), "no_pickable",
-    "empty", "flat_circle" (a circle whose rim depth reads the table), or
-    "not_found". Writes the annotated photo to logs/latest_bowl_scan.jpg.
+    status: "detected" (pickable candies listed nearest the robot first),
+    "no_pickable", or "not_found". Writes the annotated photo to
+    logs/latest_candy_scan.jpg (pickable candies green, the rest red).
     """
-    require_healthy(arm, "before bowl scan")
+    require_healthy(arm, "before table scan")
     before = np.asarray(arm.pose(), dtype=np.float64)
     captured, png = camera.capture_png()
     after = np.asarray(arm.pose(), dtype=np.float64)
-    camera_to_base = stationary_camera_to_base(before, after, camera_to_gripper, settings, "bowl scan")
+    camera_to_base = stationary_camera_to_base(before, after, camera_to_gripper, settings, "table scan")
     frame = cv2.imdecode(np.frombuffer(png, dtype=np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
-        raise DemoError("could not decode the bowl scan photo")
-    bowl_settings = settings["bowl"]
-    intrinsics = settings["camera_intrinsics"]
-    result = bowl_vision.find_bowl(frame, intrinsics, camera_to_base, bowl_settings)
+        raise DemoError("could not decode the table scan photo")
+    result = table_vision.find_table_candies(frame, settings["camera_intrinsics"], camera_to_base, settings["table"])
     result.update(pickable=[], unpickable=[], captured_at=captured.get("captured_at"))
-    bowl = result.get("bowl")
-    if bowl is not None:
-        height, width = frame.shape[:2]
-        rim_z = []
-        for pixel in bowl["rim_depth_pixels"]:
-            if not (0 <= pixel[0] < width and 0 <= pixel[1] < height):
-                continue
-            try:
-                rim_z.append(float(to_base_point(camera_to_base, camera.deproject(captured["token"], pixel))[2]))
-            except DemoError:
-                rim_z.append(None)
-        raised, reason = bowl_vision.check_rim_height(rim_z, bowl_settings)
-        bowl["rim_check"] = reason
-        if not raised:
-            result["status"] = "flat_circle"
     if result["status"] == "detected":
         candies = measure_candies(result, camera, captured["token"], camera_to_base, settings)
-        rim_height = bowl_settings["table_z_mm"] + bowl_settings["bowl_height_mm"]
-        pickable, result["unpickable"] = bowl_vision.grasp_options(
-            candies, bowl["plane_center_mm"], rim_height, bowl_settings, bowl["radius_mm"],
-        )
+        pickable, result["unpickable"] = table_vision.grasp_options(candies, settings["table"])
         for candy in pickable[: int(settings["maximum_candies_depth_checked"])]:
             problems = {}
             for closing in candy["closing_yaw_deg"]:
@@ -1135,45 +1123,35 @@ def scan_bowl(
                 result["unpickable"].append({**candy, "reasons": sorted(set(problems.values()))})
         if not result["pickable"]:
             result["status"] = "no_pickable"
-    report_bowl_scan(result, settings)
+    report_table_scan(result, settings)
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        annotated = bowl_vision.annotate(
-            frame, bowl_vision.with_rim_outline(result, intrinsics, camera_to_base, bowl_settings),
-            result["pickable"][0] if result["pickable"] else None,
-        )
-        cv2.imwrite(str(BOWL_SCAN_IMAGE), annotated)
+        drawn = {
+            "status": result["status"], "candies": result["pickable"],
+            "rejected_candies": result["rejected_candies"] + result["unpickable"],
+        }
+        cv2.imwrite(str(CANDY_SCAN_IMAGE), bowl_vision.annotate(frame, drawn))
     except (OSError, cv2.error) as exc:
-        print(f"WARNING: could not save {BOWL_SCAN_IMAGE.name}: {exc}", flush=True)
+        print(f"WARNING: could not save {CANDY_SCAN_IMAGE.name}: {exc}", flush=True)
     return result
 
 
-def report_bowl_scan(result: dict, settings: dict) -> None:
-    bowl = result.get("bowl")
-    where = (
-        f" bowl at {np.round(bowl['plane_center_mm'], 0).tolist()}mm r={bowl['radius_mm']:.0f}mm "
-        f"({bowl.get('rim_check', '')})" if bowl else ""
+def report_table_scan(result: dict, settings: dict) -> None:
+    print(
+        f"TABLE SCAN: {result['status']}, {len(result['candies'])} candies, {len(result['pickable'])} pickable",
+        flush=True,
     )
-    counts = f", {len(result['candies'])} candies, {len(result['pickable'])} pickable" if bowl else ""
-    print(f"BOWL SCAN: {result['status']}{where}{counts}", flush=True)
     if settings.get("verbose"):
         for item in result["unpickable"] + result["rejected_candies"]:
             location = item.get("base_point_mm", item.get("plane_center_mm"))
             print(f"  skipped candy at {np.round(location, 1).tolist()}mm: {'; '.join(item['reasons'])}", flush=True)
 
 
-def closing_yaw_candidates(candy: dict, bowl: dict, settings: dict) -> list[float]:
-    """Closing directions to try, exact first, then small yaw offsets still clear of the wall."""
+def closing_yaw_candidates(candy: dict, settings: dict) -> list[float]:
+    """Closing directions to try: each clear direction exactly, then small yaw offsets from it."""
     step, maximum = float(settings["grasp_yaw_offset_step_deg"]), float(settings["maximum_grasp_yaw_offset_deg"])
     offsets = [0.0] + [sign * value for value in np.arange(step, maximum + step * 0.5, step) for sign in (-1.0, 1.0)]
-    point = candy["base_point_mm"]
-    return [
-        (yaw + offset) % 180.0
-        for offset in offsets for yaw in candy["closing_yaw_deg"]
-        if bowl_vision.jaw_clear_of_wall(
-            point, (yaw + offset) % 180.0, bowl["plane_center_mm"], settings["bowl"], bowl.get("radius_mm"),
-        )
-    ]
+    return [(yaw + offset) % 180.0 for offset in offsets for yaw in candy["closing_yaw_deg"]]
 
 
 def validate_descent_line(
@@ -1184,11 +1162,11 @@ def validate_descent_line(
 
     The line runs from the grasp tip back along the tool axis (up_axis points
     from the tip toward the flange). Checks the joint-space segments from
-    "above bowl" to "grasp"; the lift retraces the same segments.
+    "above candy" to "grasp"; the lift retraces the same segments.
     """
     names = [name for name, _ in plan]
     joints = [value for _, value in plan]
-    route = joints[names.index("above bowl"):names.index("grasp") + 1]
+    route = joints[names.index("above candy"):names.index("grasp") + 1]
     origin = np.asarray(grasp_tip_mm, dtype=np.float64)
     direction = np.asarray(up_axis, dtype=np.float64) / np.linalg.norm(up_axis)
     for start, end in zip(route, route[1:]):
@@ -1197,11 +1175,21 @@ def validate_descent_line(
             offset = float(np.linalg.norm(np.cross(tip - origin, direction)))
             if tip[2] < below_z_mm and offset > maximum_deviation_mm:
                 raise DemoError(
-                    f"descent into the bowl strays {offset:.1f}mm from its straight line at tip Z {tip[2]:.0f}mm"
+                    f"descent to the candy strays {offset:.1f}mm from its straight line at tip Z {tip[2]:.0f}mm"
                 )
 
 
-def bowl_grasp_rotations(closing_yaw_deg: float, tilt_deg: float, settings: dict) -> list[Rot]:
+def validate_transit_height(
+    name: str, start_joints: np.ndarray, end_joints: np.ndarray, minimum_tip_z_mm: float, samples: int = 40,
+) -> None:
+    """Require the tool tip to stay at or above a height on a joint-space move (over other candies)."""
+    for fraction in np.linspace(0.0, 1.0, samples + 1):
+        tip_z = float(tip_position((1.0 - fraction) * start_joints + fraction * end_joints)[2])
+        if tip_z < minimum_tip_z_mm:
+            raise DemoError(f"{name} dips to tip Z {tip_z:.0f}mm, below {minimum_tip_z_mm:.0f}mm")
+
+
+def grasp_rotations(closing_yaw_deg: float, tilt_deg: float, settings: dict) -> list[Rot]:
     """Grasp orientations whose jaws close along closing_yaw_deg, tilted about that closing axis."""
     closing = np.array([math.cos(math.radians(closing_yaw_deg)), math.sin(math.radians(closing_yaw_deg)), 0.0])
     # align_grasp_rpy_to_axis points the gripper along an axis and closes the jaws across it.
@@ -1219,42 +1207,32 @@ def grasp_tilt_deg(grasp_joints: np.ndarray) -> float:
     return math.degrees(math.acos(float(np.clip(-fk(np.asarray(grasp_joints, dtype=np.float64))[2, 2], -1.0, 1.0))))
 
 
-def plan_bowl_pick(
-    candy: dict, bowl: dict, start_joints: np.ndarray, scan_joints: np.ndarray, settings: dict,
+def plan_table_pick(
+    candy: dict, start_joints: np.ndarray, scan_joints: np.ndarray, settings: dict,
 ) -> list[tuple[str, np.ndarray]]:
-    """Plan a bowl pick: above the candy clear of the rim, straight in along the tool axis, grip, back out.
+    """Plan a table pick: above the candy, straight in along the tool axis, grip, back out, and scan.
 
-    Waypoints: "above bowl", "descend N", "grasp", "lift N", "lift above bowl",
-    "scan". Tilts from grasp_tilt_options_deg are tried smallest first; a tilt is
-    used only if the open gripper, from fingertips to rim, stays inside the bowl
-    opening. The whole route is path-checked and the descent must follow its
-    straight line below the rim.
+    Waypoints: "above candy", "descend N", "grasp", "lift N", "lift above candy",
+    "scan". Tilts from grasp_tilt_options_deg are tried smallest first. The
+    whole route is path-checked, the move between the scan pose and "above
+    candy" keeps the tip at least at that height, and the descent must follow
+    its straight line.
     """
-    bowl_settings = settings["bowl"]
     point = finite_vector(candy["base_point_mm"], 3, "candy top point")
-    center = bowl["plane_center_mm"]
-    rim_z = bowl_settings["table_z_mm"] + bowl_settings["bowl_height_mm"]
     grasp_tip = np.array([point[0], point[1], grasp_tip_z(point[2], settings)])
-    above_z = max(rim_z, grasp_tip[2]) + float(settings["rim_clearance_mm"])
-    closings = closing_yaw_candidates(candy, bowl, settings)
-    if not closings:
-        raise DemoError("no closing direction keeps the open jaws clear of the bowl wall")
+    approach = float(settings["pick_approach_height_mm"])
+    start = np.asarray(start_joints, dtype=np.float64)
+    scan = np.asarray(scan_joints, dtype=np.float64)
     errors = []
     for tilt in settings["grasp_tilt_options_deg"]:
-        for closing in closings:
-            for rotation in bowl_grasp_rotations(closing, tilt, settings):
+        for closing in closing_yaw_candidates(candy, settings):
+            for rotation in grasp_rotations(closing, tilt, settings):
                 up = -rotation.apply([0.0, 0.0, 1.0])
-                label = f"tilt {tilt:.0f}deg closing {closing:.0f}deg"
-                if not bowl_vision.gripper_clear_of_bowl(
-                    grasp_tip, -up, closing, center, rim_z, FINGER_EXTENSION_BELOW_TIP_MM, bowl_settings,
-                    rim_radius_mm=bowl.get("radius_mm"),
-                ):
-                    errors.append(f"{label}: the tilted gripper would touch the bowl wall")
-                    continue
-                distances = np.arange((above_z - grasp_tip[2]) / up[2], 0.0, -float(settings["vertical_step_mm"]))
+                distances = np.arange(approach / up[2], 0.0, -float(settings["vertical_step_mm"]))
                 tips = [grasp_tip + up * distance for distance in distances]
+                label = f"tilt {tilt:.0f}deg closing {closing:.0f}deg"
                 try:
-                    above = solve_waypoint("above bowl", flange_for_tip(tips[0], rotation), rotation, start_joints)
+                    above = solve_waypoint("above candy", flange_for_tip(tips[0], rotation), rotation, start)
                     descents, seed = [], above
                     for index, tip in enumerate(tips[1:], start=1):
                         seed = solve_waypoint(f"descend {index}", flange_for_tip(tip, rotation), rotation, seed)
@@ -1262,31 +1240,31 @@ def plan_bowl_pick(
                     grasp = solve_waypoint("grasp", flange_for_tip(grasp_tip, rotation), rotation, seed)
                     lifts = [(f"lift {index}", joints.copy()) for index, (_, joints) in enumerate(reversed(descents), start=1)]
                     plan = [
-                        ("above bowl", above), *descents, ("grasp", grasp), *lifts,
-                        ("lift above bowl", above.copy()), ("scan", np.asarray(scan_joints, dtype=np.float64).copy()),
+                        ("above candy", above), *descents, ("grasp", grasp), *lifts,
+                        ("lift above candy", above.copy()), ("scan", scan.copy()),
                     ]
-                    validate_joint_path_safety(
-                        "bowl pickup and return to scan", [np.asarray(start_joints, dtype=np.float64), *[q for _, q in plan]],
-                    )
+                    validate_joint_path_safety("table pickup and return to scan", [start, *[q for _, q in plan]])
+                    above_z = float(tips[0][2])
+                    validate_transit_height("move above the candy", start, above, above_z - 1.0)
+                    validate_transit_height("return to scan", above, scan, above_z - 1.0)
                     validate_descent_line(
-                        plan, grasp_tip, up, rim_z + FINGER_EXTENSION_BELOW_TIP_MM,
-                        float(settings["maximum_vertical_deviation_mm"]),
+                        plan, grasp_tip, up, above_z + 1.0, float(settings["maximum_vertical_deviation_mm"]),
                     )
                     return plan
                 except DemoError as exc:
                     errors.append(f"{label}: {exc}")
-    raise DemoError("no reachable bowl grasp at any allowed tilt: " + " | ".join(errors[:3]))
+    raise DemoError("no reachable grasp at any allowed tilt: " + " | ".join(errors[:3]))
 
 
 def pick_first_reachable(
     arm: Piper, scan_result: dict, scan: dict, settings: dict,
 ) -> tuple[dict, list[tuple[str, np.ndarray]]]:
-    """Plan the first pickable candy (highest first) that has a reachable vertical grasp."""
-    start = measured_start_joints(arm, "bowl pickup planning")
+    """Plan the first pickable candy (nearest the robot first) that has a reachable grasp."""
+    start = measured_start_joints(arm, "table pickup planning")
     rejections = []
     for candy in scan_result["pickable"]:
         try:
-            return candy, plan_bowl_pick(candy, scan_result["bowl"], start, scan["joints_deg"], settings)
+            return candy, plan_table_pick(candy, start, scan["joints_deg"], settings)
         except DemoError as exc:
             rejections.append({"base_point_mm": candy["base_point_mm"], "reason": str(exc)})
             print(
@@ -1294,17 +1272,33 @@ def pick_first_reachable(
                 f"{summarize_rejection(str(exc))}",
                 flush=True,
             )
-    raise NoReachableCandyError("no candy in the bowl has a reachable grasp; move the bowl closer to the robot", rejections)
+    raise NoReachableCandyError(
+        "no candy on the table has a reachable grasp; place candies closer to the robot", rejections,
+    )
 
 
-def execute_bowl_pickup(
+def hand_in_view(hands: HandClient) -> str | None:
+    """Why a pick must wait (any hand in view, or no fresh answer), or None when no hand is seen."""
+    try:
+        capture = hands.capture_hand(HAND_SLOT)
+        verify_fresh(capture, MAXIMUM_HAND_AGE_SECONDS)
+    except DemoError as exc:
+        return f"cannot confirm that no hand is in view: {exc}"
+    visible = capture.get("visible_hand_sample_count")
+    if capture.get("status") == "not_found" and visible == 0:
+        return None
+    return f"a hand is in view (hand service: {capture.get('status')}, seen in {visible} of {capture.get('sample_count')} samples)"
+
+
+def execute_table_pickup(
     arm: Piper, plan: list[tuple[str, np.ndarray]], settings: dict, carry: CandyCarry, candy: dict,
 ) -> float:
-    """Descend, grip, lift clear of the rim, verify the candy is held, and return to the scan pose.
+    """Descend, grip, lift back above the candy's spot, verify the candy is held, and return to scan.
 
     The carry tracker marks the candy held when the gripper closes and records
-    each reached waypoint. On a missed grasp the jaws open above the bowl and
-    the arm returns to the scan pose before GraspVerificationError is raised.
+    each reached waypoint. On a missed grasp the jaws open above the pickup
+    spot and the arm returns to the scan pose before GraspVerificationError is
+    raised.
     """
     timeout = float(settings["move_timeout_seconds"])
     open_mm, close_mm = float(settings["grip_open_mm"]), float(settings["grip_close_mm"])
@@ -1322,7 +1316,7 @@ def execute_bowl_pickup(
         print("motion: close gripper", flush=True)
     hold_gripper(arm, waypoints["grasp"], close_mm, hold_seconds)
     carry.gripped_at(waypoints["grasp"])
-    for name, joints in plan[grasp_index + 1:names.index("lift above bowl") + 1]:
+    for name, joints in plan[grasp_index + 1:names.index("lift above candy") + 1]:
         move_robot(arm, name, joints, close_mm, timeout, speed, verbose=verbose)
         carry.reached(name, joints)
     held_width = float(arm.grip_mm())
@@ -1331,10 +1325,10 @@ def execute_bowl_pickup(
         carry.holding = False
         print(
             f"No candy in gripper: measured width {held_width:.1f}mm is below {minimum_held:.1f}mm; "
-            "opening above the bowl and returning to scan",
+            "opening and returning to scan",
             flush=True,
         )
-        hold_gripper(arm, waypoints["lift above bowl"], open_mm, hold_seconds)
+        hold_gripper(arm, waypoints["lift above candy"], open_mm, hold_seconds)
         move_robot(arm, "return to scan pose after missed grasp", waypoints["scan"], open_mm, timeout, speed, verbose=verbose)
         raise GraspVerificationError(held_width, minimum_held)
     move_robot(arm, "scan", waypoints["scan"], close_mm, timeout, speed, verbose=verbose)
@@ -1342,31 +1336,33 @@ def execute_bowl_pickup(
     return held_width
 
 
-def return_candy_to_bowl(
+def return_candy_to_table(
     arm: Piper, pickup_plan: list[tuple[str, np.ndarray]], carry: CandyCarry, settings: dict,
 ) -> None:
-    """Carry a held candy back above the bowl along reached waypoints, drop it, and return to scan.
+    """Carry a held candy back above where it was picked along reached waypoints, drop it, and return to scan.
 
-    Retraces the carried path in reverse to the "lift above bowl" pose (or, if
+    Retraces the carried path in reverse to the "lift above candy" pose (or, if
     the error came before it was reached, finishes the planned lift up to it),
-    opens the gripper there, and moves to the scan pose. The whole route is
-    path-checked from the measured joints before the first move.
+    opens the gripper there, so the candy drops back onto its spot from the
+    approach height without the arm coming down to the table, and moves to the
+    scan pose. The whole route is path-checked from the measured joints before
+    the first move.
     """
     if not carry.holding or not carry.path or carry.path[0][0] != "grasp":
         raise DemoError("no tracked held candy to return")
     names = [name for name, _ in pickup_plan]
     waypoints = dict(pickup_plan)
     reached = [name for name, _ in carry.path]
-    if "lift above bowl" in reached:
-        last = len(reached) - 1 - reached[::-1].index("lift above bowl")
+    if "lift above candy" in reached:
+        last = len(reached) - 1 - reached[::-1].index("lift above candy")
         back = [(f"return candy: retrace {name}", joints) for name, joints in reversed(carry.path[last + 1:])]
     else:
-        remaining = names[names.index("grasp") + 1:names.index("lift above bowl")]
+        remaining = names[names.index("grasp") + 1:names.index("lift above candy")]
         back = [(f"return candy: {name}", waypoints[name]) for name in remaining if name not in reached]
-    back.append(("return candy: above bowl", waypoints["lift above bowl"]))
+    back.append(("return candy: above its spot", waypoints["lift above candy"]))
     validate_joint_path_safety(
-        "candy return to bowl",
-        [measured_start_joints(arm, "candy return to bowl"), *[joints for _, joints in back], waypoints["scan"]],
+        "candy return to the table",
+        [measured_start_joints(arm, "candy return to the table"), *[joints for _, joints in back], waypoints["scan"]],
     )
     closed, opened = float(settings["grip_close_mm"]), float(settings["grip_open_mm"])
     timeout, speed = float(settings["move_timeout_seconds"]), int(settings["pick_motion_speed_percent"])
@@ -1375,9 +1371,9 @@ def return_candy_to_bowl(
             continue
         validate_joint_path_safety(name, [measured_start_joints(arm, name), joints])
         move_robot(arm, name, joints, closed, timeout, speed)
-    print("motion: open gripper to drop the candy back into the bowl", flush=True)
+    print("motion: open gripper to drop the candy back where it was picked", flush=True)
     carry.holding = False
-    hold_gripper(arm, waypoints["lift above bowl"], opened, float(settings["gripper_hold_seconds"]))
+    hold_gripper(arm, waypoints["lift above candy"], opened, float(settings["gripper_hold_seconds"]))
     validate_joint_path_safety("return candy: back to scan", [measured_start_joints(arm, "back to scan"), waypoints["scan"]])
     move_robot(arm, "return candy: back to scan", waypoints["scan"], opened, timeout, speed)
 
@@ -1482,7 +1478,7 @@ def deliver_to_hand(
     checked_move(arm, f"hand release height (+{RELEASE_CLEARANCE_MM:.0f}mm)", plan["hand release"], closed, settings)
     carry.reached("hand release height", plan["hand release"])
     verify_fresh(capture, MAXIMUM_HAND_AGE_SECONDS)
-    # Once opening starts above the hand, never carry anything back to the bowl.
+    # Once opening starts above the hand, never carry anything back to the table.
     carry.holding = False
     hold_gripper(arm, plan["hand release"], opened, float(settings["gripper_hold_seconds"]))
     checked_move(arm, "hand retreat", plan["hand retreat"], opened, settings)
@@ -1498,24 +1494,28 @@ def go_to_scan(arm: Piper, scan: dict, settings: dict) -> None:
 
 
 def run_cycle(
-    arm: Piper, camera: CameraClient, hands: HandClient | None, scan: dict,
+    arm: Piper, camera: CameraClient, hands: HandClient, scan: dict,
     camera_to_gripper: np.ndarray, settings: dict, pick_only: bool = False,
 ) -> bool:
-    """Pick one candy from the bowl, then drop it on a hand (or back in the bowl with pick_only).
+    """Pick one candy from the table, then drop it on a hand (or back on its spot with pick_only).
 
-    Return True after a drop, False when nothing was picked (no bowl or
-    pickable candy, no reachable grasp, missed grasp) or a held candy had to be
-    returned to the bowl after an error. Errors with nothing held, failed
+    Return True after a drop, False when nothing was picked (no pickable
+    candy, no reachable grasp, a hand in view, missed grasp) or a held candy
+    had to be put back after an error. Errors with nothing held, failed
     returns, and Ctrl+C propagate and stop the loop.
     """
     go_to_scan(arm, scan, settings)
-    result = scan_bowl(arm, camera, camera_to_gripper, settings)
+    result = scan_table(arm, camera, camera_to_gripper, settings)
     if result["status"] != "detected":
         return False
     try:
         candy, plan = pick_first_reachable(arm, result, scan, settings)
     except NoReachableCandyError as exc:
         print(f"{exc}; scanning again", flush=True)
+        return False
+    reason = hand_in_view(hands)
+    if reason is not None:
+        print(f"Not picking: {reason}; scanning again", flush=True)
         return False
     print(
         f"Picking candy at {np.round(candy['base_point_mm'], 1).tolist()}mm "
@@ -1524,10 +1524,10 @@ def run_cycle(
     )
     carry = CandyCarry()
     try:
-        width = execute_bowl_pickup(arm, plan, settings, carry, candy)
+        width = execute_table_pickup(arm, plan, settings, carry, candy)
         print(f"Pickup confirmed: gripper width={width:.1f}mm", flush=True)
         if pick_only:
-            return_candy_to_bowl(arm, plan, carry, settings)
+            return_candy_to_table(arm, plan, carry, settings)
             return True
         deliver_to_hand(arm, hands, scan, camera_to_gripper, settings, carry)
         print("Candy dropped on the hand", flush=True)
@@ -1538,12 +1538,12 @@ def run_cycle(
         if not carry.holding:
             raise
         print(f"ERROR while holding candy: {exc}", flush=True)
-        print("Returning the candy to the bowl", flush=True)
+        print("Putting the candy back where it was picked", flush=True)
         try:
-            return_candy_to_bowl(arm, plan, carry, settings)
+            return_candy_to_table(arm, plan, carry, settings)
         except (RuntimeError, OSError, KeyError, TypeError, ValueError) as return_exc:
             raise DemoError(f"candy return failed after '{exc}': {return_exc}") from return_exc
-        print("Candy returned; continuing", flush=True)
+        print("Candy put back; continuing", flush=True)
         return False
     return True
 
@@ -1552,9 +1552,9 @@ def run_scan_only(
     arm: Piper, camera: CameraClient, hands: HandClient, scan: dict,
     camera_to_gripper: np.ndarray, settings: dict,
 ) -> None:
-    """One no-pick report at the scan pose: bowl, candies, and hand."""
+    """One no-pick report at the scan pose: candies on the table and the hand."""
     go_to_scan(arm, scan, settings)
-    result = scan_bowl(arm, camera, camera_to_gripper, settings)
+    result = scan_table(arm, camera, camera_to_gripper, settings)
     if result["pickable"]:
         try:
             candy, plan = pick_first_reachable(arm, result, scan, settings)
@@ -1565,7 +1565,7 @@ def run_scan_only(
             )
         except NoReachableCandyError as exc:
             print(f"  {exc}", flush=True)
-    print(f"  annotated photo: {BOWL_SCAN_IMAGE}", flush=True)
+    print(f"  annotated photo: {CANDY_SCAN_IMAGE}", flush=True)
     try:
         capture, decision = capture_hand_target(arm, hands, camera_to_gripper, settings)
         print(f"HAND SCAN: {report_hand(capture, decision)}", flush=True)
@@ -1588,11 +1588,12 @@ def parse_args() -> argparse.Namespace:
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--scan-only", action="store_true",
-        help="move to the scan pose and report bowl, candies, and hand each cycle; never picks",
+        help="move to the scan pose and report the candies and hand each cycle; never picks",
     )
     mode.add_argument(
         "--pick-only", action="store_true",
-        help="pick a candy from the bowl and drop it back in; no hand service needed",
+        help="pick a candy from the table and drop it back where it was; no open palm needed "
+        "(the hand service still confirms no hand is in view before each pick)",
     )
     parser.add_argument("--verbose", action="store_true", help="print each motion and skipped-candy reasons")
     parser.add_argument(
@@ -1624,7 +1625,8 @@ def main() -> int:
     try:
         hand_eye = load_hand_eye(args.calibration_dir)
         camera = CameraClient(args.vision_url)
-        hands = None if args.pick_only else HandClient(args.hand_url)
+        # Needed in every mode: no pick starts while the hand service sees a hand.
+        hands = HandClient(args.hand_url)
         ensure_k3s_address()
         check_services(camera, hands, hand_eye["camera"]["serial"])
         settings, camera_to_gripper, scans = load_setup(args, hand_eye)

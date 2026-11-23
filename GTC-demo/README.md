@@ -1,71 +1,61 @@
-# GTC demo: candy from a bowl to an open hand
+# GTC demo: candy from the table to an open hand
 
-The Piper arm picks a cuboid Christmas candy (1 x 1 x 0.75 inch) from a
-6-inch bowl and drops it on an open hand, using the wrist D435 camera, OpenCV,
+The Piper arm picks a cuboid Christmas candy (about 1 x 1 x 0.75 inch) from
+the table and drops it on an open hand, using the wrist D435 camera, OpenCV,
 and the MediaPipe hand service. It reuses the Ignite calibration, scan pose,
 workspace, k3s camera/hand services, and motion safety checks.
+
+The earlier bowl version is parked: [bowl_vision.py](bowl_vision.py) is kept
+for later but no longer used by the demo, apart from shared helpers.
 
 ## Flow
 
 Each cycle starts at the taught scan pose:
 
-1. **Bowl and candy** ([bowl_vision.py](bowl_vision.py)). The photo is warped
-   to a top-down view at rim height, where the 6-inch rim is a circle: Hough
-   circles confirmed by edge support (no colour; printed circles on the hand
-   board score far lower than a real rim). Depth just inside the far rim must
-   read a raised bowl, which rejects flat circles. Candies are found by their
-   foil colour (red, green, gold, each segmented on its own so touching
-   candies of different colours separate): candy-sized rectangles, touching
-   same-colour candies split, and candy-sized squares fitted inside merged
-   blobs of a full bowl. Each candy's top centre comes from depth, and depth
+1. **Candies** ([table_vision.py](table_vision.py)). The photo is warped to a
+   top-down view on the plane through the candy tops. A candy is a blob of the
+   foil colours (red, green, gold, merged so a ribbon in another colour does
+   not split it). The camera also sees each candy's near sides, which stretch
+   the blob toward the camera; they are trimmed geometrically so the box sits
+   on the top face. Blobs cut off by the photo edge, the gripper fingers (the
+   dark shape at the bottom of every photo), or the workspace edge are
+   skipped. Each candy's top is then measured from depth: it must be 10-32 mm
+   above the table (a print on the board or a hand is not a candy), and depth
    where each open finger would land must be below the fingertips, so the
-   gripper does not come down on a neighbour; candies on top of the heap win.
-2. **Pick** ([demo.py](demo.py)). The highest candy whose open jaws stay clear
-   of the bowl wall is picked along a straight line: above the candy 30 mm
-   over the rim, in along the tool axis, grip, back out, back to the scan pose.
-   The gripper is vertical when that reaches; far bowls use the smallest tilt
-   (10, 20, or 30 degrees, about the jaws' closing axis so they still close
-   level) whose gripper, from fingertips to rim, stays inside the bowl opening.
-   A width check confirms the candy is held; a miss opens above the bowl and
-   rescans.
+   gripper does not come down on a neighbour. The candy nearest the robot wins.
+2. **Pick** ([demo.py](demo.py)). No pick starts while the hand service sees
+   any hand, open or closed. The gripper goes 60 mm above the candy, moves
+   straight in along its own axis, grips, moves back out, and returns to the
+   scan pose; it never dips below that approach height on the way over other
+   candies. It is vertical when that reaches; farther candies use the
+   smallest tilt (10, 20, or 30 degrees, about the jaws' closing axis so they
+   still close level). A width check confirms the candy is held; a miss opens
+   the gripper and rescans.
 3. **Wait for a hand** ([hand_target.py](hand_target.py)). Holding the candy at
    the scan pose, the demo waits (no timeout) for an open palm whose finger
    base (centre of the four knuckles) is visible by depth and inside the hand
    workspace.
 4. **Drop**: 35 mm above the palm centre, or above the finger base when the
-   palm centre is not visible. Then the next cycle.
+   palm centre is not visible. Then the next cycle picks another candy.
 
 If anything fails while the candy is held, it is carried back along the
-reached waypoints and dropped into the bowl. Ctrl+C returns the arm to SDK
-zero and opens the gripper there.
+reached waypoints and dropped onto its spot from the approach height (the arm
+does not come back down to the table). Ctrl+C returns the arm to SDK zero and
+opens the gripper there.
 
-## Bowl placement
+## Candy placement
 
-The bowl may be anywhere in the workspace that the scan pose (shared with
-Ignite) can see. Bowl detection needs at least 20% of the rim in the photo and
-not behind the gripper fingers, which the wrist camera always sees at the
-bottom of the photo (bowls beside the hand board and near the robot were found
-at 25-83%); reach comes from tilted grasps. Smallest gripper tilt that reaches a
-candy at the bowl centre, by bowl-centre position (`v` = less than 60% of the
-rim in view, so a conservative map: many `v` cells are still detected):
+Place candies one at a time, not touching, where the scan pose sees them
+whole: roughly X 230-550 mm and inside the workspace (X 144-595, Y -170 to 206
+mm). Candies at the bottom edge of the photo, behind the gripper fingers, or
+across the workspace edge are skipped.
 
-| X \ Y (mm) | -160 | -120 | -80 | -40 | 0 | 40 | 80 | 120 | 160 | 200 |
-|---|---|---|---|---|---|---|---|---|---|---|
-| 160-200 | v | v | v | v | v | v | v | v | v | v |
-| 240 | v | v | 0 | 0 | 0 | 0 | 0 | 0 | v | v |
-| 280 | v | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | v |
-| 320 | v | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 10 | 10 |
-| 360-440 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10 | 10-20 |
-| 480 | 20 | 20 | 20 | 10 | 10 | 10 | 20 | 20 | 20 | 20 |
-| 520 | v | 20 | 20 | 20 | 20 | 20 | 20 | 20 | 20 | v |
-| 560-600 | v | v | v | v | v | v | v | v | v | v |
-
-Closer than about X 240 mm or beyond about X 540 mm only part of the bowl is
-in view. It is still found if enough rim shows, but only the visible candies
-can be picked, and those are often too close to the wall for the open jaws;
-the annotated photo shows what the camera saw. Candies near the wall are
-harder to reach at a tilt, so far bowls work best with candy heaped in the
-middle.
+| X (mm) | Grasp |
+|---|---|
+| up to ~370 | straight down (most reliable) |
+| ~375-525 | tilted 10-30 degrees; most candy orientations reach |
+| ~550 | tilted; about a third of orientations reach |
+| beyond ~575 | out of reach |
 
 ## Run
 
@@ -75,64 +65,70 @@ From the repository root with `source ~/venv-ignite-demo/bin/activate`:
 # Preflight: services, calibration, scan pose; no CAN, no motion
 python GTC-demo/demo.py --check-only
 
-# Move to the scan pose and report bowl, candies, and hand every cycle; never picks
+# Move to the scan pose and report candies and hand every cycle; never picks
 python GTC-demo/demo.py --allow-motion --scan-only --verbose
 
-# Pick from the bowl and drop the candy back in; no hand needed
-python GTC-demo/demo.py --allow-motion --pick-only --verbose
+# Pick a candy and drop it back on its spot; no open palm needed
+python GTC-demo/demo.py --allow-motion --pick-only --verbose --pause-before-grip
 
 # Full demo
 python -u GTC-demo/demo.py --allow-motion --verbose 2>&1 | tee -i GTC-demo/logs/run-$(date +%Y%m%d-%H%M%S).log
 ```
 
-`--max-cycles N` stops after N cycles (default 0: until Ctrl+C). Each bowl scan
-writes an annotated photo to `GTC-demo/logs/latest_bowl_scan.jpg`: rim in blue,
-candies in green, rejected regions in red, the chosen candy in yellow.
+`--max-cycles N` stops after N cycles (default 0: until Ctrl+C). Every mode
+needs the hand service, which confirms no hand is in view before each pick.
+Each table scan writes an annotated photo to
+`GTC-demo/logs/latest_candy_scan.jpg`: pickable candies in green, skipped ones
+in red.
 
 ## Tuning with photos
 
-Capture photos at the scan pose (moves the arm; type `MOVE` to confirm, Enter
-to capture, a word to label the photo, `q` to finish):
+Capture photos at the scan pose (moves the arm; type `MOVE` to confirm):
 
 ```bash
-python GTC-demo/capture_scan_images.py --allow-motion --setup-reviewed --no-yolo --frames 1
+python GTC-demo/capture_scan_images.py --allow-motion --setup-reviewed --no-yolo --frames 1 --label table
 ```
 
 Evaluate them offline (no robot or services) and review the annotated images
-in `GTC-demo/captures/bowl-eval/`:
+in `GTC-demo/captures/table-eval/`:
 
 ```bash
-python GTC-demo/bowl_vision.py GTC-demo/captures
+python GTC-demo/table_vision.py GTC-demo/captures
 ```
 
-Detection settings are in `BOWL_SETTINGS` in [bowl_vision.py](bowl_vision.py);
+Detection settings are in `TABLE_SETTINGS` in [table_vision.py](table_vision.py)
+(the foil colours come from `BOWL_SETTINGS` in [bowl_vision.py](bowl_vision.py));
 motion settings in `DEMO_SETTINGS` in [demo.py](demo.py).
 
 ## To measure on the arm
 
-These values are estimates until checked with the real candy and bowl:
+These values are estimates until checked with the real candy:
 
 | Setting | Current | How to check |
 |---|---|---|
-| `maximum_descent_below_rim_mm` (bowl_vision) | 40 mm | Lower the gripper into the bowl by hand; the deepest candy top the wrist and camera can reach without touching the rim |
 | `grasp_tip_above_candy_top_mm` | 5 mm | `--pick-only --pause-before-grip`: fingertips ~10 mm down the candy's side |
 | `candy_xy_correction_mm` | 0, 0 | `--pause-before-grip` prints the suggested value after each typed offset |
-| `minimum_held_grip_mm` | 12 mm | Held candy should read about 19-25 mm, an empty close about 1 mm |
-| `finger_thickness_mm`, `finger_width_mm` (bowl_vision) | 10, 20 mm | Measure the jaws; they set the wall clearance |
+| `minimum_held_grip_mm` | 12 mm | Held candy should read about 20-25 mm, an empty close about 1 mm |
+| `finger_thickness_mm` | 10 mm | Measure the jaws; sets where the finger-landing depth is read |
+
+The candy tops measure about 21-23 mm across in the scan photos rather than
+25.4 mm; the 40 mm jaw opening leaves about 9 mm either side.
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | [demo.py](demo.py) | The demo loop and its modes |
-| [bowl_vision.py](bowl_vision.py) | Bowl and candy detection, rim check, grasp ordering; offline evaluation |
+| [table_vision.py](table_vision.py) | Candy detection on the table and grasp ordering; offline evaluation |
+| [bowl_vision.py](bowl_vision.py) | Parked bowl detection; its top-down view, colour segmentation, and drawing helpers are shared |
 | [hand_target.py](hand_target.py) | Finger-base gate and palm-centre / finger-base choice |
 | [vision_client.py](vision_client.py) | Camera (photos, depth at a pixel) and hand service clients |
 | [capture_scan_images.py](capture_scan_images.py) | Scan-pose photo capture for tuning |
 | [workspace_motion.py](workspace_motion.py) | Replay the taught workspace corners |
 
 The hand service ([k3s-hand-service](../k3s-hand-service/README.md)) reports
-the palm centre and finger base with depth visibility in its `points` block.
+the palm centre and finger base with depth visibility in its `points` block,
+and how many of its samples showed any hand.
 
 Tests (hardware-free): `python -m unittest discover -s GTC-demo` from the
 repository root.

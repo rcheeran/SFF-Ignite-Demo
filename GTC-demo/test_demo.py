@@ -1,4 +1,4 @@
-"""Hardware-free tests for the GTC bowl-to-hand flow in demo.py."""
+"""Hardware-free tests for the GTC table-to-hand flow in demo.py."""
 
 import argparse
 from datetime import datetime, timedelta, timezone
@@ -17,9 +17,11 @@ from scipy.spatial.transform import Rotation as Rot
 
 import bowl_vision as bv
 import demo
+import table_vision as tv
 from piper.kinematics import fk
 from piper.transforms import rot_to_euler, tip_position
-from test_bowl_vision import GOLD, GREEN, INTRINSICS, RED, render
+from test_bowl_vision import GOLD, GREEN, INTRINSICS, RED
+from test_table_vision import WHITE, render_table
 
 # The taught scan pose (prepare-piper/scan-poses/scan_poses.json is not in git).
 SCAN = {
@@ -27,10 +29,12 @@ SCAN = {
     "joints_deg": np.array([-5.73, 35.966, -53.772, 3.918, 67.018, -7.811]),
     "end_pose_mm_deg": np.array([82.029, -2.477, 374.27, -177.127, 45.876, -176.709]),
 }
-# Inside the band the scan pose can see whole and straight-down grasps can reach.
-BOWL_XY = (290.0, 20.0)
-BOWL = bv.BOWL_SETTINGS
-RIM_Z = BOWL["table_z_mm"] + BOWL["bowl_height_mm"]
+TABLE_Z = tv.TABLE_SETTINGS["table_z_mm"]
+TOP_Z = TABLE_Z + tv.TABLE_SETTINGS["candy_top_above_table_mm"]
+TIP_ABOVE_TOP = demo.DEMO_SETTINGS["grasp_tip_above_candy_top_mm"]
+APPROACH = demo.DEMO_SETTINGS["pick_approach_height_mm"]
+# Inside the scan-pose view and within straight-down reach.
+NEAR = (300.0, 0.0)
 
 
 def settings(**overrides):
@@ -66,11 +70,11 @@ def pose_for(transform):
 
 
 class FakeCamera:
-    """Camera service with a rendered photo and depth given by a height per rim-plane region."""
+    """Camera service with a rendered photo and depth given by a height per candy-top-plane point."""
 
     def __init__(self, frame, c2b, height_at):
         self.frame, self.c2b, self.height_at = frame, c2b, height_at
-        self.view = bv.bowl_view(INTRINSICS, c2b)
+        self.view = tv.table_view(INTRINSICS, c2b, settings()["table"])
 
     def capture_png(self):
         captured = {"token": "token1", "frame_sequence": 1, "captured_at": datetime.now(timezone.utc).isoformat()}
@@ -85,100 +89,90 @@ class FakeCamera:
         return (np.linalg.inv(self.c2b) @ np.append(point, 1.0))[:3]
 
 
-CANDIES = ((290, 20, 0, RED), (300, 48, 30, GOLD))
-FLOOR_Z = 5.0
-TIP_ABOVE_TOP = demo.DEMO_SETTINGS["grasp_tip_above_candy_top_mm"]
+CANDIES = ((300, 0, 0, RED, GOLD), (300, 36, 0, GREEN, WHITE), (420, -80, 30, GOLD, RED))
 
 
-def bowl_depth(rim_z=RIM_Z - 4.0, candy_z=45.0, candies=CANDIES):
-    """Depth model on the rim plane: inner wall top near the rim, candy tops on candies, floor elsewhere."""
+def table_depth(candies=CANDIES, top_z=TOP_Z):
+    """Depth model on the candy-top plane: candy tops on candies, the table elsewhere."""
     def height_at(plane_xy):
-        point = np.asarray(plane_xy)
-        if np.linalg.norm(point - BOWL_XY) > BOWL["bowl_diameter_mm"] / 2.0 - 10.0:
-            return rim_z
-        if any(np.linalg.norm(point - candy[:2]) <= 12.7 for candy in candies):
-            return candy_z
-        return FLOOR_Z
+        if any(np.max(np.abs(np.asarray(plane_xy) - candy[:2])) <= 12.7 for candy in candies):
+            return top_z
+        return TABLE_Z
     return height_at
 
 
-class BowlScanTests(unittest.TestCase):
+class TableScanTests(unittest.TestCase):
     def scan(self, height_at, candies=CANDIES):
-        frame, c2b = render(bowl_center=BOWL_XY, candies=candies)
+        frame, c2b = render_table(candies)
         arm = healthy_arm()
         arm.pose.return_value = pose_for(c2b)
         camera = FakeCamera(frame, c2b, height_at)
         with tempfile.TemporaryDirectory() as folder, \
                 mock.patch.object(demo, "LOG_DIR", Path(folder)), \
-                mock.patch.object(demo, "BOWL_SCAN_IMAGE", Path(folder) / "scan.jpg"), \
+                mock.patch.object(demo, "CANDY_SCAN_IMAGE", Path(folder) / "scan.jpg"), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            result = demo.scan_bowl(arm, camera, np.eye(4), settings())
+            result = demo.scan_table(arm, camera, np.eye(4), settings())
             saved = (Path(folder) / "scan.jpg").exists()
         return result, arm, camera, stdout.getvalue(), saved
 
-    def test_bowl_is_confirmed_by_rim_depth_and_candies_located_from_depth(self):
-        result, arm, camera, output, saved = self.scan(bowl_depth())
+    def test_candies_are_located_from_depth_and_ranked_nearest_the_robot_first(self):
+        result, arm, camera, output, saved = self.scan(table_depth())
         self.assertEqual(result["status"], "detected")
         self.assertTrue(saved)
-        self.assertIn("above the table", result["bowl"]["rim_check"])
-        self.assertIn("BOWL SCAN: detected", output)
-        self.assertEqual(len(result["pickable"]), 2)
+        self.assertIn("TABLE SCAN: detected, 3 candies, 3 pickable", output)
+        distances = [np.linalg.norm(candy["base_point_mm"][:2]) for candy in result["pickable"]]
+        self.assertEqual(distances, sorted(distances))
         for candy in result["pickable"]:
-            expected = bv.point_at_height(camera.view, candy["plane_center_mm"], 45.0)
+            expected = bv.point_at_height(camera.view, candy["plane_center_mm"], TOP_Z)
             np.testing.assert_allclose(candy["base_point_mm"], expected, atol=0.5)  # pixel rounded to 0.1 px
-            self.assertAlmostEqual(candy["true_long_mm"], bv.true_size(camera.view, candy["long_mm"], 45.0))
-            self.assertAlmostEqual(candy["true_long_mm"], 25.4 * (418 - 45) / (418 - RIM_Z), delta=2.5)
-        # The red candy's fingers cannot close along Y: one would land on the gold candy.
-        red = min(result["pickable"], key=lambda c: np.linalg.norm(np.subtract(c["plane_center_mm"], (290, 20))))
+            self.assertAlmostEqual(candy["true_long_mm"], 25.4, delta=3.0)
+        # The red candy's fingers cannot close along Y: one would land on the green candy beside it.
+        red = min(result["pickable"], key=lambda c: np.linalg.norm(np.subtract(c["plane_center_mm"], (300, 0))))
         self.assertTrue(all(min(abs(yaw - 90.0), abs(yaw - 270.0)) > 15.0 for yaw in red["closing_yaw_deg"]))
-        # The best candy has a reachable straight-down grasp just above its top surface.
+        # The nearest candy has a reachable straight-down grasp just above its top surface.
         candy, plan = demo.pick_first_reachable(arm, result, SCAN, settings())
         np.testing.assert_allclose(
             tip_position(dict(plan)["grasp"]), np.add(candy["base_point_mm"], [0, 0, TIP_ABOVE_TOP]), atol=1.0,
         )
+        self.assertAlmostEqual(demo.grasp_tilt_deg(dict(plan)["grasp"]), 0.0, delta=0.5)
 
-    def test_flat_circle_and_candies_without_depth_are_not_picked(self):
-        flat, *_ = self.scan(bowl_depth(rim_z=BOWL["table_z_mm"]))
-        self.assertEqual(flat["status"], "flat_circle")
-        self.assertIn("flat circle", flat["bowl"]["rim_check"])
-        self.assertEqual(flat["pickable"], [])
+    def test_prints_and_candies_without_depth_are_not_picked(self):
+        printed, *_ = self.scan(table_depth(top_z=TABLE_Z))
+        self.assertEqual(printed["status"], "no_pickable")
+        self.assertTrue(all("above the table" in " ".join(item["reasons"]) for item in printed["unpickable"]))
 
         def no_candy_depth(plane_xy):
-            return bowl_depth()(plane_xy) if np.linalg.norm(np.asarray(plane_xy) - BOWL_XY) > 66.0 else None
-
-        packed, *_ = self.scan(bowl_depth(candies=CANDIES + ((265, 20, 0, GREEN), (315, 20, 0, GREEN), (290, -5, 0, GREEN), (290, 45, 0, GREEN))))
-        packed_red = [item for item in packed["unpickable"] if np.linalg.norm(np.subtract(item["plane_center_mm"], (290, 20))) < 3.0]
-        self.assertEqual(len(packed_red), 1, "red candy boxed in by neighbours on all four sides")
-        self.assertTrue(any("finger would land" in reason for reason in packed_red[0]["reasons"]))
+            return None if table_depth()(plane_xy) == TOP_Z else TABLE_Z
 
         blind, *_ = self.scan(no_candy_depth)
         self.assertEqual(blind["status"], "no_pickable")
         no_depth = [item for item in blind["rejected_candies"] if any("no depth" in reason for reason in item["reasons"])]
-        self.assertEqual(len(no_depth), 2)
+        self.assertEqual(len(no_depth), 3)
 
 
-class BowlPickPlanTests(unittest.TestCase):
-    def candy(self, xy=BOWL_XY, top_z=45.0, closing=(0.0, 90.0)):
+class TablePickPlanTests(unittest.TestCase):
+    def candy(self, xy=NEAR, top_z=TOP_Z, closing=(0.0, 90.0)):
         return {"base_point_mm": [*xy, top_z], "closing_yaw_deg": list(closing), "edge_yaw_deg": 0.0}
 
-    def plan(self, candy, bowl_xy=BOWL_XY, values=None):
-        return demo.plan_bowl_pick(candy, {"plane_center_mm": list(bowl_xy)}, SCAN["joints_deg"], SCAN["joints_deg"], values or settings())
+    def plan(self, candy, values=None):
+        return demo.plan_table_pick(candy, SCAN["joints_deg"], SCAN["joints_deg"], values or settings())
 
-    def test_pick_approaches_above_the_rim_then_moves_straight_down_and_up(self):
+    def test_pick_approaches_above_the_candy_then_moves_straight_down_and_up(self):
         plan = self.plan(self.candy(closing=(90.0,)))
         names = [name for name, _ in plan]
-        self.assertEqual(names[0], "above bowl")
-        self.assertEqual(names[-2:], ["lift above bowl", "scan"])
+        self.assertEqual(names[0], "above candy")
+        self.assertEqual(names[-2:], ["lift above candy", "scan"])
         descents = [name for name in names if name.startswith("descend")]
-        lifts = [name for name in names if name.startswith("lift ") and name != "lift above bowl"]
+        lifts = [name for name in names if name.startswith("lift ") and name != "lift above candy"]
         self.assertGreater(len(descents), 0)
         self.assertEqual(len(lifts), len(descents))
         self.assertEqual(names.index("grasp"), len(descents) + 1)
         waypoints = dict(plan)
-        np.testing.assert_allclose(tip_position(waypoints["above bowl"]), [*BOWL_XY, RIM_Z + 30.0], atol=0.5)
-        np.testing.assert_allclose(tip_position(waypoints["grasp"]), [*BOWL_XY, 45.0 + TIP_ABOVE_TOP], atol=0.5)
+        grasp_z = TOP_Z + TIP_ABOVE_TOP
+        np.testing.assert_allclose(tip_position(waypoints["above candy"]), [*NEAR, grasp_z + APPROACH], atol=0.5)
+        np.testing.assert_allclose(tip_position(waypoints["grasp"]), [*NEAR, grasp_z], atol=0.5)
         for name in descents:
-            np.testing.assert_allclose(tip_position(waypoints[name])[:2], BOWL_XY, atol=0.5)
+            np.testing.assert_allclose(tip_position(waypoints[name])[:2], NEAR, atol=0.5)
         # Lifts retrace the descent in reverse.
         for lift, descent in zip(lifts, reversed(descents)):
             np.testing.assert_array_equal(waypoints[lift], waypoints[descent])
@@ -187,57 +181,47 @@ class BowlPickPlanTests(unittest.TestCase):
         self.assertAlmostEqual(abs(jaw_axis[1]), 1.0, delta=0.01)
         np.testing.assert_array_equal(waypoints["scan"], SCAN["joints_deg"])
 
-    def test_grasp_height_never_goes_below_the_bowl_floor_limit(self):
+    def test_grasp_height_never_goes_below_the_table_limit(self):
         plan = self.plan(self.candy(top_z=5.0))
         self.assertAlmostEqual(tip_position(dict(plan)["grasp"])[2], settings()["minimum_grasp_tip_z_mm"], delta=0.5)
 
-    def test_candies_at_the_wall_or_out_of_reach_have_no_plan(self):
-        with self.assertRaisesRegex(demo.DemoError, "clear of the bowl wall"):
-            self.plan(self.candy(xy=(BOWL_XY[0] + 60.0, BOWL_XY[1])))
-        with self.assertRaisesRegex(demo.DemoError, "no reachable bowl grasp at any allowed tilt"):
-            self.plan(self.candy(xy=(640.0, 0.0)), bowl_xy=(640.0, 0.0))
-
-    def test_far_bowl_uses_the_smallest_tilt_and_descends_along_the_tool_axis(self):
-        far = (420.0, 0.0)
-        vertical_only = settings(grasp_tilt_options_deg=[0.0])
-        with self.assertRaisesRegex(demo.DemoError, "no reachable bowl grasp"):
-            self.plan(self.candy(xy=far), bowl_xy=far, values=vertical_only)
-        plan = dict(self.plan(self.candy(xy=far), bowl_xy=far))
+    def test_far_candy_uses_the_smallest_tilt_and_moves_along_the_tool_axis(self):
+        far = (430.0, 0.0)
+        with self.assertRaisesRegex(demo.DemoError, "no reachable grasp at any allowed tilt"):
+            self.plan(self.candy(xy=far), values=settings(grasp_tilt_options_deg=[0.0]))
+        plan = dict(self.plan(self.candy(xy=far)))
         self.assertAlmostEqual(demo.grasp_tilt_deg(plan["grasp"]), 10.0, delta=0.5)
-        grasp_tip = np.array([*far, 45.0 + TIP_ABOVE_TOP])
+        grasp_tip = np.array([*far, TOP_Z + TIP_ABOVE_TOP])
         np.testing.assert_allclose(tip_position(plan["grasp"]), grasp_tip, atol=0.5)
         frame = fk(plan["grasp"])
         up = -frame[:3, 2]
         self.assertLess(abs(frame[2, 1]), 0.01)  # the jaws still close level
         for name, joints in plan.items():
-            if name.startswith("descend") or name == "above bowl":
+            if name.startswith("descend") or name == "above candy":
                 offset = np.cross(tip_position(joints) - grasp_tip, up)
                 self.assertLess(np.linalg.norm(offset), 0.5, name)
-        self.assertAlmostEqual(tip_position(plan["above bowl"])[2], RIM_Z + 30.0, delta=0.5)
-        self.assertTrue(bv.gripper_clear_of_bowl(
-            grasp_tip, frame[:3, 2], 0.0, far, RIM_Z, demo.FINGER_EXTENSION_BELOW_TIP_MM, settings()["bowl"],
-        ) or bv.gripper_clear_of_bowl(
-            grasp_tip, frame[:3, 2], 90.0, far, RIM_Z, demo.FINGER_EXTENSION_BELOW_TIP_MM, settings()["bowl"],
-        ))
+        self.assertAlmostEqual(tip_position(plan["above candy"])[2], grasp_tip[2] + APPROACH, delta=0.5)
 
-    def test_descent_that_strays_from_its_line_is_rejected(self):
+    def test_out_of_reach_candy_has_no_plan(self):
+        with self.assertRaisesRegex(demo.DemoError, "no reachable grasp at any allowed tilt"):
+            self.plan(self.candy(xy=(640.0, 0.0)))
+
+    def test_descent_that_strays_or_a_move_that_dips_toward_the_table_is_rejected(self):
         plan = dict(self.plan(self.candy()))
-        stray = demo.plan_bowl_pick(
-            self.candy(xy=(BOWL_XY[0] + 12.0, BOWL_XY[1])), {"plane_center_mm": list(BOWL_XY)},
-            SCAN["joints_deg"], SCAN["joints_deg"], settings(),
-        )
-        mixed = [("above bowl", plan["above bowl"]), ("grasp", dict(stray)["grasp"])]
+        stray = dict(self.plan(self.candy(xy=(NEAR[0] + 12.0, NEAR[1]))))
+        mixed = [("above candy", plan["above candy"]), ("grasp", stray["grasp"])]
+        grasp_tip = [*NEAR, TOP_Z + TIP_ABOVE_TOP]
         with self.assertRaisesRegex(demo.DemoError, "strays"):
-            demo.validate_descent_line(mixed, [*BOWL_XY, 45.0 + TIP_ABOVE_TOP], [0.0, 0.0, 1.0], RIM_Z + 15.0, 3.0)
+            demo.validate_descent_line(mixed, grasp_tip, [0.0, 0.0, 1.0], grasp_tip[2] + APPROACH + 1.0, 3.0)
+        with self.assertRaisesRegex(demo.DemoError, "dips to tip Z"):
+            demo.validate_transit_height("move above the candy", SCAN["joints_deg"], plan["grasp"], grasp_tip[2] + APPROACH - 1.0)
 
 
 class PickupExecutionTests(unittest.TestCase):
     def setUp(self):
         self.settings = settings()
-        self.candy = {"base_point_mm": [*BOWL_XY, 45.0], "closing_yaw_deg": [0.0], "edge_yaw_deg": 90.0}
-        self.plan = demo.plan_bowl_pick(
-            self.candy, {"plane_center_mm": list(BOWL_XY)}, SCAN["joints_deg"], SCAN["joints_deg"], self.settings,
-        )
+        self.candy = {"base_point_mm": [*NEAR, TOP_Z], "closing_yaw_deg": [0.0], "edge_yaw_deg": 90.0}
+        self.plan = demo.plan_table_pick(self.candy, SCAN["joints_deg"], SCAN["joints_deg"], self.settings)
         self.names = [name for name, _ in self.plan]
 
     def execute(self, grip_mm):
@@ -245,12 +229,12 @@ class PickupExecutionTests(unittest.TestCase):
         carry = demo.CandyCarry()
         with follow_moves(arm) as move, mock.patch.object(demo, "hold_gripper") as hold:
             try:
-                width = demo.execute_bowl_pickup(arm, self.plan, self.settings, carry, self.candy)
+                width = demo.execute_table_pickup(arm, self.plan, self.settings, carry, self.candy)
             except demo.GraspVerificationError as exc:
                 width = exc
         return width, carry, move, hold
 
-    def test_held_candy_is_lifted_clear_of_the_rim_and_carried_to_scan(self):
+    def test_held_candy_is_lifted_back_above_its_spot_and_carried_to_scan(self):
         width, carry, move, hold = self.execute(22.0)
         self.assertEqual(width, 22.0)
         moved = [call.args[1] for call in move.call_args_list]
@@ -265,17 +249,17 @@ class PickupExecutionTests(unittest.TestCase):
         self.assertTrue(carry.holding)
         self.assertEqual([name for name, _ in carry.path], ["grasp", *self.names[grasp + 1:]])
 
-    def test_missed_grasp_opens_above_the_bowl_and_returns_to_scan(self):
+    def test_missed_grasp_opens_above_the_spot_and_returns_to_scan(self):
         error, carry, move, hold = self.execute(1.0)
         self.assertIsInstance(error, demo.GraspVerificationError)
         self.assertFalse(carry.holding)
         opened = hold.call_args_list[-1]
-        np.testing.assert_array_equal(opened.args[1], dict(self.plan)["lift above bowl"])
+        np.testing.assert_array_equal(opened.args[1], dict(self.plan)["lift above candy"])
         self.assertEqual(opened.args[2], 40.0)
         self.assertEqual(move.call_args.args[1], "return to scan pose after missed grasp")
         self.assertEqual(move.call_args.args[3], 40.0)
 
-    def test_return_after_leaving_the_bowl_retraces_and_drops_above_it(self):
+    def test_return_after_leaving_retraces_and_drops_the_candy_above_its_spot(self):
         waypoints = dict(self.plan)
         carry = demo.CandyCarry()
         carry.gripped_at(waypoints["grasp"])
@@ -284,13 +268,13 @@ class PickupExecutionTests(unittest.TestCase):
         arm = healthy_arm(joints=waypoints["scan"])
         with follow_moves(arm) as move, mock.patch.object(demo, "hold_gripper") as hold, \
                 mock.patch("builtins.print"):
-            demo.return_candy_to_bowl(arm, self.plan, carry, self.settings)
+            demo.return_candy_to_table(arm, self.plan, carry, self.settings)
         self.assertEqual(
             [call.args[1] for call in move.call_args_list],
-            ["return candy: above bowl", "return candy: back to scan"],
+            ["return candy: above its spot", "return candy: back to scan"],
         )
         self.assertEqual(move.call_args_list[0].args[3], 1.0)  # still holding on the way
-        np.testing.assert_array_equal(hold.call_args.args[1], waypoints["lift above bowl"])
+        np.testing.assert_array_equal(hold.call_args.args[1], waypoints["lift above candy"])
         self.assertEqual(hold.call_args.args[2], 40.0)
         self.assertFalse(carry.holding)
 
@@ -301,11 +285,11 @@ class PickupExecutionTests(unittest.TestCase):
         carry.reached("lift 1", waypoints["lift 1"])
         arm = healthy_arm(joints=waypoints["lift 1"])
         with follow_moves(arm) as move, mock.patch.object(demo, "hold_gripper"), mock.patch("builtins.print"):
-            demo.return_candy_to_bowl(arm, self.plan, carry, self.settings)
-        remaining = [name for name in self.names if name.startswith("lift ") and name != "lift above bowl"][1:]
+            demo.return_candy_to_table(arm, self.plan, carry, self.settings)
+        remaining = [name for name in self.names if name.startswith("lift ") and name != "lift above candy"][1:]
         self.assertEqual(
             [call.args[1] for call in move.call_args_list],
-            [f"return candy: {name}" for name in remaining] + ["return candy: above bowl", "return candy: back to scan"],
+            [f"return candy: {name}" for name in remaining] + ["return candy: above its spot", "return candy: back to scan"],
         )
 
 
@@ -381,24 +365,34 @@ class HandDropTests(unittest.TestCase):
 
 
 class CycleTests(unittest.TestCase):
-    def run_cycle(self, scan_result, pick_only=False, execute=None, deliver=None):
+    def run_cycle(self, scan_result, pick_only=False, execute=None, deliver=None, hand=None):
         arm, camera, hands = healthy_arm(), mock.Mock(), mock.Mock()
-        candy = {"base_point_mm": [*BOWL_XY, 45.0]}
+        candy = {"base_point_mm": [*NEAR, TOP_Z]}
         with mock.patch.object(demo, "go_to_scan"), \
-                mock.patch.object(demo, "scan_bowl", return_value=scan_result), \
+                mock.patch.object(demo, "scan_table", return_value=scan_result), \
                 mock.patch.object(demo, "pick_first_reachable", return_value=(candy, [("grasp", np.zeros(6))])) as plan, \
-                mock.patch.object(demo, "execute_bowl_pickup", side_effect=execute or (lambda *a: 22.0)) as pick, \
+                mock.patch.object(demo, "hand_in_view", return_value=hand) as interlock, \
+                mock.patch.object(demo, "execute_table_pickup", side_effect=execute or (lambda *a: 22.0)) as pick, \
                 mock.patch.object(demo, "deliver_to_hand", side_effect=deliver) as delivery, \
-                mock.patch.object(demo, "return_candy_to_bowl") as back, \
+                mock.patch.object(demo, "return_candy_to_table") as back, \
                 mock.patch("builtins.print"):
-            result = demo.run_cycle(arm, camera, None if pick_only else hands, SCAN, np.eye(4), settings(), pick_only)
+            result = demo.run_cycle(arm, camera, hands, SCAN, np.eye(4), settings(), pick_only)
+        self.interlock = interlock
         return result, plan, pick, delivery, back
 
-    def test_no_pickable_bowl_means_no_pick(self):
-        result, plan, pick, *_ = self.run_cycle({"status": "empty"})
+    def test_no_pickable_candy_means_no_pick(self):
+        result, plan, pick, *_ = self.run_cycle({"status": "no_pickable"})
         self.assertFalse(result)
         plan.assert_not_called()
         pick.assert_not_called()
+
+    def test_no_pick_starts_while_a_hand_is_in_view(self):
+        result, plan, pick, delivery, _ = self.run_cycle({"status": "detected"}, hand="a hand is in view")
+        self.assertFalse(result)
+        plan.assert_called_once()
+        self.interlock.assert_called_once()
+        pick.assert_not_called()
+        delivery.assert_not_called()
 
     def test_missed_grasp_rescans_without_waiting_for_a_hand(self):
         def miss(*args):
@@ -408,7 +402,7 @@ class CycleTests(unittest.TestCase):
         delivery.assert_not_called()
         back.assert_not_called()
 
-    def test_error_while_holding_returns_the_candy_to_the_bowl(self):
+    def test_error_while_holding_puts_the_candy_back(self):
         def holding(arm, plan, values, carry, candy):
             carry.gripped_at(np.zeros(6))
             return 22.0
@@ -428,8 +422,31 @@ class CycleTests(unittest.TestCase):
             return 22.0
         result, _, _, delivery, back = self.run_cycle({"status": "detected"}, pick_only=True, execute=holding)
         self.assertTrue(result)
+        self.interlock.assert_called_once()
         delivery.assert_not_called()
         back.assert_called_once()
+
+
+class HandInViewTests(unittest.TestCase):
+    def check(self, capture=None, error=None):
+        hands = mock.Mock()
+        hands.capture_hand.side_effect = error or (lambda slot: capture)
+        return demo.hand_in_view(hands)
+
+    def test_only_a_fresh_capture_with_no_hand_in_any_sample_allows_a_pick(self):
+        now = datetime.now(timezone.utc).isoformat()
+        clear = {"status": "not_found", "captured_at": now, "visible_hand_sample_count": 0, "sample_count": 5}
+        self.assertIsNone(self.check(clear))
+        for name, capture in (
+            ("closed hand", {**clear, "visible_hand_sample_count": 2}),
+            ("open palm", {**clear, "status": "detected", "visible_hand_sample_count": 5}),
+            ("unstable palm", {**clear, "status": "rejected", "visible_hand_sample_count": 3}),
+            ("older hand service", {"status": "not_found", "captured_at": now}),
+            ("stale", {**clear, "captured_at": (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()}),
+        ):
+            with self.subTest(name):
+                self.assertIsNotNone(self.check(capture))
+        self.assertIn("cannot confirm", self.check(error=demo.DemoError("cannot reach service")))
 
 
 class MainTests(unittest.TestCase):
@@ -478,9 +495,9 @@ class MainTests(unittest.TestCase):
         self.assertEqual(zero.call_args.kwargs["open_grip_mm"], 40.0)
         arm.disconnect.assert_called_once()
 
-    def test_pick_only_skips_the_hand_service_and_scan_only_never_picks(self):
+    def test_pick_only_still_checks_the_hand_service_and_scan_only_never_picks(self):
         _, _, services, _, _, cycle, _, _, _ = self.run_main(self.args(pick_only=True, max_cycles=1))
-        self.assertIsNone(services.call_args.args[1])
+        self.assertIsNotNone(services.call_args.args[1])
         self.assertTrue(cycle.call_args.kwargs["pick_only"])
         _, _, _, _, _, cycle, scan_only, _, _ = self.run_main(self.args(scan_only=True, max_cycles=3))
         self.assertEqual(scan_only.call_count, 3)
@@ -560,7 +577,7 @@ class PreflightTests(unittest.TestCase):
     def test_services_need_the_calibrated_camera_and_a_hand_stream_from_it(self):
         good = {"camera_serial": "D435", "preview_only": False, "depth_calibrated": True}
         self.services(good, {"source_url": "http://camera:8094/stream.mjpg"})
-        self.services(good)  # pick-only: no hand service
+        self.services(good)  # camera only
         for camera, hand in (
             ({**good, "camera_serial": "other"}, None),
             ({**good, "preview_only": True}, None),
@@ -569,9 +586,10 @@ class PreflightTests(unittest.TestCase):
             with self.subTest(camera=camera, hand=hand), self.assertRaises(demo.DemoError):
                 self.services(camera, hand)
 
-    def test_settings_require_ordered_gripper_widths_and_share_them_with_the_bowl_check(self):
+    def test_settings_require_ordered_gripper_widths_and_look_for_candies_in_the_workspace(self):
         values = demo.validate_demo_settings(demo.DEMO_SETTINGS)
-        self.assertEqual(values["bowl"]["grip_open_mm"], values["grip_open_mm"])
+        self.assertEqual(values["table"]["view_x_mm"], [float(demo.WORKSPACE_MIN_MM[0]), float(demo.WORKSPACE_MAX_MM[0])])
+        self.assertEqual(values["table"]["view_y_mm"], [float(demo.WORKSPACE_MIN_MM[1]), float(demo.WORKSPACE_MAX_MM[1])])
         for key, value in (("minimum_held_grip_mm", 0.5), ("minimum_held_grip_mm", 45.0), ("grip_open_mm", 90.0)):
             with self.subTest(key=key, value=value), self.assertRaisesRegex(demo.DemoError, "gripper settings"):
                 demo.validate_demo_settings({**demo.DEMO_SETTINGS, key: value})
