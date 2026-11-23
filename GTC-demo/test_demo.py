@@ -19,7 +19,7 @@ import bowl_vision as bv
 import demo
 from piper.kinematics import fk
 from piper.transforms import rot_to_euler, tip_position
-from test_bowl_vision import GOLD, INTRINSICS, RED, render
+from test_bowl_vision import GOLD, GREEN, INTRINSICS, RED, render
 
 # The taught scan pose (prepare-piper/scan-poses/scan_poses.json is not in git).
 SCAN = {
@@ -85,18 +85,25 @@ class FakeCamera:
         return (np.linalg.inv(self.c2b) @ np.append(point, 1.0))[:3]
 
 
-def bowl_depth(rim_z=RIM_Z - 4.0, candy_z=45.0):
-    """Depth model: near the rim the inner wall top, elsewhere inside the bowl the candy tops."""
+CANDIES = ((290, 20, 0, RED), (300, 48, 30, GOLD))
+FLOOR_Z = 5.0
+TIP_ABOVE_TOP = demo.DEMO_SETTINGS["grasp_tip_above_candy_top_mm"]
+
+
+def bowl_depth(rim_z=RIM_Z - 4.0, candy_z=45.0, candies=CANDIES):
+    """Depth model on the rim plane: inner wall top near the rim, candy tops on candies, floor elsewhere."""
     def height_at(plane_xy):
-        distance = np.linalg.norm(np.asarray(plane_xy) - BOWL_XY)
-        if distance > BOWL["bowl_diameter_mm"] / 2.0 - 10.0:
+        point = np.asarray(plane_xy)
+        if np.linalg.norm(point - BOWL_XY) > BOWL["bowl_diameter_mm"] / 2.0 - 10.0:
             return rim_z
-        return candy_z
+        if any(np.linalg.norm(point - candy[:2]) <= 12.7 for candy in candies):
+            return candy_z
+        return FLOOR_Z
     return height_at
 
 
 class BowlScanTests(unittest.TestCase):
-    def scan(self, height_at, candies=((290, 20, 0, RED), (300, 48, 30, GOLD))):
+    def scan(self, height_at, candies=CANDIES):
         frame, c2b = render(bowl_center=BOWL_XY, candies=candies)
         arm = healthy_arm()
         arm.pose.return_value = pose_for(c2b)
@@ -121,9 +128,14 @@ class BowlScanTests(unittest.TestCase):
             np.testing.assert_allclose(candy["base_point_mm"], expected, atol=0.5)  # pixel rounded to 0.1 px
             self.assertAlmostEqual(candy["true_long_mm"], bv.true_size(camera.view, candy["long_mm"], 45.0))
             self.assertAlmostEqual(candy["true_long_mm"], 25.4 * (418 - 45) / (418 - RIM_Z), delta=2.5)
-        # The best candy has a reachable straight-down grasp at its top surface.
+        # The red candy's fingers cannot close along Y: one would land on the gold candy.
+        red = min(result["pickable"], key=lambda c: np.linalg.norm(np.subtract(c["plane_center_mm"], (290, 20))))
+        self.assertTrue(all(min(abs(yaw - 90.0), abs(yaw - 270.0)) > 15.0 for yaw in red["closing_yaw_deg"]))
+        # The best candy has a reachable straight-down grasp just above its top surface.
         candy, plan = demo.pick_first_reachable(arm, result, SCAN, settings())
-        np.testing.assert_allclose(tip_position(dict(plan)["grasp"]), candy["base_point_mm"], atol=1.0)
+        np.testing.assert_allclose(
+            tip_position(dict(plan)["grasp"]), np.add(candy["base_point_mm"], [0, 0, TIP_ABOVE_TOP]), atol=1.0,
+        )
 
     def test_flat_circle_and_candies_without_depth_are_not_picked(self):
         flat, *_ = self.scan(bowl_depth(rim_z=BOWL["table_z_mm"]))
@@ -133,6 +145,11 @@ class BowlScanTests(unittest.TestCase):
 
         def no_candy_depth(plane_xy):
             return bowl_depth()(plane_xy) if np.linalg.norm(np.asarray(plane_xy) - BOWL_XY) > 66.0 else None
+
+        packed, *_ = self.scan(bowl_depth(candies=CANDIES + ((265, 20, 0, GREEN), (315, 20, 0, GREEN), (290, -5, 0, GREEN), (290, 45, 0, GREEN))))
+        packed_red = [item for item in packed["unpickable"] if np.linalg.norm(np.subtract(item["plane_center_mm"], (290, 20))) < 3.0]
+        self.assertEqual(len(packed_red), 1, "red candy boxed in by neighbours on all four sides")
+        self.assertTrue(any("finger would land" in reason for reason in packed_red[0]["reasons"]))
 
         blind, *_ = self.scan(no_candy_depth)
         self.assertEqual(blind["status"], "no_pickable")
@@ -159,7 +176,7 @@ class BowlPickPlanTests(unittest.TestCase):
         self.assertEqual(names.index("grasp"), len(descents) + 1)
         waypoints = dict(plan)
         np.testing.assert_allclose(tip_position(waypoints["above bowl"]), [*BOWL_XY, RIM_Z + 30.0], atol=0.5)
-        np.testing.assert_allclose(tip_position(waypoints["grasp"]), [*BOWL_XY, 45.0], atol=0.5)
+        np.testing.assert_allclose(tip_position(waypoints["grasp"]), [*BOWL_XY, 45.0 + TIP_ABOVE_TOP], atol=0.5)
         for name in descents:
             np.testing.assert_allclose(tip_position(waypoints[name])[:2], BOWL_XY, atol=0.5)
         # Lifts retrace the descent in reverse.
@@ -187,7 +204,7 @@ class BowlPickPlanTests(unittest.TestCase):
             self.plan(self.candy(xy=far), bowl_xy=far, values=vertical_only)
         plan = dict(self.plan(self.candy(xy=far), bowl_xy=far))
         self.assertAlmostEqual(demo.grasp_tilt_deg(plan["grasp"]), 10.0, delta=0.5)
-        grasp_tip = np.array([*far, 45.0])
+        grasp_tip = np.array([*far, 45.0 + TIP_ABOVE_TOP])
         np.testing.assert_allclose(tip_position(plan["grasp"]), grasp_tip, atol=0.5)
         frame = fk(plan["grasp"])
         up = -frame[:3, 2]
@@ -211,7 +228,7 @@ class BowlPickPlanTests(unittest.TestCase):
         )
         mixed = [("above bowl", plan["above bowl"]), ("grasp", dict(stray)["grasp"])]
         with self.assertRaisesRegex(demo.DemoError, "strays"):
-            demo.validate_descent_line(mixed, [*BOWL_XY, 45.0], [0.0, 0.0, 1.0], RIM_Z + 15.0, 3.0)
+            demo.validate_descent_line(mixed, [*BOWL_XY, 45.0 + TIP_ABOVE_TOP], [0.0, 0.0, 1.0], RIM_Z + 15.0, 3.0)
 
 
 class PickupExecutionTests(unittest.TestCase):

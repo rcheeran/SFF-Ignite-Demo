@@ -39,6 +39,8 @@ BOWL_SETTINGS = {
     "table_z_mm": -3.0,
     "bowl_diameter_mm": 152.4,      # 6 inches across the rim
     "bowl_height_mm": 76.2,         # 3 inches, table to rim
+    # Wide enough for the inner edge of the bowl's red rim band (r ~66 mm in the
+    # 2026-11-23 photos) as well as the outer rim (r 76 mm).
     "bowl_radius_tolerance": 0.15,
     # Top-down view covers the demo workspace plus room for a rim past its edge.
     "view_x_mm": [50.0, 690.0],
@@ -51,14 +53,21 @@ BOWL_SETTINGS = {
     "hough_accumulator": 15,
     "maximum_circle_candidates": 25,
     "edge_tolerance_px": 2,
-    "minimum_rim_support": 0.45,          # fraction of the visible rim on image edges
-    "minimum_rim_visible_fraction": 0.6,  # fraction of the rim inside the photo
-    # Candy search: skip a ring at the rim (edge, highlights), learn the bowl
-    # colour from the next ring in, and flag pixels that differ from it.
-    "rim_margin_mm": 8.0,
-    "bowl_colour_ring_mm": 12.0,
-    "candy_colour_distance": 28.0,  # CIE Lab distance with lightness down-weighted
-    "lightness_weight": 0.5,        # shading and shadows mostly change lightness
+    # Real rims had edge support 0.84-0.99; rings printed on the hand board 0.57 or less.
+    "minimum_rim_support": 0.75,
+    # Fraction of the rim inside the photo; bowls at the workspace edge were 46-83% visible.
+    "minimum_rim_visible_fraction": 0.45,
+    # Candy search skips this ring inside the detected rim (rim band, highlights).
+    "rim_margin_mm": 12.0,
+    # Candies are the foil colours (OpenCV HSV, hue 0-179): red, green, and gold.
+    # Each colour is segmented on its own so touching candies of different
+    # colours separate; ribbons and prints are filled by the closing kernel.
+    "candy_colours_hsv": {
+        "red": [[[0, 110, 60], [10, 255, 255]], [[165, 110, 60], [179, 255, 255]]],
+        "green": [[[40, 70, 40], [90, 255, 255]]],
+        "gold": [[[12, 90, 80], [35, 255, 255]]],
+    },
+    "candy_close_kernel_px": 5,
     "mask_kernel_px": 3,
     "candy_size_mm": [25.4, 25.4, 19.05],  # 1 x 1 x 0.75 inch cuboid
     "candy_size_tolerance": 0.3,
@@ -66,6 +75,10 @@ BOWL_SETTINGS = {
     "maximum_candy_aspect": 1.8,
     "split_peak_fraction": 0.6,     # distance-transform peaks used as watershed seeds
     "maximum_chain_candies": 4,     # split straight rows of up to this many candies
+    # Merged same-colour blobs in a packed bowl: candy-sized squares are fitted
+    # at distance-transform peaks at least this fraction of the smallest half side.
+    "heap_peak_fraction": 0.8,
+    "maximum_heap_candidates": 12,
     "minimum_candies": 1,
     # Live checks (demo.py): depth just inside the rim on the side away from the
     # camera reads the top of the bowl's inner wall; a flat circle reads the table.
@@ -243,10 +256,6 @@ def find_rim_circles(top: np.ndarray, valid: np.ndarray, settings: dict) -> list
     return sorted(circles, key=lambda circle: circle["rim_support"], reverse=True)
 
 
-def lab(image_bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(image_bgr.astype(np.float32) / 255.0, cv2.COLOR_BGR2Lab)
-
-
 def candy_side_limits(view: PlaneView, settings: dict) -> tuple[tuple[float, float], tuple[float, float]]:
     """Apparent (long, short) side ranges on the rim plane for a candy anywhere in the bowl.
 
@@ -339,53 +348,132 @@ def classify_shape(shape: dict, limits: tuple, settings: dict) -> tuple[list[dic
     return [], reasons
 
 
+def candy_colour_masks(top: np.ndarray, inner: np.ndarray, settings: dict) -> dict[str, np.ndarray]:
+    """One cleaned mask per candy colour inside the bowl interior."""
+    hsv = cv2.cvtColor(top, cv2.COLOR_BGR2HSV)
+    close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (settings["candy_close_kernel_px"],) * 2)
+    opening = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (settings["mask_kernel_px"],) * 2)
+    masks = {}
+    for name, ranges in settings["candy_colours_hsv"].items():
+        mask = np.zeros(inner.shape, np.uint8)
+        for low, high in ranges:
+            mask |= cv2.inRange(hsv, np.array(low, np.uint8), np.array(high, np.uint8))
+        mask = cv2.morphologyEx(cv2.morphologyEx(mask & inner, cv2.MORPH_CLOSE, close), cv2.MORPH_OPEN, opening)
+        masks[name] = mask & inner
+    return masks
+
+
+def dominant_edge_angle(gray: np.ndarray, region: np.ndarray, center: Any, radius: float) -> float:
+    """Dominant edge direction (radians, modulo 90 degrees) of a region around a raster point.
+
+    Gradient orientations are folded by 4 (square symmetry) and averaged,
+    weighted by magnitude; candy edges and ribbons run along the same two directions.
+    """
+    height, width = gray.shape
+    x0, y0 = max(0, int(center[0] - radius)), max(0, int(center[1] - radius))
+    x1, y1 = min(width, int(center[0] + radius) + 1), min(height, int(center[1] + radius) + 1)
+    patch = gray[y0:y1, x0:x1].astype(np.float32)
+    support = cv2.dilate(region[y0:y1, x0:x1], np.ones((3, 3), np.uint8)) > 0
+    gx = cv2.Sobel(patch, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(patch, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = np.hypot(gx, gy)[support]
+    angle = np.arctan2(gy, gx)[support]
+    if magnitude.sum() <= 1e-6:
+        return 0.0
+    folded = np.sum(magnitude * np.exp(4j * angle))
+    return float(np.angle(folded) / 4.0)
+
+
+def heap_candidates(region: np.ndarray, gray: np.ndarray, view: PlaneView, limits: tuple, settings: dict) -> list[dict[str, Any]]:
+    """Candy-sized squares inside a merged same-colour blob (a packed bowl).
+
+    Centres are distance-transform peaks where a candy-sized square fits; each
+    square is oriented by the local edge direction and kept if the colour
+    fills at least minimum_candy_fill of it.
+    """
+    scale = view.mm_per_px
+    (long_min, long_max), _ = limits
+    distance = cv2.distanceTransform(region, cv2.DIST_L2, 5)
+    threshold = settings["heap_peak_fraction"] * long_min / 2.0 / scale
+    spacing = 0.7 * long_min / scale
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(spacing) | 1,) * 2)
+    peaks = np.argwhere((distance >= threshold) & (distance >= cv2.dilate(distance, kernel)))
+    order = sorted(peaks.tolist(), key=lambda rc: -distance[rc[0], rc[1]])
+    chosen: list[tuple[int, int]] = []
+    for row, column in order:
+        if all(math.hypot(row - r, column - c) >= spacing for r, c in chosen):
+            chosen.append((row, column))
+        if len(chosen) >= settings["maximum_heap_candidates"]:
+            break
+    squares = []
+    for row, column in chosen:
+        if 2.0 * distance[row, column] > long_max / scale:
+            continue  # wider than one candy in every direction: cannot tell which candy this is
+        side = float(np.clip(2.0 * distance[row, column], long_min / scale, long_max / scale))
+        theta = dominant_edge_angle(gray, region, (column, row), side)
+        along = np.array([math.cos(theta), math.sin(theta)]) * side / 2.0
+        across = np.array([-along[1], along[0]])
+        center = np.array([column, row], dtype=np.float64)
+        corners = np.array([center + sa * along + sc * across for sa, sc in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
+        square = np.zeros(region.shape, np.uint8)
+        cv2.fillConvexPoly(square, np.int32(np.round(corners)), 1)
+        fill = float(region[square > 0].mean() / 255.0) if np.any(square) else 0.0
+        if fill < settings["minimum_candy_fill"]:
+            continue
+        direction = view.raster_direction_to_base(along / np.linalg.norm(along))
+        squares.append({
+            "raster_center": center.tolist(), "raster_corners": corners.tolist(),
+            "long_mm": side * scale, "short_mm": side * scale, "area_mm2": side * side * fill * scale * scale,
+            "fill_ratio": fill, "edge_yaw_deg": math.degrees(math.atan2(direction[1], direction[0])) % 180.0,
+            "split": "heap",
+        })
+    return squares
+
+
 def segment_candies(
     top: np.ndarray, valid: np.ndarray, view: PlaneView, circle: dict, settings: dict,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], np.ndarray]:
-    """Return (candies, rejected regions, candy mask) inside one rim circle on the top-down view."""
+    """Return (candies, rejected regions, candy mask) inside one rim circle on the top-down view.
+
+    Each candy colour is segmented separately. A region is a candy if it is a
+    candy-sized rectangle (touching candies are split at distance-transform
+    peaks or as straight rows); larger merged regions are searched for
+    candy-sized squares (heap_candidates).
+    """
     height, width = valid.shape
     center = tuple(int(round(value)) for value in circle["raster_center"])
     scale = view.mm_per_px
     inner_px = circle["radius_px"] - settings["rim_margin_mm"] / scale
-    ring_px = inner_px - settings["bowl_colour_ring_mm"] / scale
-    if ring_px <= 0:
-        raise BowlVisionError("rim margin and colour ring leave no bowl interior")
+    if inner_px <= 0:
+        raise BowlVisionError("rim margin leaves no bowl interior")
     inner = np.zeros((height, width), np.uint8)
     cv2.circle(inner, center, int(inner_px), 255, -1)
     inner &= valid
-    ring = inner.copy()
-    cv2.circle(ring, center, int(ring_px), 0, -1)
-    colours = lab(top)
-    reference_pixels = colours[ring > 0]
-    if len(reference_pixels) < 50:
-        reference_pixels = colours[inner > 0]
-    if len(reference_pixels) < 50:
-        return [], [], np.zeros_like(inner)
-    reference = np.median(reference_pixels, axis=0)
-    difference = colours - reference
-    difference[..., 0] *= settings["lightness_weight"]
-    mask = ((np.linalg.norm(difference, axis=2) > settings["candy_colour_distance"]) & (inner > 0)).astype(np.uint8) * 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (settings["mask_kernel_px"],) * 2)
-    mask = cv2.morphologyEx(cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel), cv2.MORPH_CLOSE, kernel)
-
+    gray = cv2.cvtColor(top, cv2.COLOR_BGR2GRAY)
     limits = candy_side_limits(view, settings)
     minimum_area_px = (limits[1][0] / scale) ** 2 * 0.5
+    single_area_px = (limits[0][0] / scale) ** 2
     candies, rejected = [], []
-    count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
-    for label in range(1, count):
-        if stats[label, cv2.CC_STAT_AREA] < minimum_area_px:
-            continue
-        component = (labels == label).astype(np.uint8) * 255
-        for region in split_touching(component, top, settings):
-            shape = describe_region(region, view, settings)
-            if shape is None:
+    combined = np.zeros_like(inner)
+    for colour, mask in candy_colour_masks(top, inner, settings).items():
+        combined |= mask
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+        for label in range(1, count):
+            if stats[label, cv2.CC_STAT_AREA] < minimum_area_px:
                 continue
-            accepted, reasons = classify_shape(shape, limits, settings)
-            if accepted:
-                candies.extend(accepted)
-            elif shape["area_mm2"] >= minimum_area_px * scale * scale:
-                rejected.append({**shape, "reasons": reasons})
-    return candies, rejected, mask
+            component = (labels == label).astype(np.uint8) * 255
+            for region in split_touching(component, top, settings):
+                shape = describe_region(region, view, settings)
+                if shape is None:
+                    continue
+                accepted, reasons = classify_shape(shape, limits, settings)
+                if not accepted and shape["area_mm2"] >= single_area_px * scale * scale:
+                    accepted = heap_candidates(region, gray, view, limits, settings)
+                if accepted:
+                    candies.extend({**item, "colour": colour} for item in accepted)
+                elif shape["area_mm2"] >= minimum_area_px * scale * scale:
+                    rejected.append({**shape, "colour": colour, "reasons": reasons})
+    return candies, rejected, combined
 
 
 def split_touching(component: np.ndarray, top: np.ndarray, settings: dict) -> list[np.ndarray]:
@@ -487,17 +575,30 @@ def jaw_footprint(center_xy: Any, closing_yaw_deg: float, settings: dict) -> np.
     return np.array([center + sa * half_along * along + sc * half_across * across for sa, sc in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
 
 
-def jaw_clear_of_wall(center_xy: Any, closing_yaw_deg: float, bowl_center_xy: Any, settings: dict) -> bool:
+def wall_clear_radius(settings: dict, rim_radius_mm: float | None = None) -> float:
+    """Radius around the bowl centre the open jaws must stay inside.
+
+    Uses the detected rim radius when given (it may be the rim band's inner
+    edge), but never more than the nominal inner wall.
+    """
+    nominal = settings["bowl_diameter_mm"] / 2.0 - settings["bowl_wall_mm"]
+    inner = nominal if rim_radius_mm is None else min(float(rim_radius_mm), nominal)
+    return inner - settings["wall_margin_mm"]
+
+
+def jaw_clear_of_wall(
+    center_xy: Any, closing_yaw_deg: float, bowl_center_xy: Any, settings: dict, rim_radius_mm: float | None = None,
+) -> bool:
     """True if the open jaws around a candy centre stay inside the bowl with the wall margin."""
-    clear_radius = settings["bowl_diameter_mm"] / 2.0 - settings["bowl_wall_mm"] - settings["wall_margin_mm"]
     footprint = jaw_footprint(center_xy, closing_yaw_deg, settings)
     center = np.asarray(bowl_center_xy, dtype=np.float64)[:2]
-    return bool(np.all(np.linalg.norm(footprint - center, axis=1) <= clear_radius))
+    return bool(np.all(np.linalg.norm(footprint - center, axis=1) <= wall_clear_radius(settings, rim_radius_mm)))
 
 
 def gripper_clear_of_bowl(
     grasp_tip_mm: Any, tool_axis: Any, closing_yaw_deg: float, bowl_center_xy: Any,
     rim_z_mm: float, finger_extension_mm: float, settings: dict, step_mm: float = 2.0,
+    rim_radius_mm: float | None = None,
 ) -> bool:
     """True if a (possibly tilted) open gripper at the grasp pose stays inside the bowl opening.
 
@@ -513,13 +614,14 @@ def gripper_clear_of_bowl(
     fingertip_z = float((tip + axis * finger_extension_mm)[2])
     for height in np.arange(fingertip_z, float(rim_z_mm) + step_mm, step_mm):
         point = tip + axis * ((height - tip[2]) / axis[2])
-        if not jaw_clear_of_wall(point[:2], closing_yaw_deg, bowl_center_xy, settings):
+        if not jaw_clear_of_wall(point[:2], closing_yaw_deg, bowl_center_xy, settings, rim_radius_mm):
             return False
     return True
 
 
 def grasp_options(
     candies: list[dict[str, Any]], bowl_center_xy: Any, rim_z_mm: float, settings: dict = BOWL_SETTINGS,
+    rim_radius_mm: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Order pickable candies (highest first) and give each its closing directions.
 
@@ -542,7 +644,7 @@ def grasp_options(
             reasons.append(f"too deep ({rim_z_mm - point[2]:.0f} mm below the rim)")
         closing = [
             yaw % 180.0 for yaw in (candy["edge_yaw_deg"] + 90.0, candy["edge_yaw_deg"])
-            if jaw_clear_of_wall(point, yaw % 180.0, center, settings)
+            if jaw_clear_of_wall(point, yaw % 180.0, center, settings, rim_radius_mm)
         ]
         if not closing:
             reasons.append("too close to the bowl wall for the open jaws")

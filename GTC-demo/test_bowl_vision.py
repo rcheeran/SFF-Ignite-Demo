@@ -127,6 +127,23 @@ class BowlDetectionTests(unittest.TestCase):
         self.assertLess(np.linalg.norm(np.subtract(result["candies"][0]["plane_center_mm"], (340, 60))), 2.0)
         self.assertTrue(any("width" in item["reasons"] for item in result["rejected_candies"]))
 
+    def test_packed_same_colour_block_is_not_guessed_at_its_centre(self):
+        block = [(345 + dx, 15 + dy, 0, RED) for dx in (0, 25.4) for dy in (0, 25.4)]
+        frame, c2b = render(candies=block)
+        center = (345 + 12.7, 15 + 12.7)
+        for candy in bv.find_bowl(frame, INTRINSICS, c2b)["candies"]:
+            self.assertGreater(np.linalg.norm(np.subtract(candy["plane_center_mm"], center)), 5.0)
+
+    def test_heap_squares_follow_candies_in_a_merged_blob(self):
+        # An L of three touching red candies is one blob, too big for one candy.
+        frame, c2b = render(candies=[(330, 10, 0, RED), (355.4, 10, 0, RED), (330, 35.4, 0, RED)])
+        candies = bv.find_bowl(frame, INTRINSICS, c2b)["candies"]
+        self.assertTrue(candies)
+        self.assertTrue(all(candy.get("split") == "heap" for candy in candies))
+        corner = min(candies, key=lambda c: np.linalg.norm(np.subtract(c["plane_center_mm"], (330, 10))))
+        self.assertLess(np.linalg.norm(np.subtract(corner["plane_center_mm"], (330, 10))), 8.0)
+        self.assertLess(yaw_error_mod(corner["edge_yaw_deg"], 0.0, 90.0), 5.0)
+
 
 class GeometryTests(unittest.TestCase):
     def setUp(self):

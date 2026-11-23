@@ -11,11 +11,15 @@ Each cycle starts at the taught scan pose:
 
 1. **Bowl and candy** ([bowl_vision.py](bowl_vision.py)). The photo is warped
    to a top-down view at rim height, where the 6-inch rim is a circle: Hough
-   circles confirmed by edge support (no colour). Depth just inside the far
-   rim must read a raised bowl, which rejects flat circles. Candies are regions
-   inside the rim whose colour differs from the bowl's own, kept when they are
-   candy-sized rectangles (touching candies are split). Each candy's top
-   centre comes from depth.
+   circles confirmed by edge support (no colour; printed circles on the hand
+   board score far lower than a real rim). Depth just inside the far rim must
+   read a raised bowl, which rejects flat circles. Candies are found by their
+   foil colour (red, green, gold, each segmented on its own so touching
+   candies of different colours separate): candy-sized rectangles, touching
+   same-colour candies split, and candy-sized squares fitted inside merged
+   blobs of a full bowl. Each candy's top centre comes from depth, and depth
+   where each open finger would land must be below the fingertips, so the
+   gripper does not come down on a neighbour; candies on top of the heap win.
 2. **Pick** ([demo.py](demo.py)). The highest candy whose open jaws stay clear
    of the bowl wall is picked along a straight line: above the candy 30 mm
    over the rim, in along the tool axis, grip, back out, back to the scan pose.
@@ -38,10 +42,11 @@ zero and opens the gripper there.
 ## Bowl placement
 
 The bowl may be anywhere in the workspace that the scan pose (shared with
-Ignite) can see. Bowl detection needs at least 60% of the rim in the photo;
-reach comes from tilted grasps. Smallest gripper tilt that reaches a candy at
-the bowl centre, by bowl-centre position (`v` = not enough rim in view, so the
-bowl is not detected there):
+Ignite) can see. Bowl detection needs at least 45% of the rim in the photo
+(bowls beside the hand board, partly past the photo edge, were found at
+46-83%); reach comes from tilted grasps. Smallest gripper tilt that reaches a
+candy at the bowl centre, by bowl-centre position (`v` = less than 60% of the
+rim in view, so a conservative map: some `v` cells are still detected):
 
 | X \ Y (mm) | -160 | -120 | -80 | -40 | 0 | 40 | 80 | 120 | 160 | 200 |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -107,7 +112,7 @@ These values are estimates until checked with the real candy and bowl:
 | Setting | Current | How to check |
 |---|---|---|
 | `maximum_descent_below_rim_mm` (bowl_vision) | 40 mm | Lower the gripper into the bowl by hand; the deepest candy top the wrist and camera can reach without touching the rim |
-| `grasp_tip_above_candy_top_mm` | 0 mm | `--pick-only --pause-before-grip`: jaws should straddle the candy's middle |
+| `grasp_tip_above_candy_top_mm` | 5 mm | `--pick-only --pause-before-grip`: fingertips ~10 mm down the candy's side |
 | `candy_xy_correction_mm` | 0, 0 | `--pause-before-grip` prints the suggested value after each typed offset |
 | `minimum_held_grip_mm` | 12 mm | Held candy should read about 19-25 mm, an empty close about 1 mm |
 | `finger_thickness_mm`, `finger_width_mm` (bowl_vision) | 10, 20 mm | Measure the jaws; they set the wall clearance |

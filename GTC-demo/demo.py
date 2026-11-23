@@ -103,9 +103,15 @@ DEMO_SETTINGS = {
     # stay inside the bowl opening from the fingertips up to the rim.
     "grasp_tilt_options_deg": [0.000, 10.000, 20.000, 30.000],
     # The tool tip is the middle of the finger pads, which reach ~15 mm below it.
-    # At the candy's top surface the fingertips are ~15 mm down its side.
+    # 5 mm above the candy's top surface puts the fingertips ~10 mm down its
+    # side, which needs less room between neighbouring candies in a full bowl.
     # Confirm with --pause-before-grip.
-    "grasp_tip_above_candy_top_mm": 0.000,
+    "grasp_tip_above_candy_top_mm": 5.000,
+    # Depth under each finger's landing spot must be at least this far below the
+    # fingertips at the grasp pose, so the fingers do not come down on a neighbour.
+    "finger_landing_clearance_mm": 2.000,
+    # Depth reads are limited to this many of the best candidates per scan.
+    "maximum_candies_depth_checked": 8,
     # Fingertips 15 mm below the tool tip stay above the bowl floor (table -3 mm,
     # floor ~6 mm thick) with margin.
     "minimum_grasp_tip_z_mm": 20.000,
@@ -813,7 +819,7 @@ def validate_demo_settings(settings: dict) -> dict:
             raise ValueError("demo.grasp_tilt_options_deg must list tilts from 0 to 35 degrees")
         demo["grasp_tilt_options_deg"] = tilts
         correction = finite_vector(demo["candy_xy_correction_mm"], 2, "demo.candy_xy_correction_mm").copy()
-        for key in ("grasp_tip_above_candy_top_mm", "minimum_grasp_tip_z_mm", "grip_close_mm"):
+        for key in ("grasp_tip_above_candy_top_mm", "minimum_grasp_tip_z_mm", "grip_close_mm", "finger_landing_clearance_mm"):
             if not math.isfinite(float(demo[key])):
                 raise ValueError(f"demo.{key} must be finite")
     except (KeyError, TypeError, ValueError) as exc:
@@ -830,7 +836,7 @@ def validate_demo_settings(settings: dict) -> dict:
         "maximum_vertical_deviation_mm", "grasp_yaw_offset_step_deg", "maximum_grasp_yaw_offset_deg",
         "motion_speed_percent", "pick_motion_speed_percent", "hand_approach_height_mm",
         "gripper_hold_seconds", "maximum_scan_position_deviation_mm", "maximum_scan_rotation_deviation_deg",
-        "move_timeout_seconds", "retry_delay_seconds", "scan_settle_seconds",
+        "move_timeout_seconds", "retry_delay_seconds", "scan_settle_seconds", "maximum_candies_depth_checked",
     ):
         value = float(demo[key])
         if not math.isfinite(value) or value <= 0:
@@ -1003,6 +1009,47 @@ def to_base_point(camera_to_base: np.ndarray, camera_point: np.ndarray) -> np.nd
     return (camera_to_base @ np.append(np.asarray(camera_point, dtype=np.float64), 1.0))[:3]
 
 
+def base_to_pixel(camera_to_base: np.ndarray, intrinsics: dict, point_mm: Any) -> np.ndarray | None:
+    """Photo pixel of a base-frame point, or None if it is behind the camera."""
+    camera_point = (np.linalg.inv(camera_to_base) @ np.append(np.asarray(point_mm, dtype=np.float64), 1.0))[:3]
+    if camera_point[2] <= 1.0:
+        return None
+    return (bowl_vision.camera_matrix(intrinsics) @ (camera_point / camera_point[2]))[:2]
+
+
+def grasp_tip_z(candy_top_z: float, settings: dict) -> float:
+    return max(float(candy_top_z) + float(settings["grasp_tip_above_candy_top_mm"]), float(settings["minimum_grasp_tip_z_mm"]))
+
+
+def finger_landing_problem(
+    candy: dict, closing_yaw_deg: float, camera: CameraClient, token: str, camera_to_base: np.ndarray, settings: dict,
+) -> str | None:
+    """Why the fingers would come down on something for this closing direction, or None if clear.
+
+    Reads depth where each open finger lands (beside the candy along the
+    closing direction); anything there higher than the fingertips at the grasp
+    pose, less the clearance, blocks this direction. Missing depth also blocks.
+    """
+    top = np.asarray(candy["base_point_mm"], dtype=np.float64)
+    fingertip_z = grasp_tip_z(top[2], settings) - FINGER_EXTENSION_BELOW_TIP_MM
+    limit = fingertip_z - float(settings["finger_landing_clearance_mm"])
+    yaw = math.radians(closing_yaw_deg)
+    direction = np.array([math.cos(yaw), math.sin(yaw), 0.0])
+    offset = settings["bowl"]["grip_open_mm"] / 2.0 + settings["bowl"]["finger_thickness_mm"] / 2.0
+    intrinsics = settings["camera_intrinsics"]
+    for sign in (-1.0, 1.0):
+        pixel = base_to_pixel(camera_to_base, intrinsics, top + sign * offset * direction)
+        if pixel is None or not (0 <= pixel[0] < int(intrinsics.get("width", 640)) and 0 <= pixel[1] < int(intrinsics.get("height", 480))):
+            return "a finger would land outside the photo"
+        try:
+            height = float(to_base_point(camera_to_base, camera.deproject(token, pixel))[2])
+        except DemoError:
+            return "no depth where a finger would land"
+        if height > limit:
+            return f"a finger would land on something {height - fingertip_z:+.0f}mm from the fingertips"
+    return None
+
+
 def measure_candies(
     result: dict, camera: CameraClient, token: str, camera_to_base: np.ndarray, settings: dict,
 ) -> list[dict]:
@@ -1074,9 +1121,18 @@ def scan_bowl(
     if result["status"] == "detected":
         candies = measure_candies(result, camera, captured["token"], camera_to_base, settings)
         rim_height = bowl_settings["table_z_mm"] + bowl_settings["bowl_height_mm"]
-        result["pickable"], result["unpickable"] = bowl_vision.grasp_options(
-            candies, bowl["plane_center_mm"], rim_height, bowl_settings,
+        pickable, result["unpickable"] = bowl_vision.grasp_options(
+            candies, bowl["plane_center_mm"], rim_height, bowl_settings, bowl["radius_mm"],
         )
+        for candy in pickable[: int(settings["maximum_candies_depth_checked"])]:
+            problems = {}
+            for closing in candy["closing_yaw_deg"]:
+                problems[closing] = finger_landing_problem(candy, closing, camera, captured["token"], camera_to_base, settings)
+            clear = [closing for closing, problem in problems.items() if problem is None]
+            if clear:
+                result["pickable"].append({**candy, "closing_yaw_deg": clear})
+            else:
+                result["unpickable"].append({**candy, "reasons": sorted(set(problems.values()))})
         if not result["pickable"]:
             result["status"] = "no_pickable"
     report_bowl_scan(result, settings)
@@ -1106,7 +1162,7 @@ def report_bowl_scan(result: dict, settings: dict) -> None:
             print(f"  skipped candy at {np.round(location, 1).tolist()}mm: {'; '.join(item['reasons'])}", flush=True)
 
 
-def closing_yaw_candidates(candy: dict, bowl_center_xy: Any, settings: dict) -> list[float]:
+def closing_yaw_candidates(candy: dict, bowl: dict, settings: dict) -> list[float]:
     """Closing directions to try, exact first, then small yaw offsets still clear of the wall."""
     step, maximum = float(settings["grasp_yaw_offset_step_deg"]), float(settings["maximum_grasp_yaw_offset_deg"])
     offsets = [0.0] + [sign * value for value in np.arange(step, maximum + step * 0.5, step) for sign in (-1.0, 1.0)]
@@ -1114,7 +1170,9 @@ def closing_yaw_candidates(candy: dict, bowl_center_xy: Any, settings: dict) -> 
     return [
         (yaw + offset) % 180.0
         for offset in offsets for yaw in candy["closing_yaw_deg"]
-        if bowl_vision.jaw_clear_of_wall(point, (yaw + offset) % 180.0, bowl_center_xy, settings["bowl"])
+        if bowl_vision.jaw_clear_of_wall(
+            point, (yaw + offset) % 180.0, bowl["plane_center_mm"], settings["bowl"], bowl.get("radius_mm"),
+        )
     ]
 
 
@@ -1176,12 +1234,9 @@ def plan_bowl_pick(
     point = finite_vector(candy["base_point_mm"], 3, "candy top point")
     center = bowl["plane_center_mm"]
     rim_z = bowl_settings["table_z_mm"] + bowl_settings["bowl_height_mm"]
-    grasp_tip = np.array([
-        point[0], point[1],
-        max(point[2] + float(settings["grasp_tip_above_candy_top_mm"]), float(settings["minimum_grasp_tip_z_mm"])),
-    ])
+    grasp_tip = np.array([point[0], point[1], grasp_tip_z(point[2], settings)])
     above_z = max(rim_z, grasp_tip[2]) + float(settings["rim_clearance_mm"])
-    closings = closing_yaw_candidates(candy, center, settings)
+    closings = closing_yaw_candidates(candy, bowl, settings)
     if not closings:
         raise DemoError("no closing direction keeps the open jaws clear of the bowl wall")
     errors = []
@@ -1192,6 +1247,7 @@ def plan_bowl_pick(
                 label = f"tilt {tilt:.0f}deg closing {closing:.0f}deg"
                 if not bowl_vision.gripper_clear_of_bowl(
                     grasp_tip, -up, closing, center, rim_z, FINGER_EXTENSION_BELOW_TIP_MM, bowl_settings,
+                    rim_radius_mm=bowl.get("radius_mm"),
                 ):
                     errors.append(f"{label}: the tilted gripper would touch the bowl wall")
                     continue
