@@ -30,11 +30,33 @@ Jetson and are never pulled. The hand model is built into its image, and the
 YOLO model loads from the on-device model store. Only the Azure Arc agents
 contact Azure, and the demo does not depend on them.
 
+### Clock without internet
+
+The Jetson's clock chip has no backup battery, so its time resets to 1970
+whenever the Jetson loses power, and k3s will not start with that time. At boot,
+chrony restores the last time it saved, which is enough for k3s. It saves the
+time at every clean shutdown and about hourly while it can reach a time server.
+Until it reaches one, the clock runs behind by however long the Jetson was
+unplugged; the demo does not need the exact time. Shut down with
+`sudo shutdown -h now` before unplugging, so the saved time is recent.
+
+To set this up on a freshly installed Jetson (`rtconutc` must be in place before
+`-s`, or chrony sets the clock 8 hours fast):
+
+```bash
+echo rtconutc | sudo tee /etc/chrony/conf.d/ignite-rtc-utc.conf
+sudo sed -i 's/^DAEMON_OPTS="-F 1"$/DAEMON_OPTS="-F 1 -s"/' /etc/default/chrony
+sudo systemctl restart chrony
+```
+
 ## 2. Host checks
 
 ```bash
 # Repository mount on the encrypted disk (SOURCE must be k3s-data-secure)
 findmnt -T ~/SFF-Ignite-Demo -o TARGET,SOURCE
+
+# Clock shows the current date (1969 or 1970 stops k3s; see Troubleshooting)
+date
 
 # k3s and the CAN bring-up service (both should print "active")
 systemctl is-active k3s piper-can
@@ -266,7 +288,7 @@ python -u Demo-Ignite/demo.py --allow-motion \
    Wait for it to finish before touching the arm.
 2. If anything looks wrong, press the emergency stop instead.
 3. Power off the Piper controller, then shut down the Jetson
-   (`sudo shutdown -h now`).
+   (`sudo shutdown -h now`; this also saves the clock, see section 1).
 
 ## Troubleshooting
 
@@ -284,6 +306,7 @@ python -u Demo-Ignite/demo.py --allow-motion \
 | `Pickup missed` | The arm rescans and retries automatically. Repeated misses on one candy: reposition it, or check the verbose `PICK PLAN` lines in the log. |
 | `No reachable candy` | The candy is too far or at an unreachable angle; move it closer to the robot. |
 | Preflight `[FAILED] k3s address OUT OF SYNC`, `k3s-node-ip-sync.sh --check` prints `OUT OF SYNC`, `sudo kubectl get node -o wide` shows an old INTERNAL-IP, or `opencv-vision` / `hand-landmarker` probes report `network is unreachable` | The Jetson's network address changed while k3s was running, and k3s still uses the old address. The automatic fix should restart k3s within a minute of the network coming up; `sudo journalctl -u k3s-node-ip-sync -b` shows what it did. To fix it by hand: `sudo systemctl start k3s-node-ip-sync` (or `sudo systemctl restart k3s`), then run the check again. If `opencv-vision` or `hand-landmarker` still restart afterwards, `sudo kubectl -n productdaydemo rollout restart deploy/opencv-vision` and, once it is `1/1`, `deploy/hand-landmarker`. |
+| `systemctl is-active k3s` prints `activating` and `date` shows 1969 or 1970 (`sudo journalctl -u k3s -b` shows `server time isn't set properly`) | The clock reset after a power loss and no saved time was restored (section 1). Set it to the current Pacific time by hand, for example `sudo date -s "2026-11-23 12:00"`; k3s starts within a few seconds on its own retry. A network with internet access also fixes it, because chrony then sets the time. |
 | Arm faults or joints disabled | Press the emergency stop, power-cycle the arm, run `can_up.sh`, then repeat section 3. |
 
 Keep the run logs in `Demo-Ignite/logs/` for later review.
