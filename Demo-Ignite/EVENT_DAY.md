@@ -1,10 +1,12 @@
 # Ignite demo: event-day checklist
 
-> **Automatic start is enabled.** About a minute after the Jetson boots, the
-> `ignite-demo` service starts the demo and **the arm moves on its own**. Keep the
-> area clear and the emergency stop reachable whenever the Jetson powers on. To
-> run the checks below or start the demo by hand instead, stop it first:
-> `sudo systemctl stop ignite-demo` (see section 8).
+> **This Jetson now starts the GTC demo at boot, not this one.** About a minute
+> after boot, the `gtc_demo` service ([GTC-demo/EVENT_DAY.md](../GTC-demo/EVENT_DAY.md))
+> starts `GTC-demo/demo.py` and **the arm moves on its own**. Keep the area clear
+> and the emergency stop reachable whenever the Jetson powers on. Before running
+> anything below, stop it: `sudo systemctl stop gtc_demo`. The `ignite-demo`
+> service in section 8 is not installed; install it only after disabling
+> `gtc_demo`, because only one program may control the arm.
 
 Work through the sections in order. Steps 1-7 never move the arm. Run every
 command from the repository root with the demo environment active:

@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Start the Ignite demo once the robot link and services are ready.
-# Run by ignite-demo.service at boot; see EVENT_DAY.md ("Automatic start at boot").
+# Start the GTC demo (GTC-demo/demo.py) once the robot link and services are ready.
+# Run by gtc_demo.service at boot; see EVENT_DAY.md ("Automatic start at boot").
 #   --wait-only   perform the readiness waits, then exit without moving the arm
 set -uo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(dirname "$DEMO_DIR")"
 PYTHON="${IGNITE_PYTHON:-/home/clouduser/venv-ignite-demo/bin/python}"
-DEMO_ARGS=(--allow-motion --detector opencv --verbose --max-cycles 0)
-#DEMO_ARGS=(--check-only --detector opencv --verbose --max-cycles 0)
+DEMO="$DEMO_DIR/demo.py"
+DEMO_ARGS=(--allow-motion --verbose --max-cycles 0)
+#DEMO_ARGS=(--check-only --verbose --max-cycles 0)
 REQUIRED_TIMEOUT_SECONDS=900   # camera, hand, CAN, and preflight
 
 cd "$REPO" || exit 1
-mkdir -p Demo-Ignite/logs
-LOG="Demo-Ignite/logs/run-$(date +%Y%m%d-%H%M%S).log"
+mkdir -p "$DEMO_DIR/logs"
+LOG="$DEMO_DIR/logs/run-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -i -a "$LOG") 2>&1
 
 say() { echo "[boot $(date +%H:%M:%S)] $*"; }
@@ -52,16 +54,16 @@ while :; do
     healthy 8094 || missing+=("camera 8094")
     healthy 8095 || missing+=("hand 8095")
     if [ ${#missing[@]} -eq 0 ]; then
-        if "$PYTHON" Demo-Ignite/demo.py --check-only --detector opencv >/tmp/ignite-preflight.$$ 2>&1; then
-            rm -f /tmp/ignite-preflight.$$
+        if "$PYTHON" "$DEMO" --check-only >/tmp/gtc-preflight.$$ 2>&1; then
+            rm -f /tmp/gtc-preflight.$$
             break
         fi
-        missing+=("preflight: $(tail -1 /tmp/ignite-preflight.$$)")
+        missing+=("preflight: $(tail -1 /tmp/gtc-preflight.$$)")
     fi
     if [ $elapsed -ge $REQUIRED_TIMEOUT_SECONDS ]; then
         say "giving up after ${elapsed}s; not ready: ${missing[*]}"
         timeout_diagnostics
-        rm -f /tmp/ignite-preflight.$$
+        rm -f /tmp/gtc-preflight.$$
         exit 1
     fi
     [ $(( elapsed % 30 )) -lt 5 ] && say "still waiting (${elapsed}s): ${missing[*]}"
@@ -74,5 +76,5 @@ if [ "${1:-}" = "--wait-only" ]; then
     say "--wait-only: not starting the demo"
     exit 0
 fi
-say "starting demo: demo.py ${DEMO_ARGS[*]}"
-exec "$PYTHON" -u Demo-Ignite/demo.py "${DEMO_ARGS[@]}"
+say "starting demo: GTC-demo/demo.py ${DEMO_ARGS[*]}"
+exec "$PYTHON" -u "$DEMO" "${DEMO_ARGS[@]}"
