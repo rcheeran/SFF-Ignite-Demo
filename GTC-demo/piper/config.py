@@ -51,7 +51,9 @@ GRIP_EFFORT = 1000       # 0.001 N/m
 
 # ---- Cartesian safety (flange frame, mm / deg) -------------------------------
 WORKSPACE_MIN_MM = [30.0, -400.0, 40.0]     # flange at HOME is x~46, y~-26, z~238 - must lie inside
-WORKSPACE_MAX_MM = [500.0, 400.0, 480.0]
+# X raised from 500 for hand drops further out; beyond ~530 mm of flange X the
+# margined-limit IK fails first (palms reachable to X ~550-570 at the 20-degree drop tilt).
+WORKSPACE_MAX_MM = [600.0, 400.0, 480.0]
 TOOL_LEN_MM = 120.0      # gripper tip lies this far past the flange along the tool z-axis
 TIP_Z_FLOOR_MM = 9.0     # tool tip never commanded below this height above the table
 STEP_MAX_MM = 15.0       # per 30 Hz tick

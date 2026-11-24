@@ -38,8 +38,12 @@ NEAR = (300.0, 0.0)
 
 
 def settings(**overrides):
+    """Validated demo settings; the camera-to-robot correction is off unless overridden."""
     values = demo.validate_demo_settings(demo.DEMO_SETTINGS)
-    values.update(camera_intrinsics=INTRINSICS, verbose=False, pause_before_grip=False)
+    values.update(
+        camera_intrinsics=INTRINSICS, verbose=False, pause_before_grip=False,
+        candy_xy_correction_mm=np.zeros(2), candy_xy_correction_matrix=np.eye(2),
+    )
     values.update(overrides)
     return values
 
@@ -241,7 +245,8 @@ class PickupExecutionTests(unittest.TestCase):
         self.assertEqual(moved, self.names)
         grips = [call.args[3] for call in move.call_args_list]
         grasp = self.names.index("grasp")
-        self.assertTrue(all(grip == 40.0 for grip in grips[:grasp + 1]))
+        self.assertEqual(self.settings["pick_open_mm"], 60.0)
+        self.assertTrue(all(grip == 60.0 for grip in grips[:grasp + 1]))
         self.assertTrue(all(grip == 1.0 for grip in grips[grasp + 1:]))
         hold.assert_called_once()
         np.testing.assert_array_equal(hold.call_args.args[1], dict(self.plan)["grasp"])
@@ -258,6 +263,21 @@ class PickupExecutionTests(unittest.TestCase):
         self.assertEqual(opened.args[2], 40.0)
         self.assertEqual(move.call_args.args[1], "return to scan pose after missed grasp")
         self.assertEqual(move.call_args.args[3], 40.0)
+
+    def test_fingers_land_where_the_wider_pick_opening_puts_them(self):
+        landed = []
+
+        def to_pixel(_transform, _intrinsics, point):
+            landed.append(np.asarray(point, dtype=float))
+            return np.array([320.0, 240.0])
+
+        camera = mock.Mock()
+        with mock.patch.object(demo, "base_to_pixel", side_effect=to_pixel), \
+                mock.patch.object(demo, "to_base_point", return_value=np.array([0.0, 0.0, TABLE_Z])):
+            self.assertIsNone(demo.finger_landing_problem(self.candy, 0.0, camera, "token", np.eye(4), self.settings))
+        reach = self.settings["pick_open_mm"] / 2.0 + self.settings["finger_thickness_mm"] / 2.0
+        np.testing.assert_allclose([point[0] - NEAR[0] for point in landed], [-reach, reach])
+        np.testing.assert_allclose([point[1] for point in landed], [0.0, 0.0])
 
     def test_return_after_leaving_retraces_and_drops_the_candy_above_its_spot(self):
         waypoints = dict(self.plan)
@@ -449,12 +469,62 @@ class HandInViewTests(unittest.TestCase):
         self.assertIn("cannot confirm", self.check(error=demo.DemoError("cannot reach service")))
 
 
+class PositionCorrectionTests(unittest.TestCase):
+    def test_correction_moves_candy_and_hand_targets_alike(self):
+        matrix = np.array([[0.9, 0.0], [0.0, 1.0]])
+        values = settings(candy_xy_correction_mm=np.array([10.0, -2.0]), candy_xy_correction_matrix=matrix)
+        np.testing.assert_allclose(demo.correct_xy([300.0, 50.0, 16.0], values), [280.0, 48.0, 16.0])
+        arm = healthy_arm()
+        arm.pose.return_value = np.zeros(6)
+        hands = mock.Mock()
+        hands.capture_hand.return_value = hand_capture(palm=(400.0, 0.0, 40.0), finger=(440.0, 0.0, 40.0))
+        _, decision = demo.capture_hand_target(arm, hands, np.eye(4), values)
+        np.testing.assert_allclose(decision["base_point_mm"], [370.0, -2.0, 40.0])
+
+    def test_default_correction_is_valid_and_a_matrix_far_from_identity_is_rejected(self):
+        values = demo.validate_demo_settings(demo.DEMO_SETTINGS)
+        self.assertEqual(values["candy_xy_correction_matrix"].shape, (2, 2))
+        with self.assertRaisesRegex(demo.DemoError, "within 0.3 of the identity"):
+            demo.validate_demo_settings({**demo.DEMO_SETTINGS, "candy_xy_correction_matrix": [[1.5, 0.0], [0.0, 1.0]]})
+
+
+class MeasureOffsetTests(unittest.TestCase):
+    def test_hover_keeps_the_fingertips_above_the_candy_and_never_grips(self):
+        values = demo.measure_offset_settings(settings())
+        candy = {"base_point_mm": [*NEAR, TOP_Z], "closing_yaw_deg": [0.0], "edge_yaw_deg": 90.0}
+        plan = demo.plan_table_pick(candy, SCAN["joints_deg"], SCAN["joints_deg"], values)
+        fingertips = tip_position(dict(plan)["grasp"])[2] - demo.FINGER_EXTENSION_BELOW_TIP_MM
+        self.assertAlmostEqual(fingertips, TOP_Z + demo.MEASURE_HOVER_MM, delta=0.5)
+        arm = healthy_arm()
+        with follow_moves(arm) as move, mock.patch.object(demo, "hold_gripper") as hold, \
+                mock.patch.object(demo, "pause_for_grasp_offset", return_value=np.array([-20.0, 0.0])) as pause:
+            offset = demo.hover_and_measure(arm, plan, values, candy)
+        np.testing.assert_array_equal(offset, [-20.0, 0.0])
+        hold.assert_not_called()
+        self.assertFalse(pause.call_args.kwargs["closing"])
+        self.assertTrue(all(call.args[3] == values["grip_open_mm"] for call in move.call_args_list))
+        self.assertEqual(move.call_args_list[-1].args[1], "scan")
+
+    def test_each_candy_from_one_scan_is_measured_once_no_hand_is_in_view(self):
+        candies = [{"base_point_mm": [x, 0.0, TOP_Z], "closing_yaw_deg": [0.0], "edge_yaw_deg": 90.0} for x in (280.0, 320.0)]
+        arm = healthy_arm()
+        with mock.patch.object(demo, "go_to_scan"), \
+                mock.patch.object(demo, "scan_table", return_value={"pickable": candies}), \
+                mock.patch.object(demo, "hand_in_view", side_effect=["a hand is in view", None, None]) as interlock, \
+                mock.patch.object(demo, "hover_and_measure", return_value=np.zeros(2)) as hover, \
+                mock.patch.object(demo.time, "sleep"), mock.patch("builtins.print"):
+            recorded = demo.run_measure_offsets(arm, mock.Mock(), mock.Mock(), SCAN, np.eye(4), settings())
+        self.assertEqual(recorded, 2)
+        self.assertEqual(interlock.call_count, 3)
+        self.assertEqual([call.args[3]["base_point_mm"][0] for call in hover.call_args_list], [280.0, 320.0])
+
+
 class MainTests(unittest.TestCase):
     def args(self, **overrides):
         values = dict(
             calibration_dir=Path("calibration"), scan_poses=Path("scan_poses.json"), vision_url="http://camera:8094",
             hand_url="http://hand:8095", can_interface="can_piper", check_only=False, scan_only=False,
-            pick_only=False, verbose=False, pause_before_grip=False, allow_motion=True, max_cycles=2,
+            pick_only=False, measure_offsets=False, verbose=False, pause_before_grip=False, allow_motion=True, max_cycles=2,
         )
         values.update(overrides)
         return argparse.Namespace(**values)
@@ -590,7 +660,10 @@ class PreflightTests(unittest.TestCase):
         values = demo.validate_demo_settings(demo.DEMO_SETTINGS)
         self.assertEqual(values["table"]["view_x_mm"], [float(demo.WORKSPACE_MIN_MM[0]), float(demo.WORKSPACE_MAX_MM[0])])
         self.assertEqual(values["table"]["view_y_mm"], [float(demo.WORKSPACE_MIN_MM[1]), float(demo.WORKSPACE_MAX_MM[1])])
-        for key, value in (("minimum_held_grip_mm", 0.5), ("minimum_held_grip_mm", 45.0), ("grip_open_mm", 90.0)):
+        for key, value in (
+            ("minimum_held_grip_mm", 0.5), ("minimum_held_grip_mm", 45.0), ("grip_open_mm", 90.0),
+            ("pick_open_mm", 30.0), ("pick_open_mm", 75.0),
+        ):
             with self.subTest(key=key, value=value), self.assertRaisesRegex(demo.DemoError, "gripper settings"):
                 demo.validate_demo_settings({**demo.DEMO_SETTINGS, key: value})
 

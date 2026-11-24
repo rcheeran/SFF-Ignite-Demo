@@ -54,8 +54,14 @@ across the workspace edge are skipped.
 |---|---|
 | up to ~370 | straight down (most reliable) |
 | ~375-525 | tilted 10-30 degrees; most candy orientations reach |
-| ~550 | tilted; about a third of orientations reach |
-| beyond ~575 | out of reach |
+| ~550-595 | tilted; about two thirds of orientations reach, at nearly full arm extension |
+
+The flange workspace limit in [piper/config.py](piper/config.py) is X 600 mm
+(500 mm in Demo-Ignite), so the arm's joint limits set the reach: with 500 mm,
+about a third of orientations reached at X 550 and none beyond ~575. Drops
+reach palms out to X ~560-570 mm near the centre line and ~550 mm at the sides
+(~510-520 mm at the far left, Y 180-206); a palm farther out keeps the arm
+waiting with `no joint-limit-safe IK solution for hand approach`.
 
 ## Run
 
@@ -80,6 +86,37 @@ needs the hand service, which confirms no hand is in view before each pick.
 Each table scan writes an annotated photo to
 `GTC-demo/logs/latest_candy_scan.jpg`: pickable candies in green, skipped ones
 in red.
+
+## Position correction (camera to robot)
+
+The hand-eye calibration places candies too far out in X: +20 mm at X 300
+(2026-11-23) and +32 mm at X 372 (the failed 2026-11-03 candy-point check in
+`prepare-piper/hand-eye-realsense435/calibration/candy_point_verification.json`).
+A camera-angle correction does not explain both, so the demo applies a
+measured correction to every candy and hand position seen from the scan pose:
+
+    true XY = candy_xy_correction_matrix @ camera XY + candy_xy_correction_mm
+
+`[-20, 0]` with the identity matrix is provisional. To fit it, spread 5-6
+candies over the area the demo will use (not touching), then:
+
+```bash
+python GTC-demo/demo.py --allow-motion --measure-offsets --verbose --max-cycles 1
+```
+
+From one scan it visits each reachable candy in turn, hovering the open
+fingertips 5 mm above it (nothing is gripped or touched), and asks for the
+candy centre's offset from the midpoint between the fingertips in robot
+directions (`dx dy` in mm: +X away from the robot, +Y to your left facing +X).
+Keep your hand out of the camera view while the arm moves, and do not move the
+candies until the cycle ends. Then fit the readings taken since the run
+started (local time) and paste the two printed settings into `DEMO_SETTINGS`:
+
+```bash
+python GTC-demo/fit_position_correction.py --since 2026-11-23T15:40
+```
+
+Four or more readings fit the full matrix; fewer fit the offset only.
 
 ## Tuning with photos
 
@@ -107,12 +144,13 @@ These values are estimates until checked with the real candy:
 | Setting | Current | How to check |
 |---|---|---|
 | `grasp_tip_above_candy_top_mm` | 5 mm | `--pick-only --pause-before-grip`: fingertips ~10 mm down the candy's side |
-| `candy_xy_correction_mm` | 0, 0 | `--pause-before-grip` prints the suggested value after each typed offset |
+| `candy_xy_correction_mm`, `candy_xy_correction_matrix` | -20, 0; identity | `--measure-offsets`, then `fit_position_correction.py` (see above) |
 | `minimum_held_grip_mm` | 12 mm | Held candy should read about 20-25 mm, an empty close about 1 mm |
+| `pick_open_mm` | 60 mm | Jaw opening from "above candy" down to the grasp (the scan pose and drops use `grip_open_mm`, 40 mm). Candies closer than about 40 mm centre to centre are skipped by the finger-landing check |
 | `finger_thickness_mm` | 10 mm | Measure the jaws; sets where the finger-landing depth is read |
 
 The candy tops measure about 21-23 mm across in the scan photos rather than
-25.4 mm; the 40 mm jaw opening leaves about 9 mm either side.
+25.4 mm; the 60 mm pick opening leaves about 19 mm either side.
 
 ## Files
 
@@ -120,6 +158,7 @@ The candy tops measure about 21-23 mm across in the scan photos rather than
 |---|---|
 | [demo.py](demo.py) | The demo loop and its modes |
 | [table_vision.py](table_vision.py) | Candy detection on the table and grasp ordering; offline evaluation |
+| [fit_position_correction.py](fit_position_correction.py) | Fits the camera-to-robot XY correction from `--measure-offsets` readings |
 | [bowl_vision.py](bowl_vision.py) | Parked bowl detection; its top-down view, colour segmentation, and drawing helpers are shared |
 | [hand_target.py](hand_target.py) | Finger-base gate and palm-centre / finger-base choice |
 | [vision_client.py](vision_client.py) | Camera (photos, depth at a pixel) and hand service clients |

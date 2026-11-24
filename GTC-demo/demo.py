@@ -14,6 +14,8 @@ Each cycle, at the taught scan pose:
   --check-only   preflight only; never connects to CAN
   --scan-only    move to the scan pose and report the candies and hand; no pick
   --pick-only    pick a candy and drop it back where it was; no open palm needed
+  --measure-offsets  hover over each candy and record where it really is (no grip),
+                 for fit_position_correction.py
 """
 
 from __future__ import annotations
@@ -63,6 +65,10 @@ ARRIVAL_TOLERANCE_DEG = 2.0
 ZERO_RETURN_START_TOLERANCE_DEG = 5.0
 MAXIMUM_HAND_AGE_SECONDS = 10.0
 MAXIMUM_CANDY_XY_CORRECTION_MM = 60.0
+# Each element of the XY correction matrix may differ from the identity by at most this.
+MAXIMUM_CORRECTION_MATRIX_DEVIATION = 0.3
+# --measure-offsets hovers the open fingertips this far above the candy top.
+MEASURE_HOVER_MM = 5.0
 HAND_SLOT = 4
 # The finger pads reach this far below the tool tip (pads span 105..135 mm past the flange).
 FINGER_EXTENSION_BELOW_TIP_MM = 15.0
@@ -90,9 +96,13 @@ WORKSPACE_MAX_MM = np.array([
     WORKSPACE_MAX_Z_MM,
 ])
 DEMO_SETTINGS = {
-    # The candy tops measure ~21-23 mm across in scan photos, leaving ~9 mm either
-    # side for the open fingers to come down.
+    # Scan pose, drops, and zero return. The scan photos (and their gripper mask)
+    # see the fingers at this width.
     "grip_open_mm": 40.000,
+    # From "above candy" down to the grasp. The candy tops measure ~21-23 mm
+    # across in scan photos, leaving ~19 mm either side for position error; the
+    # finger-landing check reads depth where fingers this far apart come down.
+    "pick_open_mm": 60.000,
     "grip_close_mm": 1.000,
     # The candy is ~20-25 mm across and an empty close reads about 1 mm.
     # Not yet measured with the new candy.
@@ -128,11 +138,15 @@ DEMO_SETTINGS = {
     "maximum_vertical_deviation_mm": 3.000,
     "grasp_yaw_offset_step_deg": 5.000,
     "maximum_grasp_yaw_offset_deg": 10.000,
-    # Added to every candy's base XY before planning. Measure it with
-    # --pause-before-grip, which prints the suggested value after each reading.
-    "candy_xy_correction_mm": [0.000, 0.000],
-    "motion_speed_percent": 20,
-    "pick_motion_speed_percent": 20,
+    # Camera-to-robot position correction for candies and hands seen from the scan
+    # pose: corrected XY = matrix @ camera XY + offset. The camera reads candies too
+    # far out in X (+20 mm at X 300 on 2026-11-23, +32 mm at X 372 in the failed
+    # 2026-11-03 candy-point check). -20 mm is provisional until fitted from
+    # --measure-offsets readings with fit_position_correction.py.
+    "candy_xy_correction_mm": [-20.000, 0.000],
+    "candy_xy_correction_matrix": [[1.000, 0.000], [0.000, 1.000]],
+    "motion_speed_percent": 15,
+    "pick_motion_speed_percent": 15,
     "hand_approach_height_mm": 20.000,
     # Pitch raised from the taught 10.012 degrees: at 10 degrees J5 (wrist pitch,
     # +/-70 degrees) limited palm reach to X ~410-440 mm; 20 degrees reaches X 500 mm.
@@ -823,6 +837,9 @@ def validate_demo_settings(settings: dict) -> dict:
             raise ValueError("demo.grasp_tilt_options_deg must list tilts from 0 to 35 degrees")
         demo["grasp_tilt_options_deg"] = tilts
         correction = finite_vector(demo["candy_xy_correction_mm"], 2, "demo.candy_xy_correction_mm").copy()
+        matrix = np.asarray(demo["candy_xy_correction_matrix"], dtype=np.float64)
+        if matrix.shape != (2, 2) or not np.all(np.isfinite(matrix)):
+            raise ValueError("demo.candy_xy_correction_matrix must be a finite 2x2 matrix")
         for key in ("grasp_tip_above_candy_top_mm", "minimum_grasp_tip_z_mm", "grip_close_mm", "finger_landing_clearance_mm"):
             if not math.isfinite(float(demo[key])):
                 raise ValueError(f"demo.{key} must be finite")
@@ -835,8 +852,13 @@ def validate_demo_settings(settings: dict) -> dict:
             f"demo.candy_xy_correction_mm components must be within +/-{MAXIMUM_CANDY_XY_CORRECTION_MM:.0f}mm"
         )
     demo["candy_xy_correction_mm"] = correction
+    if np.any(np.abs(matrix - np.eye(2)) > MAXIMUM_CORRECTION_MATRIX_DEVIATION):
+        raise DemoError(
+            f"demo.candy_xy_correction_matrix elements must be within {MAXIMUM_CORRECTION_MATRIX_DEVIATION} of the identity"
+        )
+    demo["candy_xy_correction_matrix"] = matrix
     for key in (
-        "grip_open_mm", "minimum_held_grip_mm", "pick_approach_height_mm", "vertical_step_mm",
+        "grip_open_mm", "pick_open_mm", "minimum_held_grip_mm", "pick_approach_height_mm", "vertical_step_mm",
         "finger_thickness_mm",
         "maximum_vertical_deviation_mm", "grasp_yaw_offset_step_deg", "maximum_grasp_yaw_offset_deg",
         "motion_speed_percent", "pick_motion_speed_percent", "hand_approach_height_mm",
@@ -848,6 +870,8 @@ def validate_demo_settings(settings: dict) -> dict:
             raise DemoError(f"demo.{key} must be positive")
     if not 0 <= float(demo["grip_close_mm"]) < float(demo["minimum_held_grip_mm"]) < float(demo["grip_open_mm"]) <= PIPER_C.GRIP_OPEN_MM:
         raise DemoError("gripper settings must satisfy 0 <= close < minimum held < open <= the gripper's range")
+    if not float(demo["grip_open_mm"]) <= float(demo["pick_open_mm"]) <= PIPER_C.GRIP_OPEN_MM:
+        raise DemoError("gripper settings must satisfy open <= pick open <= the gripper's range")
     if float(demo["grasp_yaw_offset_step_deg"]) > float(demo["maximum_grasp_yaw_offset_deg"]):
         raise DemoError("demo.grasp_yaw_offset_step_deg must not exceed demo.maximum_grasp_yaw_offset_deg")
     for key in ("motion_speed_percent", "pick_motion_speed_percent"):
@@ -866,6 +890,14 @@ def validate_demo_settings(settings: dict) -> dict:
     return demo
 
 
+def measure_offset_settings(settings: dict) -> dict:
+    """Settings for --measure-offsets: pause at every candy with the open fingertips hovering above its top."""
+    return {
+        **settings, "measure_offsets": True, "pause_before_grip": True,
+        "grasp_tip_above_candy_top_mm": FINGER_EXTENSION_BELOW_TIP_MM + MEASURE_HOVER_MM,
+    }
+
+
 def load_setup(args: argparse.Namespace, hand_eye: dict | None = None) -> tuple[dict, np.ndarray, list[dict]]:
     """Validate settings, calibration acceptance, and taught scan poses without moving the arm.
 
@@ -874,6 +906,8 @@ def load_setup(args: argparse.Namespace, hand_eye: dict | None = None) -> tuple[
     settings = validate_demo_settings(DEMO_SETTINGS)
     settings["verbose"] = bool(getattr(args, "verbose", False))
     settings["pause_before_grip"] = bool(getattr(args, "pause_before_grip", False))
+    if getattr(args, "measure_offsets", False):
+        settings = measure_offset_settings(settings)
     if hand_eye is None:
         hand_eye = load_hand_eye(args.calibration_dir)
     camera_serial = hand_eye["camera"]["serial"]
@@ -969,7 +1003,7 @@ def record_grasp_offset(
 
 
 def pause_for_grasp_offset(
-    arm: Piper, grasp_joints: np.ndarray, open_mm: float, target: dict, demo: dict,
+    arm: Piper, grasp_joints: np.ndarray, open_mm: float, target: dict, demo: dict, closing: bool = True,
 ) -> np.ndarray | None:
     """Hold the open-jaw grasp pose and ask the operator where the candy really is."""
     measured = finite_vector(arm.joints_deg(), 6, "measured grasp joints")
@@ -977,6 +1011,7 @@ def pause_for_grasp_offset(
     jaw_axis = fk(grasp_joints)[:2, 1]
     jaw_axis = jaw_axis / max(float(np.linalg.norm(jaw_axis)), 1e-9)
     candy = target.get("base_point_mm")
+    next_step = "grip" if closing else "continue"
     print(
         "\nPAUSED AT GRASP: jaws open and arm holding position (Ctrl+C stops the demo).\n"
         f"  candy estimate {np.round(candy, 1).tolist() if candy is not None else '?'}mm, candy edge yaw "
@@ -990,7 +1025,7 @@ def pause_for_grasp_offset(
     )
     offset = hold_for_operator_input(
         arm, grasp_joints, open_mm,
-        "  Candy offset 'dx dy' in mm (e.g. '0 -3'), or Enter to grip without recording: ",
+        f"  Candy offset 'dx dy' in mm (e.g. '0 -3'), or Enter to {next_step} without recording: ",
         parse_grasp_offset,
     )
     if offset is None:
@@ -1016,6 +1051,13 @@ def stationary_camera_to_base(
 
 def to_base_point(camera_to_base: np.ndarray, camera_point: np.ndarray) -> np.ndarray:
     return (camera_to_base @ np.append(np.asarray(camera_point, dtype=np.float64), 1.0))[:3]
+
+
+def correct_xy(point_mm: Any, settings: dict) -> np.ndarray:
+    """Apply the camera-to-robot XY correction (matrix @ XY + offset) to a base-frame point."""
+    corrected = np.asarray(point_mm, dtype=np.float64).copy()
+    corrected[:2] = settings["candy_xy_correction_matrix"] @ corrected[:2] + settings["candy_xy_correction_mm"]
+    return corrected
 
 
 def base_to_pixel(camera_to_base: np.ndarray, intrinsics: dict, point_mm: Any) -> np.ndarray | None:
@@ -1044,7 +1086,7 @@ def finger_landing_problem(
     limit = fingertip_z - float(settings["finger_landing_clearance_mm"])
     yaw = math.radians(closing_yaw_deg)
     direction = np.array([math.cos(yaw), math.sin(yaw), 0.0])
-    offset = float(settings["grip_open_mm"]) / 2.0 + float(settings["finger_thickness_mm"]) / 2.0
+    offset = float(settings["pick_open_mm"]) / 2.0 + float(settings["finger_thickness_mm"]) / 2.0
     intrinsics = settings["camera_intrinsics"]
     for sign in (-1.0, 1.0):
         pixel = base_to_pixel(camera_to_base, intrinsics, top + sign * offset * direction)
@@ -1071,8 +1113,7 @@ def measure_candies(
         except DemoError as exc:
             result["rejected_candies"].append({**candy, "reasons": [f"no depth: {exc}"]})
             continue
-        corrected = point.copy()
-        corrected[:2] += settings["candy_xy_correction_mm"]
+        corrected = correct_xy(point, settings)
         try:
             validate_target_workspace(
                 corrected, settings["target_workspace_min_mm"], settings["target_workspace_max_mm"], check_z=False,
@@ -1295,13 +1336,15 @@ def execute_table_pickup(
 ) -> float:
     """Descend, grip, lift back above the candy's spot, verify the candy is held, and return to scan.
 
-    The carry tracker marks the candy held when the gripper closes and records
-    each reached waypoint. On a missed grasp the jaws open above the pickup
-    spot and the arm returns to the scan pose before GraspVerificationError is
-    raised.
+    The jaws open to pick_open_mm from "above candy" down to the grasp. The
+    carry tracker marks the candy held when the gripper closes and records
+    each reached waypoint. On a missed grasp the jaws open to grip_open_mm
+    above the pickup spot and the arm returns to the scan pose before
+    GraspVerificationError is raised.
     """
     timeout = float(settings["move_timeout_seconds"])
     open_mm, close_mm = float(settings["grip_open_mm"]), float(settings["grip_close_mm"])
+    pick_open_mm = float(settings["pick_open_mm"])
     hold_seconds = float(settings["gripper_hold_seconds"])
     speed = int(settings["pick_motion_speed_percent"])
     verbose = bool(settings.get("verbose", False))
@@ -1309,9 +1352,9 @@ def execute_table_pickup(
     names = [name for name, _ in plan]
     grasp_index = names.index("grasp")
     for name, joints in plan[:grasp_index + 1]:
-        move_robot(arm, name, joints, open_mm, timeout, speed, verbose=verbose)
+        move_robot(arm, name, joints, pick_open_mm, timeout, speed, verbose=verbose)
     if settings.get("pause_before_grip"):
-        pause_for_grasp_offset(arm, waypoints["grasp"], open_mm, candy, settings)
+        pause_for_grasp_offset(arm, waypoints["grasp"], pick_open_mm, candy, settings)
     if verbose:
         print("motion: close gripper", flush=True)
     hold_gripper(arm, waypoints["grasp"], close_mm, hold_seconds)
@@ -1334,6 +1377,75 @@ def execute_table_pickup(
     move_robot(arm, "scan", waypoints["scan"], close_mm, timeout, speed, verbose=verbose)
     carry.reached("scan", waypoints["scan"])
     return held_width
+
+
+def hover_and_measure(
+    arm: Piper, plan: list[tuple[str, np.ndarray]], settings: dict, candy: dict,
+) -> np.ndarray | None:
+    """Hover the open fingertips just above a candy, ask for its offset, and go back to scan without gripping.
+
+    The plan's grasp pose is the hover pose (--measure-offsets raises the grasp
+    height). Every move keeps the gripper open; returns the typed offset or None.
+    """
+    timeout, speed = float(settings["move_timeout_seconds"]), int(settings["pick_motion_speed_percent"])
+    open_mm = float(settings["grip_open_mm"])
+    verbose = bool(settings.get("verbose", False))
+    names = [name for name, _ in plan]
+    grasp_index = names.index("grasp")
+    for name, joints in plan[:grasp_index + 1]:
+        move_robot(arm, name, joints, open_mm, timeout, speed, verbose=verbose)
+    offset = pause_for_grasp_offset(arm, dict(plan)["grasp"], open_mm, candy, settings, closing=False)
+    for name, joints in plan[grasp_index + 1:]:
+        move_robot(arm, name, joints, open_mm, timeout, speed, verbose=verbose)
+    return offset
+
+
+def wait_until_no_hand(arm: Piper, hands: HandClient, settings: dict) -> None:
+    """Hold still until the hand service sees no hand, reporting each new reason once."""
+    last = None
+    while (reason := hand_in_view(hands)) is not None:
+        require_healthy(arm, "waiting for hands to clear")
+        if reason != last:
+            print(f"Waiting to move: {reason}", flush=True)
+            last = reason
+        time.sleep(float(settings["retry_delay_seconds"]))
+
+
+def run_measure_offsets(
+    arm: Piper, camera: CameraClient, hands: HandClient, scan: dict,
+    camera_to_gripper: np.ndarray, settings: dict,
+) -> int:
+    """From one scan, hover over each reachable candy in turn and record its offset; never grips.
+
+    Waits before each candy until no hand is in view. Returns how many offsets were recorded.
+    """
+    go_to_scan(arm, scan, settings)
+    result = scan_table(arm, camera, camera_to_gripper, settings)
+    recorded = 0
+    for candy in result["pickable"]:
+        try:
+            plan = plan_table_pick(candy, measured_start_joints(arm, "offset planning"), scan["joints_deg"], settings)
+        except DemoError as exc:
+            print(
+                f"Skipping unreachable candy at {np.round(candy['base_point_mm'], 1).tolist()}mm: "
+                f"{summarize_rejection(str(exc))}",
+                flush=True,
+            )
+            continue
+        wait_until_no_hand(arm, hands, settings)
+        print(
+            f"Measuring candy at {np.round(candy['base_point_mm'], 1).tolist()}mm "
+            f"(gripper tilt {grasp_tilt_deg(dict(plan)['grasp']):.0f}deg)",
+            flush=True,
+        )
+        if hover_and_measure(arm, plan, settings, candy) is not None:
+            recorded += 1
+    print(
+        f"Recorded {recorded} candy offset(s) in {GRASP_OFFSET_LOG}; fit them with "
+        "python GTC-demo/fit_position_correction.py",
+        flush=True,
+    )
+    return recorded
 
 
 def return_candy_to_table(
@@ -1404,7 +1516,7 @@ def capture_hand_target(
     after = np.asarray(arm.pose(), dtype=np.float64)
     camera_to_base = stationary_camera_to_base(before, after, camera_to_gripper, settings, "hand scan")
     decision = choose_drop_target(
-        capture, lambda point: to_base_point(camera_to_base, point),
+        capture, lambda point: correct_xy(to_base_point(camera_to_base, point), settings),
         settings["hand_workspace_min_mm"], settings["hand_workspace_max_mm"],
     )
     return capture, decision
@@ -1595,6 +1707,11 @@ def parse_args() -> argparse.Namespace:
         help="pick a candy from the table and drop it back where it was; no open palm needed "
         "(the hand service still confirms no hand is in view before each pick)",
     )
+    mode.add_argument(
+        "--measure-offsets", action="store_true",
+        help=f"hover the open fingertips {MEASURE_HOVER_MM:.0f} mm above each candy from one scan, ask for "
+        "its offset, and move on without gripping; fit the readings with fit_position_correction.py",
+    )
     parser.add_argument("--verbose", action="store_true", help="print each motion and skipped-candy reasons")
     parser.add_argument(
         "--pause-before-grip", action="store_true",
@@ -1638,7 +1755,7 @@ def main() -> int:
         if not args.allow_motion:
             raise DemoError("motion requires --allow-motion")
         if settings.get("pause_before_grip") and not sys.stdin.isatty():
-            raise DemoError("--pause-before-grip needs an interactive terminal to type candy offsets")
+            raise DemoError("--pause-before-grip and --measure-offsets need an interactive terminal to type candy offsets")
         print("Will begin robot movement shortly, keep emergency stop accessible. Connecting in 5 seconds.", flush=True)
         for _ in range(5):
             time.sleep(1)
@@ -1650,6 +1767,8 @@ def main() -> int:
             print(f"\nGTC CYCLE {cycle}", flush=True)
             if args.scan_only:
                 run_scan_only(arm, camera, hands, scan, camera_to_gripper, settings)
+            elif args.measure_offsets:
+                run_measure_offsets(arm, camera, hands, scan, camera_to_gripper, settings)
             else:
                 run_cycle(arm, camera, hands, scan, camera_to_gripper, settings, pick_only=args.pick_only)
             time.sleep(float(settings["retry_delay_seconds"]))
